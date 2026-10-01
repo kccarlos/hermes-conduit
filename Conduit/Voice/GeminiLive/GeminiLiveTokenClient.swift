@@ -38,6 +38,9 @@ enum GeminiLiveAvailability: Equatable {
                 if reason == "no_api_key" {
                     return AppLocalization.string("Add a Gemini API key on your Hermes server.")
                 }
+                if reason == "no_vertex_credentials" {
+                    return AppLocalization.string("Add Vertex AI service-account credentials on your Hermes server.")
+                }
                 return AppLocalization.string("Gemini Live is not available on this Hermes server: \(reason)")
             }
             return AppLocalization.string("Gemini Live is not available on this Hermes server.")

@@ -1,0 +1,135 @@
+# Build the app and upload it to TestFlight (this fork only).
+#
+# Runs on every push to main that changes more than docs, on tags, and on
+# demand (Actions > TestFlight > Run workflow). The build is signed with the
+# App Store Connect API key (cloud signing), archived, exported and uploaded
+# in one go; it is never submitted for review. See docs/FORK.md.
+#
+# Secrets and variables live in the `testflight` environment, which only
+# main and v* tags can use, so pull requests (including from forks) never see
+# them. Names and how to make each value: docs/FORK.md.
+name: TestFlight
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "ConduitTests/**"
+      - "ConduitUITests/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    name: Archive and upload to TestFlight
+    # A fork of this fork has no secrets and would only fail.
+    if: github.repository == 'kccarlos/hermes-conduit'
+    runs-on: ${{ vars.CI_MACOS_RUNNER || 'xcode-27' }}
+    timeout-minutes: 60
+    environment: testflight
+    env:
+      APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      # Kept out of the repository (it is public) and masked in logs.
+      DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+      CONDUIT_DEFAULT_RELAY_URL: ${{ secrets.CONDUIT_DEFAULT_RELAY_URL }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        env:
+          XCODE_APP: ${{ vars.CI_XCODE_APP || '/Applications/Xcode_27.0.app' }}
+        run: |
+          # Fall back to the image default so an image refresh doesn't fail the job.
+          [[ -d "$XCODE_APP" ]] || { echo "::warning::$XCODE_APP not found; using /Applications/Xcode.app"; XCODE_APP=/Applications/Xcode.app; }
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Generate the Xcode project
+        run: |
+          [[ -n "$DEVELOPMENT_TEAM" ]] || { echo "::error::The DEVELOPMENT_TEAM secret is not set"; exit 1; }
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate
+
+      - name: Install signing material
+        env:
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: scripts/fork-ci/import-signing.sh
+
+      # Strictly increasing, which App Store Connect requires within a
+      # version; UTC so a local upload (`date -u`) stays comparable.
+      - name: Build number
+        run: echo "BUILD=$(date -u +%y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild archive \
+            -project Conduit.xcodeproj -scheme Conduit \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/Conduit.xcarchive \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            CURRENT_PROJECT_VERSION="$BUILD" \
+            | tee build/archive.log | tail -n 40
+
+      # The value itself is not printed: this repository's logs are public.
+      - name: Check the build carries the relay URL
+        if: env.CONDUIT_DEFAULT_RELAY_URL != ''
+        run: |
+          app=$(find build/Conduit.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
+          url=$(/usr/libexec/PlistBuddy -c 'Print :ConduitDefaultRelayURL' "$app/Info.plist")
+          [[ "$url" == https://* ]] || { echo "::error::ConduitDefaultRelayURL is missing or not https in the built app"; exit 1; }
+          echo "ConduitDefaultRelayURL is set."
+
+      - name: Export and upload to TestFlight
+        run: |
+          set -o pipefail
+          scripts/fork-ci/write-export-options.sh build/ExportOptions.plist
+          xcodebuild -exportArchive \
+            -archivePath build/Conduit.xcarchive \
+            -exportOptionsPlist build/ExportOptions.plist \
+            -exportPath build/export \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID" \
+            | tee build/export.log | tail -n 40
+
+      - name: Summary
+        if: success()
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleShortVersionString' build/Conduit.xcarchive/Info.plist)"
+          echo "Uploaded Conduit $version ($BUILD) to TestFlight. It shows up there after Apple finishes processing, usually within a few minutes." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs when it fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: |
+            build/*.log
+            ~/Library/Logs/gym/*
+            /var/folders/**/*.xcdistributionlogs
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Clean up signing material
+        if: always()
+        run: scripts/fork-ci/cleanup-signing.sh

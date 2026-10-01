@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 
 final class InterfaceOrientationTests: XCTestCase {
-    private let appBundleIdentifier = "com.milim.relay"
+    private let appBundleIdentifier = "io.github.kccarlos.conduit"
 
     private func appInfoDictionary() throws -> [String: Any] {
         let bundle = try XCTUnwrap(Bundle(identifier: appBundleIdentifier))

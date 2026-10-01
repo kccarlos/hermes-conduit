@@ -47,9 +47,11 @@ enum GeminiLiveProtocol {
         }
     }
 
-    /// `gemini-3.8-live` → `models/gemini-3.8-live`.
+    /// `gemini-3.8-live` → `models/gemini-3.8-live`. A Vertex AI resource
+    /// name (`projects/…/publishers/google/models/…`) is already fully
+    /// qualified and passes through unchanged.
     static func qualifiedModel(_ model: String) -> String {
-        model.hasPrefix("models/") ? model : "models/" + model
+        model.hasPrefix("models/") || model.hasPrefix("projects/") ? model : "models/" + model
     }
 
     static func setupMessage(

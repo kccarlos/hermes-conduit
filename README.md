@@ -1,3 +1,5 @@
+> **This is a fork** for a self-hosted setup (own bundle ID, own push relay, Gemini Live on Vertex AI, TestFlight CI). See [docs/FORK.md](docs/FORK.md). Upstream: [kaishi00/hermes-conduit](https://github.com/kaishi00/hermes-conduit).
+
 # Hermes Conduit
 
 A native iOS client for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Free, no ads, no tracking.

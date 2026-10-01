@@ -17632,6 +17632,16 @@
         }
       }
     },
+    "Add Vertex AI service-account credentials on your Hermes server." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在 Hermes 服务器上添加 Vertex AI 服务账号凭据。"
+          }
+        }
+      }
+    },
     "Choose OpenAI Codex when prompted. The sign-in stays on your Hermes server." : {
       "localizations" : {
         "zh-Hans" : {

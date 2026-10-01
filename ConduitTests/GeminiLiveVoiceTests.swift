@@ -195,6 +195,13 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(fresh?["model"] as? String, GeminiLiveProtocol.model)
     }
 
+    func testGeminiLiveVertexResourceNameIsNotPrefixedWithModels() {
+        let vertex = "projects/p/locations/us-central1/publishers/google/models/gemini-3.8-live"
+        XCTAssertEqual(GeminiLiveProtocol.qualifiedModel(vertex), vertex)
+        XCTAssertEqual(GeminiLiveProtocol.qualifiedModel("gemini-3.8-live"), "models/gemini-3.8-live")
+        XCTAssertEqual(GeminiLiveProtocol.qualifiedModel("models/gemini-3.8-live"), "models/gemini-3.8-live")
+    }
+
     func testGeminiLiveToolResponseCarriesSchedulingInsideTheResponse() {
         let message = GeminiLiveProtocol.toolResponseMessage(id: "c1", name: "start_job", result: ["result": "done"], scheduling: .whenIdle)
         let response = ((message["toolResponse"] as? [String: Any])?["functionResponses"] as? [[String: Any]])?.first

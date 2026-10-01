@@ -405,7 +405,18 @@ final class PushNotificationService: ObservableObject {
     }
 
     nonisolated static let relayURLDefaultsKey = "conduit.relayURL"
-    nonisolated static let defaultRelayURL = URL(string: "https://push.milim.dev")!
+    nonisolated static let upstreamRelayURL = URL(string: "https://push.milim.dev")!
+    /// The relay used when Settings is blank: the build's `ConduitDefaultRelayURL`
+    /// (set from `CONDUIT_DEFAULT_RELAY_URL` when the project is generated, so a
+    /// fork's own relay need not be committed), else upstream's shared relay.
+    nonisolated static let defaultRelayURL: URL = {
+        if let value = Bundle.main.object(forInfoDictionaryKey: "ConduitDefaultRelayURL") as? String,
+           let url = usableRelayURL(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+           url.scheme?.lowercased() == "https" {
+            return url
+        }
+        return upstreamRelayURL
+    }()
 
     /// The relay a saved Settings value points at. Blank (or
     /// whitespace-only) means the default relay, and so does anything
@@ -493,7 +504,7 @@ final class PushNotificationService: ObservableObject {
         Self.requestRelayURL(issuer: registration?.relayURL, configured: configuredRelayURL)
             ?? Self.unusableRelayURL
     }
-    private let bundleID = "com.milim.relay"
+    private let bundleID = Bundle.main.bundleIdentifier ?? "io.github.kccarlos.conduit"
     private var registration: StoredRegistration?
     private var deviceToken: String?
     private var tokenContinuation: CheckedContinuation<String, Error>?
