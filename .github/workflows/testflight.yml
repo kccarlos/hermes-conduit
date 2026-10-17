@@ -55,6 +55,14 @@ jobs:
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           xcodebuild -version
 
+      # Xcode 26+ ships the Metal compiler as a separate component, and the
+      # app builds Metal shaders; hosted images may not include it.
+      - name: Metal toolchain
+        run: |
+          xcrun -sdk iphoneos metal --version >/dev/null 2>&1 \
+            || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk iphoneos metal --version
+
       - name: Generate the Xcode project
         run: |
           [[ -n "$DEVELOPMENT_TEAM" ]] || { echo "::error::The DEVELOPMENT_TEAM secret is not set"; exit 1; }

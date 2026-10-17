@@ -2,6 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>io.github.kccarlos.conduit.health-sync</string>
+		<string>io.github.kccarlos.conduit.phone-sync</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleExecutable</key>
@@ -54,12 +59,6 @@
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
-	<key>ConduitDefaultRelayURL</key>
-	<string>$(CONDUIT_DEFAULT_RELAY_URL)</string>
-	<key>CFBundleVersion</key>
-	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>ConduitHermesCallsRing</key>
-	<true/>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -73,10 +72,18 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ConduitDefaultRelayURL</key>
+	<string>$(CONDUIT_DEFAULT_RELAY_URL)</string>
 	<key>ConduitDraftLanguages</key>
 	<array/>
+	<key>ConduitHermesCallsRing</key>
+	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>NSAlarmKitUsageDescription</key>
+	<string>When you let Hermes set alarms and timers, Conduit sets the ones your agent asks for, after you approve them unless you chose to add without asking.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -97,14 +104,12 @@
 			</dict>
 		</dict>
 	</dict>
-	<key>NSCameraUsageDescription</key>
-	<string>Conduit uses the camera only when you choose to take a photo, such as for your profile picture or a chat attachment, or to scan a dashboard's sign-in code.</string>
-	<key>NSAlarmKitUsageDescription</key>
-	<string>When you let Hermes set alarms and timers, Conduit sets the ones your agent asks for, after you approve them unless you chose to add without asking.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>When you share your calendar, Conduit sends the events you choose to your own Hermes server so your agent can answer questions about your schedule, and adds or changes events when you approve them. Nothing goes to Conduit's developer.</string>
 	<key>NSCalendarsWriteOnlyAccessUsageDescription</key>
 	<string>Conduit adds events your Hermes agent suggests, when you approve them. It doesn't read your calendar with this access.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Conduit uses the camera only when you choose to take a photo, such as for your profile picture or a chat attachment, or to scan a dashboard's sign-in code.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Conduit uses Face ID to unlock saved Hermes credentials.</string>
 	<key>NSHealthShareUsageDescription</key>
@@ -115,16 +120,18 @@
 	<string>When you turn on background sharing, Conduit tells your own Hermes server when you arrive at or leave your saved places, and where you are when your agent asks, at the detail you choose. Nothing goes to Conduit's developer.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>When you turn on location sharing, Conduit sends your location to your own Hermes server as you send a message or talk to Hermes, so your agent can answer questions about where you are. Nothing goes to Conduit's developer.</string>
-	<key>NSMotionUsageDescription</key>
-	<string>When you share phone status, Conduit tells your own Hermes server whether you're walking, driving or still, so your agent can choose a good moment to reach you. Nothing goes to Conduit's developer.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Conduit uses the microphone for voice conversations and foreground wake phrases.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>When you share phone status, Conduit tells your own Hermes server whether you're walking, driving or still, so your agent can choose a good moment to reach you. Nothing goes to Conduit's developer.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Conduit saves images and videos from your chats to Photos when you choose Save in the share sheet.</string>
 	<key>NSRemindersFullAccessUsageDescription</key>
 	<string>When you share reminders, Conduit sends the lists you choose to your own Hermes server so your agent can see what's on them, and adds or completes reminders when you approve them. Nothing goes to Conduit's developer.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Conduit uses on-device Apple speech recognition to turn your voice into text when you select On this iPhone.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -144,19 +151,12 @@
 			</array>
 		</dict>
 	</dict>
-	<key>NSSupportsLiveActivities</key>
-	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
 		<string>fetch</string>
 		<string>remote-notification</string>
 		<string>voip</string>
-	</array>
-	<key>BGTaskSchedulerPermittedIdentifiers</key>
-	<array>
-		<string>io.github.kccarlos.conduit.health-sync</string>
-		<string>io.github.kccarlos.conduit.phone-sync</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
