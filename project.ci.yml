@@ -1,0 +1,41 @@
+# CI-only signing for TestFlight: manual signing with the shared Apple
+# Distribution certificate and one App Store profile per target, so a runner
+# never has to create a development certificate (Xcode's automatic signing
+# makes a new one on every fresh machine, and Apple caps how many may exist).
+# The profiles live in 1Password (item conduit-provisioning-profiles); see
+# docs/FORK.md. Local builds keep using project.yml and automatic signing.
+#
+#   xcodegen generate --spec project.ci.yml
+include:
+  - project.yml
+targets:
+  Conduit:
+    settings:
+      base:
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "Conduit App App Store"
+  ConduitNotificationService:
+    settings:
+      base:
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "Conduit NotificationService App Store"
+  ConduitWidgets:
+    settings:
+      base:
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "Conduit widgets App Store"
+  ConduitWatch:
+    settings:
+      base:
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "Conduit watchkitapp App Store"
+  ConduitWatchWidgets:
+    settings:
+      base:
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "Conduit watchkitapp.widgets App Store"
