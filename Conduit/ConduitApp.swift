@@ -9,10 +9,48 @@
 import SwiftUI
 import UIKit
 import UserNotifications
+import os
+
+private let backgroundPushLogger = Logger(subsystem: "com.milim.relay", category: "BackgroundPush")
 
 final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         UNUserNotificationCenter.current().delegate = self
+        // A "Hermes wants to talk" notification's Talk button (#449).
+        HermesCallNotifications.registerCategory()
+        // Set up before launch returns: a call the Apple Watch starts can
+        // launch Conduit in the background, and its message waits on this.
+        MainActor.assumeIsolated {
+            WatchVoiceLink.shared.activate()
+            // Calls from Hermes ring through PushKit (#449): a call that
+            // launched Conduit is delivered once the registry is up.
+            HermesNativeCalls.shared.activate()
+            // Apple Health wakes Conduit when shared data changes, and a
+            // background refresh catches up.
+            AppState.registerHealthSyncTask()
+            if HealthSyncPreferences.load().isOn {
+                AppStateRuntimeRegistry.shared.appState.resumeHealthSyncAtLaunch()
+            }
+            // Saved places, visits and significant moves relaunch Conduit
+            // in the background: their monitors are set up again before
+            // launch returns so the event that woke it arrives.
+            let location = LocationSharingController.shared
+            if location.settings.isOn || location.configUnreadable {
+                AppStateRuntimeRegistry.shared.appState.activateLocationSharing()
+            }
+            // Calendar, reminders and phone status: a background refresh, and
+            // the calendar changing while Conduit runs.
+            AppState.registerPhoneSyncTask()
+            if PhoneSyncPreferences.load().isOn {
+                AppStateRuntimeRegistry.shared.appState.resumePhoneSyncAtLaunch()
+            }
+            // Lock Screen progress of a turn sent before a relaunch (#605):
+            // the chat's stream can still update and end it.
+            LiveTurnActivities.shared.adoptExisting()
+        }
+        Task.detached(priority: .background) {
+            AttachmentStaging.sweepStaleFiles()
+        }
         if let payload = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
             Task { @MainActor in
                 PushNotificationService.shared.receiveNotificationPayload(payload)
@@ -27,6 +65,34 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
         }
     }
 
+    /// A background push: the host saying Hermes asked for a calendar change
+    /// that applies without asking. Conduit fetches it from the host and
+    /// applies it in the time iOS gives.
+    ///
+    /// This is the only silent push the relay sends. Visible pushes are
+    /// handled by the notification center delegate (willPresent / didReceive),
+    /// so anything else here has nothing to do; it's logged so an unexpected
+    /// one shows up.
+    func application(
+        _ application: UIApplication,
+        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        guard AppState.isPhoneChangesPush(userInfo) else {
+            backgroundPushLogger.info("Background push that isn't a phone.changes push: nothing to do")
+            completionHandler(.noData)
+            return
+        }
+        Task { @MainActor in
+            let outcome = await AppStateRuntimeRegistry.shared.appState.handlePhoneChangesPush(userInfo)
+            switch outcome {
+            case .synced?: completionHandler(.newData)
+            case .failed?: completionHandler(.failed)
+            default: completionHandler(.noData)
+            }
+        }
+    }
+
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
         Task { @MainActor in
             PushNotificationService.shared.didFailToRegister(error)
@@ -38,10 +104,29 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        Task { @MainActor in
-            PushNotificationService.shared.receiveNotificationPayload(response.notification.request.content.userInfo)
+        let request = response.notification.request
+        // Only the notification Conduit posted itself, never a push carrying the key.
+        if request.identifier == MapsNavigator.notificationIdentifier, !(request.trigger is UNPushNotificationTrigger),
+           let maps = MapsNavigator.url(fromNotification: request.content.userInfo) {
+            // Directions Conduit couldn't open from the background: done once Maps opened.
+            Task { @MainActor in
+                _ = await UIApplication.shared.open(maps)
+                completionHandler()
+            }
+            return
         }
-        completionHandler()
+        Task { @MainActor in
+            if AppState.isPhoneChangesPush(request.content.userInfo) {
+                // A calendar change Hermes asked for: its card shows once fetched.
+                await AppStateRuntimeRegistry.shared.appState.handlePhoneChangesPush(request.content.userInfo)
+            } else if request.trigger is UNPushNotificationTrigger {
+                PushNotificationService.shared.receiveNotificationPayload(request.content.userInfo)
+            } else {
+                // Conduit posts only "Hermes wants to talk" itself (#449).
+                PushNotificationService.shared.receiveLocalCallNotification(request.content.userInfo)
+            }
+            completionHandler()
+        }
     }
 
     func userNotificationCenter(
@@ -51,7 +136,28 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
     ) {
         // The active conversation is already visible while Conduit is in the
         // foreground. Keep remote pushes quiet here and reserve banners/sound
-        // for when the app is not being actively used.
+        // for when the app is not being actively used. A call from Hermes
+        // (#449) still shows: it asks for the user, wherever they are.
+        // A calendar change Hermes asked for while Conduit is open: fetch it
+        // and show its card in the app instead of a banner.
+        if AppState.isPhoneChangesPush(notification.request.content.userInfo) {
+            let userInfo = notification.request.content.userInfo
+            Task { @MainActor in
+                await AppStateRuntimeRegistry.shared.appState.handlePhoneChangesPush(userInfo)
+            }
+            completionHandler([])
+            return
+        }
+        // Directions to tap: posted from the background, kept if Conduit
+        // came to the front before it showed.
+        if notification.request.identifier == MapsNavigator.notificationIdentifier {
+            completionHandler([.banner, .list, .sound])
+            return
+        }
+        if notification.request.content.categoryIdentifier == HermesCallNotifications.categoryIdentifier {
+            completionHandler([.banner, .list, .sound])
+            return
+        }
         completionHandler([])
     }
 }
@@ -67,6 +173,12 @@ struct ConduitApp: App {
     @ObservedObject private var notifications = PushNotificationService.shared
     @ObservedObject private var pendingVoiceIntents = PendingVoiceIntentStore.shared
     @ObservedObject private var appLanguage = AppLanguageStore.shared
+    /// The accent picked in Settings > Appearance (#697).
+    @AppStorage(ConduitAccentChoice.storageKey) private var accentChoice = ConduitAccentChoice.defaultChoice
+    /// A chat another app asked to open (`conduit://session/<id>`), held
+    /// until Hermes is connected: a cold launch opens it once connecting
+    /// finishes instead of failing against an empty session list.
+    @State private var pendingExternalLink: ConduitAppLink?
 
     var body: some Scene {
         // Multi-scene support is enabled in the manifest so the CarPlay
@@ -108,28 +220,104 @@ struct ConduitApp: App {
                 // re-resolve outside SwiftUI state, so view re-renders alone
                 // cannot refresh them.
                 appState.appLanguageDidChange()
+                appState.publishWidgetLanguage()
+                HermesCallNotifications.registerCategory()
             }
             .preferredColorScheme(appState.themePreference.colorScheme)
             .tint(.conduitAccent)
+            // The accent colours resolve the choice from this trait, so a
+            // new pick redraws in place: no view is rebuilt.
+            .environment(\.conduitAccent, accentChoice)
+#if DEBUG
+            .modifier(WidgetLaunchUITestFixture.modifier(appState: appState))
+#endif
+            // Links Conduit writes into chats (a voice call's job link)
+            // open inside the app; every other link goes to the system.
+            .environment(\.openURL, OpenURLAction { url in
+                if appState.routeWidgetLaunchURL(url) { return .handled }
+                // A sign-in code Hermes sent in a chat asks before it signs in.
+                if appState.routeConnectLink(url) { return .handled }
+                guard let link = ConduitAppLink(url: url) else {
+                    // The scheme is registered, so the system would hand a
+                    // conduit link Conduit can't read straight back to it.
+                    return url.scheme?.lowercased() == ConduitAppLink.scheme ? .discarded : .systemAction
+                }
+                Task { @MainActor in appState.openAppLink(link) }
+                return .handled
+            })
+            // On iPad (multiple scenes are on for CarPlay) SwiftUI opens a
+            // new window for a link no open window claims, and the
+            // duplicate-window guard would close it at once: the open
+            // window takes every link, and every other external event
+            // (Handoff) too, since Conduit has one window.
+            .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
+            // Another app opening a chat: only session links, opened through
+            // the same route as an in-app link once Hermes is connected.
+            .onOpenURL { url in
+                if appState.routeWidgetLaunchURL(url) { return }
+                // A sign-in code tapped in another app (a Telegram chat with
+                // Hermes): Conduit asks before it signs in.
+                if appState.routeConnectLink(url) { return }
+                guard let link = ConduitAppLink(externalURL: url) else { return }
+                pendingExternalLink = link
+            }
+            .task(id: externalLinkRouteKey) {
+                guard appState.isConnected, let link = pendingExternalLink else { return }
+                pendingExternalLink = nil
+                appState.openAppLink(link)
+            }
             .task { await PushNotificationService.shared.refresh() }
+            // Siri learns the cached profile names for its profile phrases.
+            .task { SiriProfileShortcuts.refresh() }
             .task(id: notificationRouteKey) {
                 guard appState.isConnected, let target = notifications.pendingTarget else { return }
                 if await appState.openNotificationTarget(target) {
+                    // A call from Hermes (#449) opens voice in its chat,
+                    // unless its CallKit call ended meanwhile and let go of
+                    // the route. Started before the route clears, which ends
+                    // this task.
+                    if let call = target.call, notifications.pendingTarget == target, !appState.answerHermesCall(call) {
+                        HermesNativeCalls.shared.routedAnswerFailed(target)
+                    }
                     notifications.clearPendingTarget(target)
-                } else {
-                    notifications.handleFailedNotificationRoute(target)
+                } else if !notifications.handleFailedNotificationRoute(target), target.call != nil {
+                    HermesNativeCalls.shared.routedAnswerFailed(target)
                 }
             }
             .task(id: voiceIntentRouteKey) {
-                await resolvePendingVoiceIntent()
+                // Siri's call shows its screen while it waits for Hermes.
+                appState.presentWaitingCallIfNeeded()
+                // A screenshot waits for Conduit to settle after connecting.
+                // Settling can end on state this view doesn't observe, so
+                // the route is retried on a short timer; the launch
+                // deadline still bounds the wait.
+                while await resolvePendingVoiceIntent() {
+                    do { try await Task.sleep(for: Self.settleRecheckInterval) } catch { return }
+                }
             }
             .task(id: voiceIntentDeadlineKey) {
                 await waitOutPendingVoiceDeadline()
             }
+            // A screenshot kept while Hermes was unreachable is attached
+            // once it connects and settles.
+            .task(id: parkedScreenQuestionKey) {
+                appState.scheduleParkedScreenQuestionResume(recheck: Self.settleRecheckInterval)
+            }
+    }
+
+    /// How often a screenshot waiting for Conduit to settle checks again.
+    private static let settleRecheckInterval: Duration = .milliseconds(250)
+
+    private var parkedScreenQuestionKey: String {
+        "\(appState.isConnected):\(appState.isConnecting):\(appState.isProfileSwitching):\(appState.parkedScreenQuestionRevision)"
     }
 
     private var notificationRouteKey: String {
         "\(notifications.pendingTarget?.id ?? "none"):\(appState.isConnected):\(notifications.navigationAttempt)"
+    }
+
+    private var externalLinkRouteKey: String {
+        "\(pendingExternalLink?.url.absoluteString ?? "none"):\(appState.isConnected)"
     }
 
     private var voiceIntentRouteKey: String {
@@ -151,19 +339,55 @@ struct ConduitApp: App {
 
     /// Resolves the pending voice launch once. Ownership token: only the
     /// claimed request may be routed or failed; a superseded completion is
-    /// discarded without publishing.
-    private func resolvePendingVoiceIntent() async {
+    /// discarded without publishing. Returns true when a screenshot is
+    /// left waiting for Conduit to settle.
+    private func resolvePendingVoiceIntent() async -> Bool {
         let router = PendingVoiceIntentRouter(store: pendingVoiceIntents)
         let connection = appState.voiceLaunchConnectionSnapshot()
+        // The router takes this exact request first, before it awaits.
+        let routed = pendingVoiceIntents.peekClaim()?.intent
+        var screenQuestionOpened: Bool?
         let outcome = await router.routePending(connection: connection) { intent in
-            await appState.openVoiceConversation(intent)
+            if intent.source == .screenQuestion {
+                let opened = await appState.openScreenQuestion(intent)
+                screenQuestionOpened = opened
+                return opened
+            }
+            return await appState.openVoiceConversation(intent)
         }
         switch outcome {
         case .failed(let message):
-            appState.errorMessage = message
-        case .idle, .routed, .deferred, .superseded:
-            break
+            // Its call screen, if one came up for it, goes.
+            appState.endWaitingCall(owner: .siri)
+            // A screenshot is kept when Hermes can't be reached: it is
+            // attached once Hermes connects and Conduit settles.
+            let request = routed?.screenQuestion
+            if let request {
+                appState.parkScreenQuestion(request, profile: routed?.profile)
+            }
+            // Past its deadline while connected but still settling, Hermes
+            // was reached: the screenshot waits without the banner.
+            if request == nil || !appState.isConnected {
+                appState.errorMessage = message
+            }
+        case .superseded:
+            // A newer request took over while this one found Hermes gone.
+            // A call screen up for this one waits for that one instead.
+            if screenQuestionOpened == false, let request = routed?.screenQuestion {
+                appState.settleSupersededScreenQuestion(
+                    request,
+                    profile: routed?.profile,
+                    newerScreenQuestionPending: pendingVoiceIntents.peekClaim()?.intent.screenQuestion != nil
+                )
+            }
+        case .deferred:
+            return routed?.screenQuestion != nil && connection.isSettling
+        case .idle, .routed:
+            // A call screen that came up for a launch that didn't open its
+            // call (nothing pending now, or voice refused it) goes.
+            appState.endWaitingCall(owner: .siri)
         }
+        return false
     }
 
     /// Authoritative 30s backstop. Sleeps on the monotonic clock, then
@@ -186,8 +410,16 @@ struct ConduitApp: App {
         guard let expired = pendingVoiceIntents.expireClaimIfCurrent(claim) else {
             return
         }
+        appState.endWaitingCall(owner: .siri)
         if expired.source == .siri {
             appState.errorMessage = PendingVoiceLaunchPolicy.expiredFailureMessage
+        } else if let request = expired.screenQuestion {
+            appState.parkScreenQuestion(request, profile: expired.profile)
+            // Connected but still settling, Hermes was reached: the
+            // screenshot is attached once Conduit settles.
+            if !appState.isConnected {
+                appState.errorMessage = PendingVoiceLaunchPolicy.screenQuestionFailureMessage
+            }
         }
     }
 }

@@ -118,6 +118,55 @@ final class AppStateForegroundLifecycleTests: XCTestCase {
         box.client.disconnect()
     }
 
+    func testSendRefusedByDesktopOwnershipOffersTakeover() async {
+        // #304: Hermes Desktop owns the chat, so prompt.submit is refused with
+        // SESSION_NOT_OWNED. Conduit offers "Take over" instead of a bare
+        // send failure, naming the owner and every id the chat goes by.
+        let defaults = UserDefaults.standard
+        let savedAutomatic = defaults.object(forKey: ChatTakeoverPreference.automaticKey)
+        defaults.set(false, forKey: ChatTakeoverPreference.automaticKey)
+        defer { defaults.set(savedAutomatic, forKey: ChatTakeoverPreference.automaticKey) }
+        var sends = 0
+        let harness = makeHarness(lifecycleOperations: ChatResumeLifecycleOperations(
+            loadCatalog: { _, _ in [self.session("stored-a")] },
+            openSession: { _, id, _ in
+                SessionResumeResult(sessionId: "runtime-a", storedSessionId: "stored-a",
+                    messages: [], snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)]))
+            },
+            refreshContext: { _, _ in },
+            sendPrompt: { _, _, _ in
+                sends += 1
+                throw RpcError(
+                    code: 4090,
+                    message: "This chat is open in another Hermes window/terminal. Use it there, or start a new chat here.\nDetails: session stored-a opened by desktop 3m ago.",
+                    reason: "SESSION_NOT_OWNED"
+                )
+            },
+            verifyTransportHealth: { _ in }
+        ))
+        let box = await installConnectedClient(into: harness)
+        harness.appState.sessions = [session("stored-a", alternateIDs: ["runtime-a"])]
+        let opened = await harness.appState.openSession("stored-a")
+        XCTAssertTrue(opened)
+
+        let submitted = await harness.appState.submitComposer(text: "From my phone")
+
+        XCTAssertFalse(submitted, "The refused draft goes back to the composer")
+        XCTAssertEqual(sends, 1)
+        let takeover = harness.appState.chatTakeover
+        XCTAssertEqual(takeover?.sessionID, "runtime-a")
+        XCTAssertEqual(takeover?.surface, "desktop")
+        XCTAssertEqual(takeover?.phase, .offered)
+        XCTAssertEqual(takeover?.sessionIDs.first, "runtime-a")
+        XCTAssertTrue(takeover?.sessionIDs.contains("stored-a") ?? false)
+        XCTAssertNil(harness.appState.errorMessage, "The takeover offer replaces the send failure")
+        XCTAssertEqual(harness.appState.activeChatTakeover, takeover, "The open chat shows the offer")
+
+        harness.appState.dismissChatTakeover()
+        XCTAssertNil(harness.appState.chatTakeover)
+        box.client.disconnect()
+    }
+
     func testComposerSubmissionSurvivesLegitimateRuntimeRotationDuringRecovery() async {
         // Hermes legitimately rotates stored-a: runtime-old → runtime-new
         // during the second send's freshness recovery. The in-flight
@@ -2831,6 +2880,104 @@ final class AppStateForegroundLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(harness.appState.turnState, .running)
         XCTAssertFalse(harness.appState.turnStateIsStale)
+        let confirmation = harness.appState.messages.last
+        XCTAssertEqual(confirmation?.isSteer, true, "An accepted steer is confirmed in the transcript (issue #337)")
+        XCTAssertEqual(confirmation?.content, "Follow-up")
+    }
+
+    private func runStaleIdleSteer(
+        seeded: [ChatMessage],
+        duringSteer: @escaping @MainActor (AppState) -> Void = { _ in }
+    ) async -> AppState {
+        let active = session("stored-a")
+        var appStateRef: AppState?
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                sendPrompt: { _, _, _ in .accepted },
+                probeActiveSessions: { _ in
+                    [LiveSessionStatus(
+                        runtimeSessionId: "runtime-a",
+                        storedSessionId: "stored-a",
+                        status: "working"
+                    )]
+                },
+                steer: { _, _, _ in
+                    if let appStateRef { duringSteer(appStateRef) }
+                }
+            )
+        )
+        appStateRef = harness.appState
+        installDisconnectedClient(into: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+        harness.appState.messages = seeded
+        harness.appState.handleScenePhase(.background)
+
+        let submitted = await harness.appState.submitComposer(text: "Follow-up")
+        XCTAssertTrue(submitted)
+        return harness.appState
+    }
+
+    private func persistedSteer(_ id: String, _ text: String) -> ChatMessage {
+        ChatMessage(id: id, role: .user, content: text, timestamp: "", displayKind: ChatMessage.steerDisplayKind)
+    }
+
+    func testRepeatingAnEarlierSteerStillGetsItsOwnConfirmation() async {
+        let appState = await runStaleIdleSteer(seeded: [persistedSteer("90", "Follow-up")])
+
+        XCTAssertEqual(appState.messages.count, 2)
+        XCTAssertEqual(appState.messages.last?.isSteer, true)
+        XCTAssertTrue(appState.messages.last?.id.hasPrefix("local-steer-") == true)
+    }
+
+    func testSteerPersistedDuringTheRPCIsNotConfirmedTwice() async {
+        let appState = await runStaleIdleSteer(seeded: []) { appState in
+            appState.messages.append(self.persistedSteer("91", "Follow-up"))
+        }
+
+        XCTAssertEqual(appState.messages.map(\.id), ["91"])
+    }
+
+    func testFailedSteerAddsNoTranscriptConfirmation() async {
+        let active = session("stored-a")
+        struct SteerFailure: Error {}
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                sendPrompt: { _, _, _ in .accepted },
+                probeActiveSessions: { _ in
+                    [LiveSessionStatus(
+                        runtimeSessionId: "runtime-a",
+                        storedSessionId: "stored-a",
+                        status: "working"
+                    )]
+                },
+                steer: { _, _, _ in throw SteerFailure() }
+            )
+        )
+        installDisconnectedClient(into: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+        harness.appState.handleScenePhase(.background)
+
+        let submitted = await harness.appState.submitComposer(text: "Follow-up")
+
+        XCTAssertFalse(submitted)
+        XCTAssertFalse(harness.appState.messages.contains(where: \.isSteer))
+    }
+
+    func testLocalSteerTwinMatchesPersistedSteerByText() {
+        let local = ChatMessage(
+            id: "local-steer-1", role: .user, content: "Use staging", timestamp: "",
+            displayKind: ChatMessage.steerDisplayKind
+        )
+        let persisted = ChatMessage(
+            id: "412", role: .user, content: "Use staging\n", timestamp: "",
+            displayKind: ChatMessage.steerDisplayKind
+        )
+        let ordinary = ChatMessage(id: "local-2", role: .user, content: "Use staging", timestamp: "")
+        XCTAssertTrue(AppState.isLocalSteerTwin(local, of: persisted))
+        XCTAssertFalse(AppState.isLocalSteerTwin(persisted, of: persisted), "A durable row is never a local twin")
+        XCTAssertFalse(AppState.isLocalSteerTwin(ordinary, of: persisted))
     }
 
     // MARK: - K. Two genuinely idle turns stay independent
@@ -3277,6 +3424,85 @@ final class AppStateForegroundLifecycleTests: XCTestCase {
         box.client.disconnect()
     }
 
+    /// A staged file's reference leads the prompt, and Hermes persists the
+    /// row expanded (reference, typed text, its attached-context footer).
+    /// The check must project what was SENT, reference included: typed
+    /// text that itself holds a footer heading only loses it on the
+    /// persisted side when a reference sits above.
+    func testAmbiguousSendWithAStagedFileIsProvenByTranscript() async {
+        let active = session("stored-a")
+        let typed = "Compare these\n\n--- Attached Context ---\nmy own notes"
+        let reference = "@file:/root/.hermes/attachments/notes.txt"
+        var submitted: [String] = []
+        var transcriptReads = 0
+        var catalogCount = 0
+        var operations = ChatResumeLifecycleOperations(
+            loadCatalog: { _, _ in
+                catalogCount += 1
+                return [active]
+            },
+            openSession: { _, sessionID, _ in
+                SessionResumeResult(
+                    sessionId: sessionID,
+                    messages: [],
+                    snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+                )
+            },
+            persistedTranscript: { _, _, _ in
+                transcriptReads += 1
+                if transcriptReads == 1 {
+                    return .payload([
+                        "messages": [
+                            ["id": "100", "role": "user", "content": "Earlier question", "timestamp": "1"],
+                            ["id": "101", "role": "assistant", "content": "Earlier answer", "timestamp": "2"]
+                        ],
+                        "pagination": ["limit": 120, "offset": 0, "order": "latest", "returned": 2]
+                    ])
+                }
+                let persisted = "\(reference)\n\n\(typed)\n\n--- Attached Context ---\n\n"
+                    + "📎 notes.txt is available on disk at /root/.hermes/attachments/notes.txt"
+                return .payload([
+                    "messages": [
+                        ["id": "100", "role": "user", "content": "Earlier question", "timestamp": "1"],
+                        ["id": "101", "role": "assistant", "content": "Earlier answer", "timestamp": "2"],
+                        ["id": "102", "role": "user", "content": persisted, "timestamp": "3"],
+                        ["id": "103", "role": "assistant", "content": "Compared", "timestamp": "4"]
+                    ],
+                    "pagination": ["limit": 120, "offset": 0, "order": "latest", "returned": 4]
+                ])
+            },
+            refreshContext: { _, _ in },
+            sendPrompt: { _, _, text in
+                submitted.append(text)
+                throw HermesError.timeout("prompt.submit")
+            },
+            probeActiveSessions: { _ in [] }
+        )
+        operations.uploadAttachment = { _, _, _ in reference }
+        let harness = makeHarness(lifecycleOperations: operations)
+        let box = await installConnectedClient(into: harness)
+        harness.appState.sessions = [active]
+        harness.appState.activeSessionId = active.id
+        let opened = await harness.appState.openSession(active.id)
+        XCTAssertTrue(opened)
+        let notes = Attachment(
+            id: UUID().uuidString,
+            name: "notes.txt",
+            uri: "file:///tmp/notes.txt",
+            mimeType: "text/plain",
+            kind: .document
+        )
+
+        let sent = await harness.appState.submitComposer(text: typed, attachments: [notes])
+
+        XCTAssertTrue(sent, "The expanded persisted row proves the send landed")
+        XCTAssertEqual(submitted, ["\(reference)\n\n\(typed)"], "An accepted prompt must never be re-submitted")
+        XCTAssertEqual(transcriptReads, 2)
+        XCTAssertEqual(catalogCount, 0, "No failed-send restoration may run")
+        XCTAssertEqual(harness.appState.messages.last?.content, typed)
+        box.client.disconnect()
+    }
+
     /// The genuine not-accepted case keeps its coverage: registry idle AND
     /// the durable transcript holds nothing beyond the submit-time baseline.
     func testAmbiguousPromptAbsentFromDurableTranscriptRestoresOnce() async {
@@ -3601,6 +3827,84 @@ final class AppStateForegroundLifecycleTests: XCTestCase {
         )
         XCTAssertNotNil(expected)
         XCTAssertEqual(steeredTexts, [expected ?? ""])
+    }
+
+    /// A quoted reply (#385) that names a bot is not a mention: only the
+    /// user's own words below the quote are scanned, and a mention there
+    /// annotates the whole sent text.
+    func testQuotedReplyBotNamesAreNotTakenAsMentions() async {
+        let sessionA = session("stored-a")
+        let researcher = BotProfile(
+            name: "researcher",
+            botTitle: nil,
+            displayName: "",
+            profileDescription: "",
+            model: nil,
+            provider: nil,
+            hasAvatar: false,
+            isPinned: false,
+            isHiddenByMeta: false,
+            appearanceColor: nil,
+            canonicalSession: nil,
+            lastActive: nil,
+            lastPreview: nil
+        )
+        var steeredTexts: [String] = []
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                sendPrompt: { _, _, _ in .accepted },
+                probeActiveSessions: { _ in
+                    [LiveSessionStatus(
+                        runtimeSessionId: "runtime-a",
+                        storedSessionId: "stored-a",
+                        status: "working"
+                    )]
+                },
+                steer: { _, _, text in steeredTexts.append(text) },
+                botRoster: { _ in
+                    BotRosterSnapshot(bots: [researcher], supportsBotProtocol: true)
+                }
+            )
+        )
+        installDisconnectedClient(into: harness)
+        harness.appState.isConnected = true
+        await harness.appState.refreshBotRoster()
+        harness.appState.isConnected = false
+        XCTAssertEqual(harness.appState.botRoster.map(\.name), ["researcher"])
+
+        harness.appState.sessions = [sessionA]
+        harness.appState.activeSessionId = sessionA.id
+        harness.appState.handleScenePhase(.background)
+
+        let quotedOnly = ReplyQuoteEnvelope.outboundText(
+            quoting: "Ask @researcher for the numbers",
+            message: "Sounds good"
+        )
+        let submittedQuote = await harness.appState.submitComposer(text: quotedOnly)
+        XCTAssertTrue(submittedQuote)
+        XCTAssertEqual(steeredTexts, [quotedOnly], "a bot named only in the quote is not a mention")
+
+        let mentioned = ReplyQuoteEnvelope.outboundText(
+            quoting: "Earlier answer",
+            message: "@researcher check this"
+        )
+        let submittedMention = await harness.appState.submitComposer(text: mentioned)
+        XCTAssertTrue(submittedMention)
+        // The bot named in the user's own words is annotated onto the whole
+        // text, quote included.
+        let expected = BotMentions.annotated(text: mentioned, mentions: [researcher])
+        XCTAssertNotEqual(expected, mentioned)
+        XCTAssertEqual(steeredTexts.last, expected)
+        XCTAssertEqual(ReplyQuoteEnvelope.parse(expected)?.quote, "Earlier answer")
+
+        // A selection quoted as `>` lines is someone else's words too.
+        let selectionQuote = ChatQuote.inserting(
+            ChatQuote.blockquote("Ask @researcher for the numbers"),
+            into: ""
+        ) + "What did they mean?"
+        let submittedSelection = await harness.appState.submitComposer(text: selectionQuote)
+        XCTAssertTrue(submittedSelection)
+        XCTAssertEqual(steeredTexts.last, selectionQuote, "a bot named only in a quoted selection is not a mention")
     }
 
     /// A prompt outcome returned after the user switched sessions must not
@@ -4957,8 +5261,12 @@ final class AppStateForegroundLifecycleTests: XCTestCase {
         XCTAssertEqual(steerCount, 1, "The text routed through the configured busy action")
         XCTAssertEqual(transcriptReads, 3, "No retry loop behind the routed submission")
         XCTAssertEqual(
-            harness.appState.messages.map(\.id), ["100", "101"],
+            Array(harness.appState.messages.map(\.id).prefix(2)), ["100", "101"],
             "No optimistic new-turn row is appended into the running turn"
+        )
+        XCTAssertEqual(
+            harness.appState.messages.dropFirst(2).map(\.isSteer), [true],
+            "Only the steer confirmation (issue #337) follows the transcript"
         )
         XCTAssertEqual(harness.appState.turnState, .running)
         XCTAssertTrue(
@@ -6679,9 +6987,9 @@ final class AppStateForegroundLifecycleTests: XCTestCase {
         XCTAssertEqual(probeCount, 1)
         XCTAssertEqual(submitCount, 0, "No ordinary prompt.submit into the running turn")
         XCTAssertEqual(steerCount, 1, "The text routed through the configured busy action")
-        XCTAssertTrue(
-            harness.appState.messages.isEmpty,
-            "No optimistic new-turn row is appended into the running turn"
+        XCTAssertEqual(
+            harness.appState.messages.map(\.isSteer), [true],
+            "No optimistic new-turn row is appended into the running turn; only the steer confirmation (issue #337)"
         )
         XCTAssertEqual(harness.appState.turnState, .running)
     }

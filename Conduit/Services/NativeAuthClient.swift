@@ -12,7 +12,11 @@ struct DashboardCredentials: Codable, Equatable {
     let username: String
     let password: String
     /// Face ID is an optional gate for a saved credential, not a requirement
-    /// for credential persistence itself.
+    /// for credential persistence itself. It guards the launch restore on
+    /// the phone screen only: off screen (a call from Hermes woke Conduit,
+    /// or only CarPlay shows it) the saved session connects instead, and a
+    /// silent renewal signs in again with the password, locked or not
+    /// (Eric's choice, 2026-10-11, so a call always connects).
     let requiresFaceID: Bool
 }
 
@@ -35,7 +39,7 @@ enum AuthClientError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidURL:
-            return "Invalid dashboard URL."
+            return AppLocalization.string("Invalid dashboard URL.")
         case .loginFailed(let status, _):
             // Never expose a bare "HTTP 401" as the credential-rejection
             // message; other statuses keep the status for diagnosis (the
@@ -389,7 +393,7 @@ final class NativeAuthClient {
     }
 
     private func request(url: URL) -> URLRequest {
-        cloudflareAccess?.applying(to: URLRequest(url: url)) ?? URLRequest(url: url)
+        URLRequest(url: url).applyingProxyHeaders(cloudflare: cloudflareAccess)
     }
 
     private func endpointURL(path: String) throws -> URL {

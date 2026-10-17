@@ -35,6 +35,7 @@ struct LargeMarkdownDocumentView: View {
     let usesAccentSurface: Bool
     let gatewayMediaDataURL: ((String) async -> String?)?
 
+    @Environment(\.chatRowDisclosure) private var disclosure
     @State private var expanded = false
 
     var body: some View {
@@ -61,13 +62,17 @@ struct LargeMarkdownDocumentView: View {
                 source: Self.previewSource(of: source),
                 foregroundStyle: foregroundStyle,
                 usesAccentSurface: usesAccentSurface,
-                gatewayMediaDataURL: gatewayMediaDataURL
+                gatewayMediaDataURL: gatewayMediaDataURL,
+                mayEndMidBlock: true
             )
 
             LargeDocumentBanner(
                 byteCount: source.utf8.count,
                 usesAccentSurface: usesAccentSurface,
-                expand: { expanded = true }
+                expand: {
+                    disclosure?.willToggle(nil, to: true)
+                    expanded = true
+                }
             )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -342,7 +347,19 @@ struct LargeMarkdownPreparedDocument {
     }
 
     static func identity(of source: String) -> String {
-        "\(source.utf8.count)-\(source.hashValue)"
+        // Hermes' @session links take the chat's name once Conduit lists it.
+        "\(source.utf8.count)-\(source.hashValue)-\(HermesSessionReference.titleKey(for: source).hashValue)"
+    }
+
+    /// Web-page units per chunk (diagrams and formulas are chunks of
+    /// their own), which bound the expanded view's windows.
+    var webPageUnitsByChunk: [Int] {
+        chunks.map { chunk in
+            if case .block(let block, _) = chunk {
+                return MarkdownRichContentPolicy.webPageUnits(block)
+            }
+            return 0
+        }
     }
 }
 
@@ -374,6 +391,7 @@ extension MarkdownBlock {
         case .columns(let columns): return columns.joined(separator: "\n")
         case .math(let source): return source
         case .image(let url, let alt): return "\(alt) \(url)"
+        case .htmlPreview(let path): return path
         case .divider: return ""
         }
     }
@@ -426,7 +444,9 @@ struct LargeSpecializedRichContent {
 /// initial batch mounts immediately; every further batch requires an
 /// explicit Continue action — a plain VStack fires onAppear on insertion
 /// rather than on visibility, so any automatic growth would cascade through
-/// hundreds of chunks without the user ever scrolling.
+/// hundreds of chunks without the user ever scrolling. A batch also ends
+/// early at the rich-unit budget's worth of diagrams and formulas, which
+/// each draw in their own web page.
 struct LargeMarkdownExpandedView: View {
     let source: String
     let foregroundStyle: Color
@@ -453,7 +473,7 @@ struct LargeMarkdownExpandedView: View {
                     chunkView(prepared, chunk: prepared.chunks[index], index: index)
                 }
                 if renderedChunkCount < prepared.chunks.count {
-                    progressFooter(remaining: prepared.chunks.count - renderedChunkCount)
+                    progressFooter(remainingCount: prepared.chunks.count - renderedChunkCount)
                 }
             } else {
                 LargeDocumentPreparingView()
@@ -481,7 +501,7 @@ struct LargeMarkdownExpandedView: View {
                 // Clamped: a large document can legitimately produce fewer
                 // chunks than one batch, and chunkView indexes
                 // prepared.chunks directly.
-                renderedChunkCount = min(Self.initialChunkBatch, plan.chunks.count)
+                renderedChunkCount = Self.initialWindowCount(webPageUnitsByChunk: plan.webPageUnitsByChunk)
             }
         }
         .onAppear {
@@ -589,24 +609,24 @@ struct LargeMarkdownExpandedView: View {
         }
     }
 
-    /// Total chunk count read through @State: dynamic, so a button action
-    /// firing twice before SwiftUI rebuilds still sees the live value.
-    private var preparedChunkTotal: Int {
-        prepared?.chunks.count ?? 0
+    /// Read through @State: dynamic, so a button action firing twice before
+    /// SwiftUI rebuilds still sees the live document.
+    private var preparedWebPageUnits: [Int] {
+        prepared?.webPageUnitsByChunk ?? []
     }
 
     @ViewBuilder
-    private func progressFooter(remaining: Int) -> some View {
+    private func progressFooter(remainingCount: Int) -> some View {
         Button {
             // Clamped to the real total: chunkView indexes prepared.chunks
             // directly, and the remaining chunks can be fewer than a batch.
             renderedChunkCount = Self.nextWindowCount(
                 current: renderedChunkCount,
-                total: preparedChunkTotal
+                webPageUnitsByChunk: preparedWebPageUnits
             )
         } label: {
             Label(
-                "Continue reading (\(remaining) sections left)",
+                "Continue reading (\(remainingCount) sections left)",
                 systemImage: "chevron.down"
             )
             .font(.footnote.weight(.semibold))
@@ -616,10 +636,48 @@ struct LargeMarkdownExpandedView: View {
         .padding(.vertical, 4)
     }
 
+    /// Chunks mounted before any Continue action.
+    static func initialWindowCount(webPageUnitsByChunk: [Int]) -> Int {
+        windowEnd(
+            start: 0,
+            chunkBatch: initialChunkBatch,
+            unitBudget: MarkdownRichContentPolicy.eagerRichUnitBudget,
+            webPageUnitsByChunk: webPageUnitsByChunk
+        )
+    }
+
     /// Next mounted-chunk count: one batch more, clamped to the document's
     /// chunk count.
-    static func nextWindowCount(current: Int, total: Int) -> Int {
-        min(current + continueChunkBatch, total)
+    static func nextWindowCount(current: Int, webPageUnitsByChunk: [Int]) -> Int {
+        windowEnd(
+            start: current,
+            chunkBatch: continueChunkBatch,
+            unitBudget: MarkdownRichContentPolicy.revealUnitBatch,
+            webPageUnitsByChunk: webPageUnitsByChunk
+        )
+    }
+
+    /// End of a window starting at `start`: up to `chunkBatch` chunks,
+    /// stopping before the diagram or formula that would take the window's
+    /// web pages past `unitBudget`. Always at least one chunk, so every
+    /// Continue action moves on.
+    static func windowEnd(
+        start: Int,
+        chunkBatch: Int,
+        unitBudget: Int,
+        webPageUnitsByChunk: [Int]
+    ) -> Int {
+        let total = webPageUnitsByChunk.count
+        guard start < total else { return total }
+        var end = start
+        var units = 0
+        while end < total, end - start < chunkBatch {
+            let next = webPageUnitsByChunk[end]
+            if end > start, next > 0, units + next > unitBudget { break }
+            units += next
+            end += 1
+        }
+        return end
     }
 }
 
@@ -754,11 +812,11 @@ struct LargeMarkdownCallout: View {
 
     private var detail: (title: String, icon: String, color: Color) {
         switch calloutKind.lowercased() {
-        case "tip", "hint": ("Tip", "lightbulb.fill", .green)
-        case "warning", "caution": ("Warning", "exclamationmark.triangle.fill", .orange)
-        case "danger", "error": ("Important", "exclamationmark.octagon.fill", .red)
-        case "important": ("Important", "exclamationmark.circle.fill", .purple)
-        default: ("Note", "info.circle.fill", .blue)
+        case "tip", "hint": (AppLocalization.string("Tip"), "lightbulb.fill", .green)
+        case "warning", "caution": (AppLocalization.string("Warning"), "exclamationmark.triangle.fill", .orange)
+        case "danger", "error": (AppLocalization.string("Important"), "exclamationmark.octagon.fill", .red)
+        case "important": (AppLocalization.string("Important"), "exclamationmark.circle.fill", .purple)
+        default: (AppLocalization.string("Note"), "info.circle.fill", .blue)
         }
     }
 
@@ -850,6 +908,7 @@ struct LargeCodeBlockView: View {
     let language: String
     let usesAccentSurface: Bool
 
+    @Environment(\.chatRowDisclosure) private var disclosure
     @State private var expanded = false
     @State private var copied = false
     @State private var slices: [String]?
@@ -888,6 +947,7 @@ struct LargeCodeBlockView: View {
                         )
                         if lineStats?.hasMore == true {
                             Button {
+                                disclosure?.willToggle(nil, to: true)
                                 withAnimation(.easeInOut(duration: 0.15)) { expanded = true }
                             } label: {
                                 Label("Show all \(lineStats?.count ?? 0) lines", systemImage: "chevron.down")

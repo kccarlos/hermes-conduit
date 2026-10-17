@@ -4,11 +4,13 @@ struct LiveVoiceSetupSheet: View {
     enum Mode {
         case gemini
         case gpt
+        case grok
 
         var checkTitle: String {
             switch self {
             case .gemini: AppLocalization.string("Check Gemini Live")
             case .gpt: AppLocalization.string("Check GPT-Live")
+            case .grok: AppLocalization.string("Check Grok Live")
             }
         }
     }
@@ -76,13 +78,14 @@ struct LiveVoiceSetupSheet: View {
                 HStack(spacing: 8) {
                     Text(verbatim: "2")
                         .font(.caption.weight(.bold))
+                        .conduitFixedGlyph()
                         .foregroundStyle(.white)
                         .frame(width: 22, height: 22)
                         .background(Color.conduitAccent, in: Circle())
                     Text(AppLocalization.string("Add a Gemini API key"))
                         .font(.subheadline.weight(.semibold))
                 }
-                Text(AppLocalization.string("Set GEMINI_API_KEY in the active Hermes profile’s .env file. Keep the key on your Hermes server."))
+                Text(AppLocalization.string("Add it in Voice settings under API key, or set GEMINI_API_KEY in the active Hermes profile’s .env file. The key stays on your Hermes server."))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -95,6 +98,18 @@ struct LiveVoiceSetupSheet: View {
                     command: "hermes auth"
                 )
                 Text(AppLocalization.string("Choose OpenAI Codex when prompted. The sign-in stays on your Hermes server."))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case .grok:
+            VStack(alignment: .leading, spacing: 6) {
+                NotificationSetupCommand(
+                    step: 2,
+                    title: AppLocalization.string("Sign in to SuperGrok"),
+                    command: "hermes auth add xai-oauth"
+                )
+                Text(AppLocalization.string("Sign in with your SuperGrok or X Premium+ account, or add an xAI key in Voice settings under API key instead. The sign-in and the key stay on your Hermes server."))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -112,6 +127,7 @@ struct LiveVoiceSetupLink: View {
         switch mode {
         case .gemini: AppLocalization.string("Set up Gemini Live")
         case .gpt: AppLocalization.string("Set up GPT-Live")
+        case .grok: AppLocalization.string("Set up Grok Live")
         }
     }
 

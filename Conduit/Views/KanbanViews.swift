@@ -120,7 +120,7 @@ enum KanbanSelectionChromePolicy {
 
     /// ONE logical single-line label — never a vertical letter column.
     static func selectedCountLabel(count: Int) -> String {
-        count == 1 ? AppLocalization.string("1 task selected") : AppLocalization.string("\(String(count)) tasks selected")
+        AppLocalization.string("\(count) tasks selected")
     }
 
     /// One bulk-action control in the bottom bar. `title == nil` renders it
@@ -344,6 +344,14 @@ struct KanbanBulkActionsCluster<MoreMenu: View>: View {
 
 struct KanbanView: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// V2's Tasks › Board: every lane as a column, side by side in a
+    /// horizontal scroll, instead of one lane behind the chip selector.
+    var columnsLayout = false
+
+    init(columnsLayout: Bool = false) {
+        self.columnsLayout = columnsLayout
+    }
+
     @EnvironmentObject private var appState: AppState
     @StateObject private var store = KanbanStore()
     @State private var selectedTask: KanbanTask?
@@ -351,6 +359,9 @@ struct KanbanView: View {
     @State private var newTaskStatus = "todo"
     @State private var includeArchived = false
     @State private var searchText = ""
+    @FocusState private var searchFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.v2Shell) private var shell
     /// iPhone-native interaction: one selected lane rendered as a vertical
     /// card list behind a horizontally scrolling chip selector.
     @State private var selectedLane: String?
@@ -619,6 +630,7 @@ struct KanbanView: View {
         .sheet(isPresented: $showNewTask) {
             KanbanTaskComposerView(initialStatus: newTaskStatus)
                 .environmentObject(store)
+                .environmentObject(appState)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
@@ -787,7 +799,11 @@ struct KanbanView: View {
         .onChange(of: store.board) { _, _ in
             pruneSelectionAgainstBoard()
         }
-        .task(id: liveEventsKey) {
+        // V2 keeps a visited Tasks tab mounted behind the selected one: the
+        // board listens and polls only while it shows, and catches up when it
+        // comes back. Outside V2 the board is always active.
+        .task(id: "\(liveEventsKey)|\(shell.isTabActive)") {
+            guard shell.isTabActive else { return }
             await runLiveEventStream()
         }
         .task(id: pollingKey) {
@@ -797,6 +813,14 @@ struct KanbanView: View {
                 serverIdentity: appState.dashboardTicketBridge?.baseURL ?? ""
             )
             await store.reload(includeArchived: includeArchived)
+        }
+        .task(id: "\(pollingKey)|\(shell.isTabActive)") {
+            guard shell.isTabActive else { return }
+            // Back on the tab: refresh what changed while it was hidden. The
+            // first load is the configure task's own.
+            if store.loadedBoardSlug != nil {
+                await store.poll(includeArchived: includeArchived)
+            }
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(nanoseconds: KanbanPollingPolicy.boardIntervalNanoseconds)
@@ -895,8 +919,100 @@ struct KanbanView: View {
     /// vertically scrolling card list for the selected lane. Locked/system
     /// lanes stay visible with their counts but are marked and never offer
     /// creation, matching upstream LOCKED_COLUMNS semantics.
-    @ViewBuilder
     private var laneBoard: some View {
+        laneLayout
+            // Scrolling the board puts the search keyboard away.
+            .scrollDismissesKeyboard(.immediately)
+    }
+
+    @ViewBuilder
+    private var laneLayout: some View {
+        if columnsLayout {
+            columnBoard
+        } else {
+            chipLaneBoard
+        }
+    }
+
+    /// V2: each lane is a column of cards with its status symbol, name and
+    /// count; the board scrolls sideways.
+    private var columnBoard: some View {
+        let columns = visibleColumns
+        return ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(columns) { column in
+                    boardColumn(column)
+                }
+            }
+            .padding(.horizontal, 2)
+            .padding(.bottom, 14)
+        }
+        .disabled(!store.isSelectedSnapshotLoaded)
+        .overlay(alignment: .top) {
+            if !store.isSelectedSnapshotLoaded {
+                Label("Loading \(store.selectedBoardMetadata?.name ?? store.resolvedSelectedBoardSlug)…", systemImage: "hourglass")
+                    .font(.caption)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(.ultraThinMaterial, in: Capsule())
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if isSelectionActive {
+                bulkActionBar
+            }
+        }
+    }
+
+    private func boardColumn(_ column: KanbanColumn) -> some View {
+        let presentation = KanbanStatusPresentation.forStatus(column.name)
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 6) {
+                Image(systemName: presentation.systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(presentation.tint)
+                Text(presentation.displayName)
+                    .font(.subheadline.weight(.semibold))
+                Text(String(column.tasks.count))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if presentation.isBackendControlled {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityLabel(presentation.displayName + ", " + AppLocalization.string("\(column.tasks.count) tasks"))
+
+            ScrollView(showsIndicators: false) {
+                LazyVStack(spacing: 9) {
+                    if KanbanRunningGroupPolicy.shouldApply(lane: column.name, enabled: groupRunningByProfile) {
+                        ForEach(KanbanRunningGroupPolicy.group(column.tasks)) { group in
+                            runningGroupHeader(group)
+                            ForEach(group.tasks) { task in
+                                taskCard(task)
+                            }
+                        }
+                    } else {
+                        ForEach(column.tasks) { task in
+                            taskCard(task)
+                        }
+                    }
+                }
+                .padding(.bottom, 8)
+            }
+        }
+        .frame(width: 250)
+        .padding(10)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var chipLaneBoard: some View {
         let columns = visibleColumns
         VStack(spacing: 10) {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -908,7 +1024,7 @@ struct KanbanView: View {
                 .padding(.horizontal, 2)
                 .padding(.vertical, 1)
             }
-            .frame(height: 34)
+            .frame(minHeight: 34)
 
             if let column = resolvedLaneColumn(in: columns) {
                 ScrollView(showsIndicators: false) {
@@ -1116,8 +1232,7 @@ struct KanbanView: View {
     }
 
     private var selectedCountLabel: String {
-        let n = selectedTaskIDs.count
-        return n == 1 ? AppLocalization.string("1 task selected") : AppLocalization.string("\(String(n)) tasks selected")
+        KanbanSelectionChromePolicy.selectedCountLabel(count: selectedTaskIDs.count)
     }
 
     private var canRunBulk: Bool {
@@ -1125,8 +1240,8 @@ struct KanbanView: View {
     }
 
     private var bulkArchiveTitle: String {
-        let n = pendingBulkOperation?.ids.count ?? selectedTaskIDs.count
-        return n == 1 ? AppLocalization.string("Archive 1 Task?") : AppLocalization.string("Archive \(String(n)) Tasks?")
+        let count = pendingBulkOperation?.ids.count ?? selectedTaskIDs.count
+        return AppLocalization.string("Archive \(count) Tasks?")
     }
 
     private func bulkArchiveActionTitle(count: Int) -> String {
@@ -1134,8 +1249,8 @@ struct KanbanView: View {
     }
 
     private var bulkDeleteTitle: String {
-        let n = pendingBulkDelete?.taskIDs.count ?? selectedTaskIDs.count
-        return n == 1 ? AppLocalization.string("Delete 1 Task?") : AppLocalization.string("Delete \(String(n)) Tasks?")
+        let count = pendingBulkDelete?.taskIDs.count ?? selectedTaskIDs.count
+        return AppLocalization.string("Delete \(count) Tasks?")
     }
 
     private func bulkDeleteActionTitle(count: Int) -> String {
@@ -1175,8 +1290,8 @@ struct KanbanView: View {
     }
 
     private var moveSheetTitle: String {
-        let n = bulkStagedSelection?.ids.count ?? 0
-        return n == 1 ? AppLocalization.string("Move 1 Task") : AppLocalization.string("Move \(String(n)) Tasks")
+        let count = bulkStagedSelection?.ids.count ?? 0
+        return AppLocalization.string("Move \(count) Tasks")
     }
 
     private var bulkAssignSheet: some View {
@@ -1219,13 +1334,13 @@ struct KanbanView: View {
     }
 
     private var assignSheetTitle: String {
-        let n = bulkStagedSelection?.ids.count ?? 0
-        return n == 1 ? AppLocalization.string("Assign 1 Task") : AppLocalization.string("Assign \(String(n)) Tasks")
+        let count = bulkStagedSelection?.ids.count ?? 0
+        return AppLocalization.string("Assign \(count) Tasks")
     }
 
     private var prioritySheetTitle: String {
-        let n = bulkStagedSelection?.ids.count ?? 0
-        return n == 1 ? AppLocalization.string("Set Priority") : AppLocalization.string("Set Priority (\(String(n)) tasks)")
+        let count = bulkStagedSelection?.ids.count ?? 0
+        return count == 1 ? AppLocalization.string("Set Priority") : AppLocalization.string("Set Priority (\(count) tasks)")
     }
 
     private var bulkPrioritySheet: some View {
@@ -1502,12 +1617,12 @@ struct KanbanView: View {
                 }
             }
             .padding(.horizontal, 11)
-            .frame(height: 30)
+            .padding(.vertical, 6).frame(minHeight: 30)
         }
         .buttonStyle(.plain)
         .foregroundStyle(isSelected ? .primary : .secondary)
         .conduitGlassControl(cornerRadius: 15, tint: isSelected ? presentation.tint.opacity(0.16) : .clear)
-        .accessibilityLabel(presentation.displayName + ", " + String(column.tasks.count) + " tasks")
+        .accessibilityLabel(presentation.displayName + ", " + AppLocalization.string("\(column.tasks.count) tasks"))
         .disabled(bulkBusy)
     }
 
@@ -1700,12 +1815,35 @@ struct KanbanView: View {
     /// V3B search + filters row. Hidden while selection mode is active:
     /// selection chrome owns the top area (issue #98), and search/filters
     /// are inert for multi-select anyway.
+    /// While typing, Cancel beside it clears the search and puts the
+    /// keyboard away; Search on the keyboard or a scroll keeps the search.
     private var searchAndFilterBar: some View {
+        HStack(spacing: 10) {
+            searchAndFilterCapsule
+            if searchFocused {
+                Button(AppLocalization.string("Cancel")) {
+                    searchText = ""
+                    searchFocused = false
+                }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(Color.conduitAccent)
+                .buttonStyle(.plain)
+                .frame(minHeight: 44)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(ConduitMotion.ease(reduceMotion: reduceMotion), value: searchFocused)
+    }
+
+    private var searchAndFilterCapsule: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
             TextField("Search tasks", text: $searchText)
                 .textFieldStyle(.plain)
+                .submitLabel(.search)
+                .focused($searchFocused)
+                .onSubmit { searchFocused = false }
             if !searchText.isEmpty {
                 Button { searchText = "" } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -1730,7 +1868,7 @@ struct KanbanView: View {
             .disabled(!store.isSelectedSnapshotLoaded)
         }
         .padding(.horizontal, 12)
-        .frame(height: 40)
+        .padding(.vertical, 6).frame(minHeight: 40)
         .conduitGlassControl(cornerRadius: 15)
     }
 
@@ -1757,7 +1895,7 @@ struct KanbanView: View {
         .padding(.horizontal, 4)
         .padding(.top, 6)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(group.displayName), \(group.tasks.count) tasks")
+        .accessibilityLabel(group.displayName + ", " + AppLocalization.string("\(group.tasks.count) tasks"))
     }
 
     private func move(_ task: KanbanTask, to status: String) async {
@@ -1867,15 +2005,15 @@ private struct KanbanCardView: View {
                             }
                         }
                         // The CURRENT lane stays visible but inert, matching
-                        // desktop StatusMenu (name === status || !locked): a
-                        // non-control child renders as a disabled Menu row.
-                        HStack {
+                        // desktop StatusMenu (name === status || !locked): an
+                        // on toggle draws the menu's own checkmark in its row
+                        // (an HStack split into a row per child).
+                        Toggle(isOn: .constant(true)) {
                             Label(presentation.displayName, systemImage: presentation.systemImage)
-                            Spacer()
-                            Image(systemName: "checkmark")
                         }
-                        .foregroundStyle(.secondary)
-                        .accessibilityHint("Current lane")
+                        .disabled(true)
+                        .accessibilityLabel(Text(presentation.displayName))
+                        .accessibilityHint(AppLocalization.string("Current lane"))
                     }
                     Section {
                         Button {
@@ -1892,8 +2030,10 @@ private struct KanbanCardView: View {
                     Section {
                         // First-class archive: plain PATCH semantics upstream,
                         // so no destructive confirmation language.
-                        Button(action: onArchive) {
-                            Label("Archive", systemImage: "archivebox")
+                        if task.status != "archived" {
+                            Button(action: onArchive) {
+                                Label("Archive", systemImage: "archivebox")
+                            }
                         }
                         Button(role: .destructive, action: onDelete) {
                             Label("Delete…", systemImage: "trash")
@@ -1955,9 +2095,11 @@ private struct KanbanCardView: View {
             Button { copy(text: task.title, notice: AppLocalization.string("Title copied")) } label: {
                 Label("Copy Task Title", systemImage: "doc.on.doc.fill")
             }
-            Divider()
-            Button(action: onArchive) { Label("Archive", systemImage: "archivebox") }
-                .disabled(isMenusDisabled)
+            if task.status != "archived" {
+                Divider()
+                Button(action: onArchive) { Label("Archive", systemImage: "archivebox") }
+                    .disabled(isMenusDisabled)
+            }
             Button(role: .destructive, action: onDelete) { Label("Delete…", systemImage: "trash") }
                 .disabled(isMenusDisabled)
         }

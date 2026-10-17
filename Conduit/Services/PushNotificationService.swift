@@ -34,6 +34,13 @@ struct ConduitNotificationTarget: Equatable, Identifiable {
     /// the one-shot gateway stream event was missed while the app was
     /// backgrounded. Nil for non-decision notifications.
     let decision: PendingDecisionPayload?
+    /// The call a "Hermes wants to talk" notification carries (#449); nil
+    /// for every other notification.
+    let call: HermesCallRequest?
+    /// Opened from a chat link (`conduit://session/<id>?profile=…`), not a
+    /// notification: it never switches profile while a call runs, because
+    /// the switch would end the call.
+    let isChatLink: Bool
     var id: String { "\(dashboardID?.uuidString ?? "none"):\(relayGatewayID ?? "nogw"):\(profile ?? "default"):\(sessionId):\(type ?? "")" }
 
     init(
@@ -44,7 +51,9 @@ struct ConduitNotificationTarget: Equatable, Identifiable {
         hasMalformedDashboardID: Bool = false,
         relayGatewayID: String? = nil,
         type: String?,
-        decision: PendingDecisionPayload? = nil
+        decision: PendingDecisionPayload? = nil,
+        call: HermesCallRequest? = nil,
+        isChatLink: Bool = false
     ) {
         self.profile = profile
         self.sessionId = sessionId
@@ -54,6 +63,8 @@ struct ConduitNotificationTarget: Equatable, Identifiable {
         self.relayGatewayID = relayGatewayID
         self.type = type
         self.decision = decision
+        self.call = call
+        self.isChatLink = isChatLink
     }
 }
 
@@ -168,6 +179,8 @@ struct RelayMetaInfo: Decodable, Equatable {
     let gateways: [Gateway]
 
     var supportsDecisionCards: Bool { capabilities.contains("decisions") }
+    /// The relay sends the agent's on-demand locate to a location push token.
+    var supportsLocationPush: Bool { capabilities.contains("location-push") }
 
     /// One malformed gateway record must not hide the whole section: decode
     /// gateway rows lossily so a single incompatible record degrades to just
@@ -194,6 +207,57 @@ struct RelayMetaInfo: Decodable, Equatable {
         case version
         case capabilities
         case gateways
+    }
+}
+
+/// The relay's gateway list sorted by dashboard for Settings > Notifications.
+/// The relay lists every gateway paired with this iPhone, across all saved
+/// dashboards, so showing the list as-is reads another dashboard's notifier
+/// as this one's. Sorting uses the same ownership rule push routing applies,
+/// so each row says what a push from that pairing would actually do.
+struct NotificationDashboardPairings: Equatable {
+    /// Pairings whose pushes route to the active dashboard.
+    private(set) var thisDashboard: [RelayMetaInfo.Gateway] = []
+    /// Pairings from before dashboard scoping while several dashboards are
+    /// saved: their pushes fail closed until they are paired again.
+    private(set) var unscoped: [RelayMetaInfo.Gateway] = []
+    /// Pairings that belong to another saved dashboard.
+    private(set) var otherDashboardsCount = 0
+    /// Pairings bound to a dashboard no longer saved on this iPhone (or a
+    /// malformed binding): routing fails them closed, and there is nothing
+    /// to switch to.
+    private(set) var unrecognizedCount = 0
+
+    /// Pairings are judged against the selected dashboard. With none
+    /// selected (it was just removed) there is nothing to judge them
+    /// against: routing's one-dashboard fallback would otherwise list a
+    /// legacy pairing as the selected dashboard's, and "your other
+    /// dashboards" would be relative to nothing. Nothing is listed or counted.
+    @MainActor
+    init(gateways: [RelayMetaInfo.Gateway], activeDashboardID: UUID?, savedDashboardIDs: [UUID]) {
+        guard activeDashboardID != nil else { return }
+        for gateway in gateways {
+            // Parsed like a push payload's `dashboard_id`: blank is unscoped,
+            // anything else that isn't a UUID is malformed.
+            let raw = gateway.dashboardID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let dashboardID = UUID(uuidString: raw)
+            let outcome = NotificationDashboardOwnership.resolve(
+                targetDashboardID: dashboardID,
+                hasMalformedDashboardID: !raw.isEmpty && dashboardID == nil,
+                activeDashboardID: activeDashboardID,
+                savedDashboardIDs: savedDashboardIDs
+            )
+            switch outcome {
+            case .route:
+                thisDashboard.append(gateway)
+            case .failClosed(.unscopedPush):
+                unscoped.append(gateway)
+            case .switchFirst:
+                otherDashboardsCount += 1
+            case .failClosed(.unrecognizedDashboard):
+                unrecognizedCount += 1
+            }
+        }
     }
 }
 
@@ -364,13 +428,36 @@ final class PushNotificationService: ObservableObject {
 
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published private(set) var isWorking = false
+    /// A pairing with a host is running (the button or the automatic one).
+    @Published private(set) var isPairing = false
     @Published private(set) var lastError: String?
     @Published private(set) var pairingCode: String?
     @Published private(set) var pairingExpiry: String?
     @Published private(set) var pendingTarget: ConduitNotificationTarget?
     @Published private(set) var navigationAttempt = 0
-    @Published var preferences = ConduitNotificationPreferences()
-    @Published private(set) var relayMeta: RelayMetaInfo?
+    @Published var preferences = ConduitNotificationPreferences() {
+        // The Notification Service Extension decides whether a decrypted
+        // push shows its real text; it reads this from the App Group.
+        didSet { NotificationSharedSettings.showPreviews = preferences.showPreviews }
+    }
+    /// Relay gateways this iPhone holds an end-to-end encryption key for
+    /// (#431). Settings > Notifications marks those pairings encrypted.
+    @Published private(set) var encryptedGatewayIDs: Set<String> = []
+    @Published private(set) var relayMeta: RelayMetaInfo? {
+        // Plaintext from a pairing this iPhone has never seen listed isn't
+        // trusted once it holds an encryption key (#431). Kept on failure.
+        didSet {
+            guard let relayMeta else { return }
+            // A relay that sends locates now (or no longer) gets the token.
+            if relayMeta.supportsLocationPush != oldValue?.supportsLocationPush { queueVoIPTokenUpdate() }
+            NotificationSharedSettings.knownGatewayIDs = NotificationE2E.knownGatewayIDs(
+                listed: Set(relayMeta.gateways.map(\.id)),
+                previous: NotificationSharedSettings.knownGatewayIDs,
+                // Keys that can't be read count as held.
+                holdsKeys: NotificationSharedSettings.keysProvisioned || Self.e2eKeyStore.readRecords()?.isEmpty != true
+            )
+        }
+    }
     @Published private(set) var isFetchingMeta = false
     /// Set after this phone moves to a different relay: pairings live on
     /// the relay, so every Hermes profile has to pair again.
@@ -386,7 +473,34 @@ final class PushNotificationService: ObservableObject {
 
     /// The discriminator to echo for this request id, if one was retained.
     func relayGatewayID(forRequestID requestID: String) -> String? {
-        relayGatewayIDsByRequestID[requestID]
+        relayGatewayIDsByRequestID[requestID] ?? Self.encryptedDecisionGatewayIDs()[requestID]
+    }
+
+    /// Encrypted decisions keep their gateway across relaunches: the answer
+    /// has to be sealed for that pairing, and plaintext is rejected. Only
+    /// verified pushes are kept, newest last, capped.
+    static let encryptedDecisionGatewaysKey = "conduit.e2e.decisionGateways"
+    private static let encryptedDecisionGatewaysLimit = 64
+
+    private static func encryptedDecisionGatewayIDs() -> [String: String] {
+        let pairs = UserDefaults.standard.array(forKey: encryptedDecisionGatewaysKey) as? [[String]] ?? []
+        var map: [String: String] = [:]
+        for pair in pairs where pair.count == 2 { map[pair[0]] = pair[1] }
+        return map
+    }
+
+    private func persistEncryptedGatewayID(for target: ConduitNotificationTarget) {
+        guard let gatewayID = target.relayGatewayID else { return }
+        let requestID: String
+        switch target.decision {
+        case .clarify(let id, _, _): requestID = id
+        case .clarifyBatch(let id, _): requestID = id
+        default: return
+        }
+        var pairs = (UserDefaults.standard.array(forKey: Self.encryptedDecisionGatewaysKey) as? [[String]] ?? [])
+            .filter { $0.count == 2 && $0[0] != requestID }
+        pairs.append([requestID, gatewayID])
+        UserDefaults.standard.set(Array(pairs.suffix(Self.encryptedDecisionGatewaysLimit)), forKey: Self.encryptedDecisionGatewaysKey)
     }
 
     /// The respond body for a relay decision answer: answer, optional batch
@@ -515,10 +629,10 @@ final class PushNotificationService: ObservableObject {
 
     var isEnabled: Bool { registration != nil && preferences.enabled }
     var statusText: String {
-        if isWorking { return "Updating" }
+        if isWorking { return AppLocalization.string("Updating") }
         if isEnabled { return AppLocalization.string("Enabled") }
         if authorizationStatus == .denied { return AppLocalization.string("Notifications denied") }
-        return "Off"
+        return AppLocalization.string("Off")
     }
 
     init(retryDelay: Duration = .seconds(1.5)) {
@@ -540,6 +654,178 @@ final class PushNotificationService: ObservableObject {
             preferences = saved.preferences
             if needsRelayStamp { persistRegistration() }
         }
+        NotificationSharedSettings.showPreviews = preferences.showPreviews
+        refreshEncryptionState()
+    }
+
+    // MARK: End-to-end encryption (#431)
+
+    /// Where pairing keys live: the Keychain, shared with the Notification
+    /// Service Extension. The unsigned simulator host has no keychain access
+    /// group, so tests pass records to the parameterized functions instead.
+    static let e2eKeyStore: E2EKeyStoring = KeychainE2EKeyStore()
+    /// Messages already routed from a tap, shared with the extension's
+    /// delivery records.
+    static let e2eSeenStore: E2ESeenStore = .shared
+
+    static let e2ePath = "/api/plugins/conduit_push/e2e"
+    private var isProvisioningEncryption = false
+
+    func refreshEncryptionState() {
+        // Unreadable (a launch before first unlock): keep what was shown.
+        guard let records = Self.e2eKeyStore.readRecords() else { return }
+        encryptedGatewayIDs = Set(records.map(\.gatewayID))
+    }
+
+    /// Gives every pairing of this dashboard's profiles that belongs to this
+    /// iPhone an end-to-end encryption key, over the dashboard connection so
+    /// the secret never passes through the relay. A pairing whose key the
+    /// plugin already holds is left alone; one the plugin holds a key for
+    /// that this iPhone lacks (a reinstall, or a save that never finished)
+    /// gets a new one. The key only counts as established, and the
+    /// downgrade rule only applies, after the plugin confirms it.
+    func provisionEncryption(
+        dashboardID: UUID,
+        profiles: [String],
+        request: (_ path: String, _ method: String, _ body: [String: Any]?) async throws -> [String: Any]
+    ) async {
+        // One run at a time: two overlapping runs would each post a key for
+        // the same pairing, and the plugin and this iPhone could keep
+        // different ones.
+        guard !isProvisioningEncryption, let installationID = registration?.installationID else { return }
+        isProvisioningEncryption = true
+        defer { isProvisioningEncryption = false }
+        // Keys that can't be read right now: new ones would replace them on
+        // the plugin and leave them orphaned here. Provisioning runs again on
+        // the next connect.
+        Self.e2eKeyStore.removeUnparseable()
+        guard var records = Self.e2eKeyStore.readRecords() else { return }
+        // A marker with no keys means they are gone for good (a restore to
+        // another iPhone drops this-device-only Keychain items but brings the
+        // App Group marker back). Start over as on the first key; the marker
+        // stays, so plaintext stays untrusted until then.
+        let markerWasSet = NotificationSharedSettings.keysProvisioned
+        // Keys without the marker (a lost file, or a reinstall that kept the
+        // Keychain): put it back so unreadable keys still fail closed.
+        if !records.isEmpty { guard NotificationSharedSettings.markKeysProvisioned() else { return } }
+        if records.isEmpty && relayMeta == nil {
+            // The keyless pairings plaintext stays trusted for are fixed when
+            // the first key is stored: make sure they are known by then.
+            await refreshMeta()
+            // Without the relay's list the frozen set would be empty and
+            // every keyless pairing would lose routing for good. Provisioning
+            // runs again on the next connect.
+            guard relayMeta != nil else { return }
+        }
+        for profile in profiles {
+            let path = DashboardPath.withProfile(Self.e2ePath, profile: profile)
+            guard let status = try? await request(path, "GET", nil),
+                  let gatewayID = Self.gatewayNeedingEncryptionKey(status: status, installationID: installationID, records: records) else {
+                continue
+            }
+            let record = NotificationE2E.newRecord(
+                installationID: installationID,
+                gatewayID: gatewayID,
+                dashboardID: dashboardID.uuidString,
+                profile: profile
+            )
+            let body: [String: Any] = [
+                "installation_id": installationID,
+                "gateway_id": gatewayID,
+                "kid": record.kid,
+                "secret": NotificationE2E.base64URL(record.secret),
+            ]
+            guard let response = try? await request(path, "POST", body),
+                  response["ok"] as? Bool == true,
+                  response["kid"] as? String == record.kid else {
+                continue
+            }
+            // Unregistered or moved relays while the request was out: the
+            // key belongs to a pairing this iPhone no longer has.
+            guard registration?.installationID == installationID else { break }
+            // The first key freezes the keyless pairings plaintext may still
+            // come from, and the marker goes down before the key so no
+            // stored key ever exists without it.
+            let firstKey = records.isEmpty
+            if firstKey {
+                guard let relayMeta else { break }
+                // Starting over after lost keys, the set still only shrinks.
+                NotificationSharedSettings.knownGatewayIDs = NotificationE2E.knownGatewayIDs(
+                    listed: Set(relayMeta.gateways.map(\.id)),
+                    previous: NotificationSharedSettings.knownGatewayIDs,
+                    holdsKeys: markerWasSet
+                )
+            }
+            guard NotificationSharedSettings.markKeysProvisioned() else { break }
+            guard Self.e2eKeyStore.save(record) else {
+                if firstKey && !markerWasSet { NotificationSharedSettings.clearKeysProvisioned() }
+                continue
+            }
+            // The plugin now holds only this key for the pairing.
+            for stale in records
+            where stale.installationID == installationID && stale.gatewayID == gatewayID && stale.kid != record.kid {
+                Self.e2eKeyStore.remove(kid: stale.kid)
+            }
+            records.removeAll { $0.installationID == installationID && $0.gatewayID == gatewayID }
+            records.append(record)
+        }
+        refreshEncryptionState()
+    }
+
+    /// The relay gateway id of a profile's pairing that still needs a key
+    /// from this iPhone, or nil: not paired, paired with another device, an
+    /// old pairing without a gateway id, a host that can't encrypt, or a key
+    /// this iPhone already holds.
+    nonisolated static func gatewayNeedingEncryptionKey(status: [String: Any], installationID: String, records: [E2EKeyRecord]) -> String? {
+        guard status["ok"] as? Bool == true,
+              status["paired"] as? Bool == true,
+              status["crypto"] as? Bool != false,
+              status["installation_id"] as? String == installationID,
+              let gatewayID = status["gateway_id"] as? String, !gatewayID.isEmpty else {
+            return nil
+        }
+        if let kid = (status["e2e"] as? [String: Any])?["kid"] as? String,
+           records.contains(where: { $0.kid == kid && $0.gatewayID == gatewayID && $0.installationID == installationID }) {
+            return nil
+        }
+        return gatewayID
+    }
+
+    /// Forgets the keys of an installation this iPhone no longer uses.
+    private func removeEncryptionKeys(installationID: String) {
+        // Unreadable now: the keys stay inert (no envelope matches them) and
+        // go on the next removal.
+        if let stored = Self.e2eKeyStore.readRecords() {
+            for record in stored where record.installationID == installationID {
+                Self.e2eKeyStore.remove(kid: record.kid)
+            }
+        }
+        // With no key left, the next first key freezes a fresh set. Only on
+        // a real read: an unreadable store may still hold other keys.
+        if Self.e2eKeyStore.readRecords()?.isEmpty == true {
+            NotificationSharedSettings.knownGatewayIDs = []
+            NotificationSharedSettings.clearKeysProvisioned()
+        }
+        UserDefaults.standard.removeObject(forKey: Self.encryptedDecisionGatewaysKey)
+        refreshEncryptionState()
+    }
+
+    /// A clarify answer for a gateway with an encryption key is sealed for
+    /// it; the plugin rejects plaintext from an encrypted pairing.
+    nonisolated static func sealedRespondBody(
+        _ body: [String: String],
+        requestID: String,
+        installationID: String?,
+        records: [E2EKeyRecord]
+    ) throws -> [String: String] {
+        guard let gatewayID = body["gateway_id"],
+              let answer = body["answer"],
+              let record = records.first(where: { $0.gatewayID == gatewayID && $0.installationID == installationID }) else {
+            return body
+        }
+        var sealed = body
+        sealed["answer"] = try NotificationE2E.sealAnswer(answer, record: record, requestID: requestID, questionID: body["question_id"])
+        return sealed
     }
 
     func refresh() async {
@@ -621,11 +907,14 @@ final class PushNotificationService: ObservableObject {
 
         var errorDescription: String? {
             switch self {
-            case .unregistered: return "This device is not paired with a push relay."
-            case .transport(let message): return "Could not reach the push relay: \(message)"
-            case .server(let status): return "The push relay rejected the answer (HTTP \(status))."
+            case .unregistered:
+                return AppLocalization.string("This iPhone isn't set up to answer from notifications. Set it up again in Settings > Notifications.")
+            case .transport(let message):
+                return AppLocalization.string("Couldn't send your answer: \(message)")
+            case .server:
+                return AppLocalization.string("Your answer wasn't accepted. Open the chat in Conduit and answer there.")
             case .insecureTransport:
-                return "The relay URL must use HTTPS (plain HTTP is only allowed for a localhost relay)."
+                return AppLocalization.string("The notification relay address must start with https://. Fix it in Settings > Notifications.")
             }
         }
     }
@@ -656,6 +945,51 @@ final class PushNotificationService: ObservableObject {
         case noLongerActive
         case alreadyLocked
         case released
+    }
+
+    // MARK: - Live Activities (#605)
+
+    /// The installation whose relay answered 404 for the Live Activity
+    /// route; pairing with another relay tries again.
+    private var liveActivitiesUnsupportedInstallation: String?
+
+    /// Registers the push token of the Live Activity Conduit started for a
+    /// chat, under the ids the chat is known by (at most 6, the relay's
+    /// limit), so the host's progress reports reach it. Best effort: without
+    /// notifications, or on a relay without the route, the activity is only
+    /// updated while Conduit runs.
+    func registerLiveActivity(token: String, sessionIDs: [String]) async {
+        guard let registration, liveActivitiesUnsupportedInstallation != registration.installationID,
+              !sessionIDs.isEmpty else { return }
+        await sendLiveActivity(
+            LiveActivityRegistration(pushToken: token, sessionIDs: Array(sessionIDs.prefix(6))),
+            method: "PUT",
+            registration: registration
+        )
+    }
+
+    /// The activity ended on the phone: the relay forgets its token.
+    func unregisterLiveActivity(token: String) async {
+        guard let registration, liveActivitiesUnsupportedInstallation != registration.installationID else { return }
+        await sendLiveActivity(LiveActivityRemoval(pushToken: token), method: "DELETE", registration: registration)
+    }
+
+    private func sendLiveActivity<Body: Encodable>(_ body: Body, method: String, registration: StoredRegistration) async {
+        do {
+            let request = try jsonRequest(
+                path: "/v1/installations/\(registration.installationID)/live-activities",
+                method: method,
+                body: body,
+                credential: registration.credential
+            )
+            let (_, response) = try await URLSession.shared.data(for: request)
+            // Only a registration's 404 means the relay has no route.
+            if method == "PUT", (response as? HTTPURLResponse)?.statusCode == 404 {
+                liveActivitiesUnsupportedInstallation = registration.installationID
+            }
+        } catch {
+            // The activity still updates while Conduit runs.
+        }
     }
 
     /// Answers a plugin-minted clarify decision through the relay. The gateway
@@ -716,7 +1050,13 @@ final class PushNotificationService: ObservableObject {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(registration.credential)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let sealed = try Self.sealedRespondBody(
+            body,
+            requestID: requestId,
+            installationID: registration.installationID,
+            records: Self.e2eKeyStore.records()
+        )
+        request.httpBody = try JSONSerialization.data(withJSONObject: sealed)
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else {
@@ -739,14 +1079,14 @@ final class PushNotificationService: ObservableObject {
         } catch let error as RelayDecisionError {
             throw error
         } catch {
-            throw RelayDecisionError.transport(error.localizedDescription)
+            throw RelayDecisionError.transport(UserFacingError.message(for: error))
         }
     }
 
     func enable() async {
         // The Enable button is disabled while working, but a second tap can
         // land before that state reaches the view.
-        guard !isWorking else { return }
+        guard !isWorking, !isPairing else { return }
         lastError = nil
         relayNotice = nil
         preferences.enabled = true
@@ -761,7 +1101,7 @@ final class PushNotificationService: ObservableObject {
             let token = try await requestDeviceToken()
             try await register(deviceToken: token)
         } catch {
-            lastError = error.localizedDescription
+            lastError = UserFacingError.message(for: error)
         }
     }
 
@@ -769,8 +1109,10 @@ final class PushNotificationService: ObservableObject {
         // Same one-operation-at-a-time rule as enable(), so a revoke never
         // interleaves with an in-flight registration. A tap that lands
         // mid-operation is dropped rather than queued; the button is
-        // disabled while working, so this only catches the race window.
-        guard !isWorking else { return }
+        // disabled while working or pairing, so this only catches the race
+        // window. Not mid-pairing: the plugin would claim for a revoked
+        // installation.
+        guard !isWorking, !isPairing else { return }
         lastError = nil
         relayNotice = nil
         isWorking = true
@@ -796,6 +1138,13 @@ final class PushNotificationService: ObservableObject {
         // One move at a time: overlapping moves would each register, and
         // all but the last installation would be orphaned on the new relay.
         guard !isWorking else { return }
+        // A pairing in flight claims for the current installation; the move
+        // waits for it rather than being dropped.
+        while isPairing {
+            try? await Task.sleep(for: .milliseconds(200))
+            if Task.isCancelled { return }
+        }
+        guard !isWorking else { return }
         // A failure against the previous relay no longer describes the
         // current setup, whether or not there is a registration to move.
         lastError = nil
@@ -820,10 +1169,11 @@ final class PushNotificationService: ObservableObject {
             // Still registered with the old relay, which keeps working;
             // Settings offers the move again.
             registration = previous
-            lastError = error.localizedDescription
+            lastError = UserFacingError.message(for: error)
             return
         }
         await revokeInstallation(previous)
+        removeEncryptionKeys(installationID: previous.installationID)
         relayMeta = nil
         pairingCode = nil
         pairingExpiry = nil
@@ -840,6 +1190,7 @@ final class PushNotificationService: ObservableObject {
     private func revokeRegistration() async {
         if let registration {
             await revokeInstallation(registration)
+            removeEncryptionKeys(installationID: registration.installationID)
         }
         registration = nil
         KeychainHelper.clearPushRegistration()
@@ -863,7 +1214,7 @@ final class PushNotificationService: ObservableObject {
         do {
             try await updateRegistration()
         } catch {
-            lastError = error.localizedDescription
+            lastError = UserFacingError.message(for: error)
         }
     }
 
@@ -874,37 +1225,98 @@ final class PushNotificationService: ObservableObject {
     /// Conduit just never creates new ones.)
     func createPairingCode(dashboardID: UUID) async {
         // Not mid-move: a code created against the old relay would be
-        // cleared (and useless) once the move lands.
-        guard !isWorking else { return }
+        // cleared (and useless) once the move lands. Not mid-pairing either.
+        guard !isWorking, !isPairing else { return }
         pairingCode = nil
         pairingExpiry = nil
         lastError = nil
         guard let registration else {
-            lastError = "Enable notifications on this phone before creating a pairing code."
+            lastError = AppLocalization.string("Turn on notifications on this device before creating a pairing code.")
             return
         }
         isWorking = true
         defer { isWorking = false }
         do {
-            var request = authorizedRequest(
-                url: try authenticatedRelayURL("/v1/installations/\(registration.installationID)/pairings"),
-                credential: registration.credential
-            )
-            request.httpMethod = "POST"
-            // Bind the pairing to the dashboard (#148): the relay persists
-            // this UUID at claim time, and every later push derived from that
-            // gateway credential is stamped with it. Older relays ignore the
-            // body, which keeps pre-dashboard relays working.
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONEncoder().encode(PairingCreateRequest(dashboardID: dashboardID.uuidString))
-            let (data, response) = try await URLSession.shared.data(for: request)
-            try validate(response: response, data: data)
-            let pairing = try JSONDecoder().decode(PairingResponse.self, from: data)
+            let pairing = try await requestPairingCode(registration: registration, dashboardID: dashboardID)
             pairingCode = pairing.pairingCode
             pairingExpiry = pairing.expiresAt
         } catch {
-            lastError = error.localizedDescription
+            lastError = UserFacingError.message(for: error)
         }
+    }
+
+    /// A new one-time pairing code from the relay, bound to `dashboardID`.
+    private func requestPairingCode(registration: StoredRegistration, dashboardID: UUID) async throws -> PairingResponse {
+        var request = authorizedRequest(
+            url: try authenticatedRelayURL("/v1/installations/\(registration.installationID)/pairings"),
+            credential: registration.credential
+        )
+        request.httpMethod = "POST"
+        // Bind the pairing to the dashboard (#148): the relay persists
+        // this UUID at claim time, and every later push derived from that
+        // gateway credential is stamped with it. Older relays ignore the
+        // body, which keeps pre-dashboard relays working.
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(PairingCreateRequest(dashboardID: dashboardID.uuidString))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response: response, data: data)
+        return try JSONDecoder().decode(PairingResponse.self, from: data)
+    }
+
+    /// This iPhone's relay installation, which a profile's pairing names.
+    var installationID: String? { registration?.installationID }
+
+    static let pairPath = "/api/plugins/conduit_push/pair"
+
+    /// Who a profile's notifications go to, from the plugin's
+    /// `GET /e2e?profile=` answer.
+    enum ProfilePairing: Equatable {
+        case unpaired
+        case thisDevice
+        /// Another iPhone, or this one before it re-registered.
+        case otherDevice
+    }
+
+    static func profilePairing(status: [String: Any], installationID: String) -> ProfilePairing {
+        guard status["paired"] as? Bool == true else { return .unpaired }
+        return status["installation_id"] as? String == installationID ? .thisDevice : .otherDevice
+    }
+
+    /// Pairs `profile` on the dashboard's host without a code to type
+    /// (plugin 0.24+): a new code from the relay goes to the plugin over
+    /// the signed-in dashboard connection, and the plugin claims it, the
+    /// same claim `hermes conduit-push pair` makes. `request` reaches that
+    /// dashboard.
+    func pairProfile(
+        _ profile: String,
+        dashboardID: UUID,
+        request: (_ path: String, _ method: String, _ body: [String: Any]?) async throws -> [String: Any]
+    ) async throws {
+        // Not mid-move: a code from the old relay is useless once the move lands.
+        guard !isWorking, !isPairing, let registration else { throw DashboardTicketBridgeError.notReady }
+        // One pairing at a time: the button and the automatic one can't
+        // overlap. Its own flag, so the notifications switch doesn't read
+        // "Updating" meanwhile.
+        isPairing = true
+        defer { isPairing = false }
+        // The relay the code is minted at is the one the host claims it at,
+        // even if a relay move lands meanwhile.
+        let relay = relayURL
+        let pairing = try await requestPairingCode(registration: registration, dashboardID: dashboardID)
+        guard self.registration?.installationID == registration.installationID else {
+            throw DashboardTicketBridgeError.notReady
+        }
+        let body: [String: Any] = ["pairing_code": pairing.pairingCode, "relay_url": relay.absoluteString]
+        let response = try await request(DashboardPath.withProfile(Self.pairPath, profile: profile), "POST", body)
+        // Notifications turned off or moved meanwhile: that installation is
+        // gone, so its pairing is nothing to confirm or refresh.
+        guard self.registration?.installationID == registration.installationID else {
+            throw DashboardTicketBridgeError.notReady
+        }
+        guard response["ok"] as? Bool == true, response["installation_id"] as? String == registration.installationID else {
+            throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The plugin didn't confirm the pairing."))
+        }
+        await refreshMeta()
     }
 
     func didReceiveDeviceToken(_ tokenData: Data) {
@@ -923,8 +1335,193 @@ final class PushNotificationService: ObservableObject {
     }
 
     func receiveNotificationPayload(_ userInfo: [AnyHashable: Any]) {
-        guard let target = Self.parseNotificationTarget(from: userInfo) else { return }
+        let records = Self.e2eKeyStore.records()
+        let evaluation = NotificationE2E.evaluate(
+            userInfo,
+            records: records,
+            knownGatewayIDs: NotificationSharedSettings.knownGatewayIDs,
+            keysProvisioned: NotificationSharedSettings.keysProvisioned
+        )
+        guard var target = Self.target(for: evaluation, userInfo: userInfo) else { return }
+        if case .verified(let verified) = evaluation {
+            // A sealed message routes once: a replay of it can't open
+            // anything after the original was tapped.
+            guard Self.e2eSeenStore.insert(verified.envelope.replayKey, namespace: "routed") else { return }
+        }
+        if !preferences.decisionCards, target.decision != nil {
+            // Encrypted pushes always carry the card (the relay can't strip
+            // it); the preference still decides whether Conduit uses it.
+            target = ConduitNotificationTarget(
+                profile: target.profile,
+                sessionId: target.sessionId,
+                durableSessionID: target.durableSessionID,
+                dashboardID: target.dashboardID,
+                hasMalformedDashboardID: target.hasMalformedDashboardID,
+                relayGatewayID: target.relayGatewayID,
+                type: target.type,
+                decision: nil,
+                call: target.call
+            )
+        }
         retainRelayGatewayID(for: target)
+        if case .verified = evaluation { persistEncryptedGatewayID(for: target) }
+        route(target)
+    }
+
+    // MARK: Ringing calls (#449 step 2)
+
+    /// What a VoIP push rings for (HermesNativeCalls).
+    struct VoIPCall {
+        /// The call, routed like a tap on its notification; nil when the
+        /// push routes nowhere (no call in it, or it can't be trusted).
+        let target: ConduitNotificationTarget?
+        /// When the relay sent it; nil from a relay that didn't say.
+        let sentAt: Date?
+        /// A sealed push that already rang once.
+        let replayed: Bool
+    }
+
+    /// The call a VoIP push carries, under the same end-to-end rules as a
+    /// notification tap (`receiveNotificationPayload`). Synchronous: the
+    /// PushKit callback reports the call before it returns.
+    func receiveVoIPCall(_ userInfo: [AnyHashable: Any], now: Date = Date()) -> VoIPCall {
+        let evaluation = NotificationE2E.evaluate(
+            userInfo,
+            records: Self.e2eKeyStore.records(),
+            knownGatewayIDs: NotificationSharedSettings.knownGatewayIDs,
+            keysProvisioned: NotificationSharedSettings.keysProvisioned,
+            now: now
+        )
+        let sentAt = Self.voipSentAt(userInfo)
+        guard let target = Self.target(for: evaluation, userInfo: userInfo), target.call != nil else {
+            return VoIPCall(target: nil, sentAt: sentAt, replayed: false)
+        }
+        if case .verified(let verified) = evaluation {
+            guard Self.e2eSeenStore.insert(verified.envelope.replayKey, namespace: "rang") else {
+                return VoIPCall(target: target, sentAt: sentAt, replayed: true)
+            }
+            persistEncryptedGatewayID(for: target)
+        }
+        return VoIPCall(target: target, sentAt: sentAt, replayed: false)
+    }
+
+    /// The relay's `sent_at` (seconds since 1970), outside any sealed
+    /// envelope.
+    static func voipSentAt(_ userInfo: [AnyHashable: Any]) -> Date? {
+        let direct = userInfo["conduit"] as? [String: Any]
+        let nested = (userInfo["body"] as? [String: Any])?["conduit"] as? [String: Any]
+        guard let seconds = (direct?["sent_at"] as? NSNumber) ?? (nested?["sent_at"] as? NSNumber) else { return nil }
+        return Date(timeIntervalSince1970: seconds.doubleValue)
+    }
+
+    /// The PushKit token calls ring on; nil while the phone can't ring
+    /// (CallKit is off in this storefront, or PushKit has given none).
+    private(set) var voipToken: String?
+
+    /// HermesNativeCalls has a new PushKit token, or none any more: the
+    /// relay learns it with the registration.
+    func updateVoIPToken(_ token: String?) {
+        voipToken = token
+        queueVoIPTokenUpdate()
+    }
+
+    /// The Apple Watch's own PushKit token, which calls from Hermes ring on
+    /// too (designs/hermes-calls-watch.md). Kept across launches: the Watch
+    /// sends it again only when it changes.
+    private(set) var watchVoIPToken: String? = UserDefaults.standard.string(forKey: PushNotificationService.watchVoIPTokenKey)
+    static let watchVoIPTokenKey = "hermesCalls.watchVoIPToken"
+
+    /// The voice a Watch call answers with, as the Watch last said (a
+    /// WatchCallVoices.Voice raw value); nil from an older Watch app.
+    private(set) var watchEngine: String? = UserDefaults.standard.string(forKey: PushNotificationService.watchEngineKey)
+    static let watchEngineKey = "hermesCalls.watchEngine"
+
+    /// Which Watch voices can start, as AppState last found them.
+    private(set) var watchCallVoices: WatchCallVoices = UserDefaults.standard.data(forKey: PushNotificationService.watchCallVoicesKey)
+        .flatMap { try? JSONDecoder().decode(WatchCallVoices.self, from: $0) } ?? WatchCallVoices()
+    static let watchCallVoicesKey = "hermesCalls.watchCallVoices"
+
+    /// The Watch app has a new PushKit token, or none any more, or another
+    /// voice.
+    func updateWatchVoIPToken(_ token: String?, engine: String?) {
+        watchVoIPToken = token
+        watchEngine = engine
+        UserDefaults.standard.set(token, forKey: Self.watchVoIPTokenKey)
+        UserDefaults.standard.set(engine, forKey: Self.watchEngineKey)
+        queueVoIPTokenUpdate()
+    }
+
+    func updateWatchCallVoices(_ voices: WatchCallVoices) {
+        guard voices != watchCallVoices else { return }
+        watchCallVoices = voices
+        UserDefaults.standard.set(try? JSONEncoder().encode(voices), forKey: Self.watchCallVoicesKey)
+        queueVoIPTokenUpdate()
+    }
+
+    /// The APNs token for the agent's on-demand locate (the Location Push
+    /// extension), while background location sharing is on; nil otherwise.
+    private(set) var locationToken: String?
+
+    /// LocationBackgroundMonitor has a new location push token, or none.
+    func updateLocationToken(_ token: String?) {
+        guard token != locationToken else { return }
+        locationToken = token
+        queueVoIPTokenUpdate()
+    }
+
+    /// The token the relay gets: only one whose relay says it sends locates.
+    private var relayLocationToken: String? {
+        relayMeta?.supportsLocationPush == true ? locationToken : nil
+    }
+
+    private var ringingWatchVoIPToken: String? {
+        Self.ringingWatchToken(phone: voipToken, watch: watchVoIPToken, engine: watchEngine, voices: watchCallVoices)
+    }
+
+    /// The Watch rings only alongside this phone (while the phone doesn't
+    /// ring, the relay has neither token), and only while the voice it
+    /// answers with can start: the Watch has no Classic voice to fall back
+    /// on (WatchCallVoices).
+    static func ringingWatchToken(phone: String?, watch: String?, engine: String?, voices: WatchCallVoices) -> String? {
+        guard phone != nil, voices.rings(engine: engine) else { return nil }
+        return watch
+    }
+
+    private func queueVoIPTokenUpdate() {
+        guard registration != nil else { return }
+        // One after another, each sending the tokens as they are by then. An
+        // update still on its way may carry another token, so whether this
+        // one is new is decided when its turn comes.
+        let previous = voipTokenUpdate
+        voipTokenUpdate = Task {
+            await previous?.value
+            guard let registration,
+                  registration.voipToken != voipToken || registration.watchVoipToken != ringingWatchVoIPToken
+                    || registration.locationToken != relayLocationToken else { return }
+            try? await updateRegistration()
+        }
+    }
+    private var voipTokenUpdate: Task<Void, Never>?
+
+    /// A "Hermes wants to talk" notification Conduit posted itself (#449).
+    func receiveLocalCallNotification(_ userInfo: [AnyHashable: Any]) {
+        guard let target = HermesCallNotifications.localTarget(from: userInfo) else { return }
+        route(target)
+    }
+
+    /// A call from Hermes answered with Conduit on screen opens as its
+    /// notification's Talk button would (#449).
+    func routeAnsweredHermesCall(_ target: ConduitNotificationTarget) {
+        route(target)
+    }
+
+    /// A chat link for another profile (`conduit://session/<id>?profile=…`)
+    /// opens as a notification for that chat would.
+    func routeChatLink(_ target: ConduitNotificationTarget) {
+        route(target)
+    }
+
+    private func route(_ target: ConduitNotificationTarget) {
         navigationRetryTask?.cancel()
         navigationRetryTask = nil
         pendingTarget = target
@@ -983,6 +1580,43 @@ final class PushNotificationService: ObservableObject {
     /// internal so the dashboard-identity parsing rules are testable without
     /// the singleton's registration state.
     static func parseNotificationTarget(from userInfo: [AnyHashable: Any]) -> ConduitNotificationTarget? {
+        parseNotificationTarget(
+            from: userInfo,
+            records: e2eKeyStore.records(),
+            knownGatewayIDs: NotificationSharedSettings.knownGatewayIDs,
+            keysProvisioned: NotificationSharedSettings.keysProvisioned
+        )
+    }
+
+    /// End-to-end encryption decides what a push may drive (#431): a sealed
+    /// push routes only from its verified content and the pairing its key
+    /// belongs to; plaintext routes only for pairings that never set up
+    /// encryption; anything else routes nowhere.
+    static func parseNotificationTarget(
+        from userInfo: [AnyHashable: Any],
+        records: [E2EKeyRecord],
+        knownGatewayIDs: Set<String>,
+        keysProvisioned: Bool,
+        now: Date = Date()
+    ) -> ConduitNotificationTarget? {
+        target(
+            for: NotificationE2E.evaluate(userInfo, records: records, knownGatewayIDs: knownGatewayIDs, keysProvisioned: keysProvisioned, now: now),
+            userInfo: userInfo
+        )
+    }
+
+    private static func target(for evaluation: NotificationE2E.Evaluation, userInfo: [AnyHashable: Any]) -> ConduitNotificationTarget? {
+        switch evaluation {
+        case .legacy:
+            return parsePlaintextNotificationTarget(from: userInfo)
+        case .untrusted:
+            return nil
+        case .verified(let verified):
+            return target(from: verified.routingPayload)
+        }
+    }
+
+    private static func parsePlaintextNotificationTarget(from userInfo: [AnyHashable: Any]) -> ConduitNotificationTarget? {
         let direct = userInfo["conduit"] as? [String: Any]
         let nested = (userInfo["body"] as? [String: Any])?["conduit"] as? [String: Any]
         // The relay's optimized APNs layout keeps the structured decision
@@ -991,14 +1625,19 @@ final class PushNotificationService: ObservableObject {
         // carries a decision must win, nested first (that is where the
         // optimized layout puts it). Payloads without a decision anywhere
         // fall back to plain routing, preferring the legacy top-level copy.
+        // A call's details travel the same way (#449).
         let payload: [String: Any]
-        if nested?["decision"] is [String: Any] {
+        if nested?["decision"] is [String: Any] || nested?["call"] is [String: Any] {
             payload = nested ?? [:]
-        } else if direct?["decision"] is [String: Any] {
+        } else if direct?["decision"] is [String: Any] || direct?["call"] is [String: Any] {
             payload = direct ?? [:]
         } else {
             payload = direct ?? nested ?? [:]
         }
+        return target(from: payload)
+    }
+
+    private static func target(from payload: [String: Any]) -> ConduitNotificationTarget? {
         guard let sessionId = payload["session_id"] as? String,
               !sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let durableSessionID = Self.routingDurableSessionID(from: payload)
@@ -1036,7 +1675,8 @@ final class PushNotificationService: ObservableObject {
             hasMalformedDashboardID: hasMalformedDashboardID,
             relayGatewayID: rawRelayGatewayID?.isEmpty == false ? rawRelayGatewayID : nil,
             type: type?.isEmpty == false ? type : nil,
-            decision: pendingDecision(from: payload)
+            decision: pendingDecision(from: payload),
+            call: HermesCallRequest.parse(payload["call"], type: type)
         )
     }
 
@@ -1190,24 +1830,66 @@ final class PushNotificationService: ObservableObject {
         guard RelayTransportPolicy.allowsCredentialTransport(issuer) else {
             throw RelayDecisionError.insecureTransport
         }
-        let body = RegistrationRequest(bundleID: bundleID, deviceToken: deviceToken, environment: "production", preferences: preferences)
+        let voipToken = self.voipToken
+        let watchToken = ringingWatchVoIPToken
+        let locationToken = relayLocationToken
+        let body = RegistrationRequest(bundleID: bundleID, deviceToken: deviceToken, environment: "production", preferences: preferences, voipToken: voipToken, watchVoipToken: watchToken, locationToken: locationToken)
         var request = try jsonRequest(path: "/v1/installations", method: "POST", body: body)
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response: response, data: data)
         let responseBody = try JSONDecoder().decode(RegistrationResponse.self, from: data)
         registration = StoredRegistration(credential: responseBody.credential, installationID: responseBody.installation.id, preferences: responseBody.installation.preferences ?? preferences, relayURL: issuer.absoluteString)
+        // Only a relay that rings (0.9+) keeps it; an older one is asked
+        // again at the next update.
+        registration?.voipToken = responseBody.installation.voip == true ? voipToken : nil
+        // Likewise the Watch's, on a relay that rings it (0.10+).
+        registration?.watchVoipToken = responseBody.installation.watchVoip == true ? watchToken : nil
+        // And the location push token, which goes only to a relay that
+        // says it sends locates (`location-push`).
+        registration?.locationToken = responseBody.installation.location != false ? locationToken : nil
         preferences = registration!.preferences
         persistRegistration()
+        // A PushKit token that came while this was on its way goes next
+        // (at first launch both arrive together).
+        if self.voipToken != voipToken || ringingWatchVoIPToken != watchToken || relayLocationToken != locationToken {
+            queueVoIPTokenUpdate()
+        }
     }
 
     private func updateRegistration(deviceToken: String? = nil) async throws {
         guard let registration else { return }
-        let body = UpdateRegistrationRequest(deviceToken: deviceToken ?? self.deviceToken, preferences: preferences)
+        let voipToken = self.voipToken
+        let voipChange: VoIPTokenChange = registration.voipToken == voipToken ? .keep : (voipToken.map(VoIPTokenChange.set) ?? .clear)
+        let watchToken = ringingWatchVoIPToken
+        let watchChange: VoIPTokenChange = registration.watchVoipToken == watchToken ? .keep : (watchToken.map(VoIPTokenChange.set) ?? .clear)
+        let locationToken = relayLocationToken
+        let locationChange: VoIPTokenChange = registration.locationToken == locationToken ? .keep : (locationToken.map(VoIPTokenChange.set) ?? .clear)
+        let body = UpdateRegistrationRequest(deviceToken: deviceToken ?? self.deviceToken, preferences: preferences, voipToken: voipChange, watchVoipToken: watchChange, locationToken: locationChange)
         var request = try jsonRequest(path: "/v1/installations/\(registration.installationID)", method: "PUT", body: body, credential: registration.credential)
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response: response, data: data)
         self.registration?.preferences = preferences
+        let installation = (try? JSONDecoder().decode(UpdateRegistrationResponse.self, from: data))?.installation
+        // Another update sent a newer token meanwhile, and this one may
+        // have landed after it: the newer token goes again, last.
+        var newerToken = false
+        if voipChange != .keep {
+            let rings = installation?.voip == true
+            self.registration?.voipToken = rings ? voipToken : nil
+            newerToken = rings && voipToken != self.voipToken
+        }
+        if watchChange != .keep {
+            let rings = installation?.watchVoip == true
+            self.registration?.watchVoipToken = rings ? watchToken : nil
+            newerToken = newerToken || (rings && watchToken != ringingWatchVoIPToken)
+        }
+        if locationChange != .keep {
+            let locates = installation?.location != false
+            self.registration?.locationToken = locates ? locationToken : nil
+            newerToken = newerToken || (locates && locationToken != relayLocationToken)
+        }
         persistRegistration()
+        if newerToken { queueVoIPTokenUpdate() }
     }
 
     private func jsonRequest<Body: Encodable>(path: String, method: String, body: Body, credential: String? = nil) throws -> URLRequest {
@@ -1229,7 +1911,7 @@ final class PushNotificationService: ObservableObject {
 
     private func validate(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let detail = (try? JSONDecoder().decode(RelayError.self, from: data).message) ?? "Push relay request failed."
+            let detail = (try? JSONDecoder().decode(RelayError.self, from: data).message) ?? AppLocalization.string("Push relay request failed.")
             throw PushNotificationError.relay(detail)
         }
     }
@@ -1240,6 +1922,24 @@ final class PushNotificationService: ObservableObject {
     }
 }
 
+private struct LiveActivityRegistration: Encodable {
+    let pushToken: String
+    let sessionIDs: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case pushToken = "push_token"
+        case sessionIDs = "session_ids"
+    }
+}
+
+private struct LiveActivityRemoval: Encodable {
+    let pushToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case pushToken = "push_token"
+    }
+}
+
 private struct StoredRegistration: Codable {
     let credential: String
     let installationID: String
@@ -1247,6 +1947,12 @@ private struct StoredRegistration: Codable {
     /// The relay that issued `credential`. Optional so registrations saved
     /// before it was recorded still decode.
     var relayURL: String?
+    /// The PushKit token the relay rings (#449); nil when it has none.
+    var voipToken: String? = nil
+    /// The Apple Watch's PushKit token the relay rings too.
+    var watchVoipToken: String? = nil
+    /// The location push token the relay sends locates to.
+    var locationToken: String? = nil
 }
 
 private struct RegistrationRequest: Encodable {
@@ -1254,19 +1960,69 @@ private struct RegistrationRequest: Encodable {
     let deviceToken: String
     let environment: String
     let preferences: ConduitNotificationPreferences
-    enum CodingKeys: String, CodingKey { case bundleID = "bundle_id", deviceToken = "device_token", environment, preferences }
+    var voipToken: String? = nil
+    var watchVoipToken: String? = nil
+    var locationToken: String? = nil
+    enum CodingKeys: String, CodingKey {
+        case bundleID = "bundle_id", deviceToken = "device_token", environment, preferences, voipToken = "voip_token"
+        case watchVoipToken = "watch_voip_token", locationToken = "location_token"
+    }
 }
 
-private struct UpdateRegistrationRequest: Encodable {
+/// What an update does to the relay's PushKit token.
+enum VoIPTokenChange: Equatable {
+    case keep
+    case clear
+    case set(String)
+}
+
+struct UpdateRegistrationRequest: Encodable {
     let deviceToken: String?
     let preferences: ConduitNotificationPreferences
-    enum CodingKeys: String, CodingKey { case deviceToken = "device_token", preferences }
+    var voipToken: VoIPTokenChange = .keep
+    var watchVoipToken: VoIPTokenChange = .keep
+    var locationToken: VoIPTokenChange = .keep
+    enum CodingKeys: String, CodingKey {
+        case deviceToken = "device_token", preferences, voipToken = "voip_token", watchVoipToken = "watch_voip_token"
+        case locationToken = "location_token"
+    }
+
+    /// A token is left out to keep it, null to clear it.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(deviceToken, forKey: .deviceToken)
+        try container.encode(preferences, forKey: .preferences)
+        for (change, key) in [(voipToken, CodingKeys.voipToken), (watchVoipToken, CodingKeys.watchVoipToken), (locationToken, CodingKeys.locationToken)] {
+            switch change {
+            case .keep: break
+            case .clear: try container.encodeNil(forKey: key)
+            case .set(let token): try container.encode(token, forKey: key)
+            }
+        }
+    }
 }
 
 private struct RegistrationResponse: Decodable {
-    struct Installation: Decodable { let id: String; let preferences: ConduitNotificationPreferences? }
+    struct Installation: Decodable {
+        let id: String
+        let preferences: ConduitNotificationPreferences?
+        let voip: Bool?
+        let watchVoip: Bool?
+        let location: Bool?
+        enum CodingKeys: String, CodingKey { case id, preferences, voip, watchVoip = "watch_voip", location }
+    }
     let credential: String
     let installation: Installation
+}
+
+private struct UpdateRegistrationResponse: Decodable {
+    struct Installation: Decodable {
+        let voip: Bool?
+        let watchVoip: Bool?
+        let location: Bool?
+        enum CodingKeys: String, CodingKey { case voip, watchVoip = "watch_voip", location }
+    }
+    let installation: Installation?
 }
 
 private struct PairingCreateRequest: Encodable {
@@ -1289,9 +2045,9 @@ private enum PushNotificationError: LocalizedError {
     case relay(String)
     var errorDescription: String? {
         switch self {
-        case .permissionDenied: return "Allow notifications in Settings to continue."
-        case .tokenTimeout: return "Apple didn't return a push token in time. Check your connection and try again."
-        case .tokenRequestPending: return "Still waiting for a push token from Apple. Try again in a moment."
+        case .permissionDenied: return AppLocalization.string("Allow notifications in Settings to continue.")
+        case .tokenTimeout: return AppLocalization.string("Apple didn't return a push token in time. Check your connection and try again.")
+        case .tokenRequestPending: return AppLocalization.string("Still waiting for a push token from Apple. Try again in a moment.")
         case .relay(let message): return message
         }
     }

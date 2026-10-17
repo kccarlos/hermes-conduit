@@ -224,6 +224,7 @@ final class NativeOAuthAPIClient {
         path: String,
         method: String = "GET",
         body: [String: Any]? = nil,
+        encodedBody: Data? = nil,
         accessToken: String,
         timeoutMilliseconds: Int = 12_000,
         maxResponseBytes: Int = DataURLLimits.maxJSONResponseBytes
@@ -233,7 +234,10 @@ final class NativeOAuthAPIClient {
         request.timeoutInterval = TimeInterval(max(1_000, timeoutMilliseconds)) / 1_000
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        if let body {
+        if let encodedBody {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = encodedBody
+        } else if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
@@ -257,7 +261,7 @@ final class NativeOAuthAPIClient {
             }
             throw DashboardTicketBridgeError.http(
                 status: http.statusCode,
-                detail: Self.errorDetail(data) ?? "Dashboard request failed (\(http.statusCode))."
+                detail: Self.errorDetail(data) ?? AppLocalization.string("Dashboard request failed (\(String(http.statusCode))).")
             )
         }
         guard !data.isEmpty else { return [:] }
@@ -274,7 +278,7 @@ final class NativeOAuthAPIClient {
             accessToken: accessToken
         )
         guard let ticket = response["ticket"] as? String, !ticket.isEmpty else {
-            throw DashboardTicketBridgeError.requestFailed("Dashboard did not return a WebSocket ticket.")
+            throw DashboardTicketBridgeError.requestFailed(DashboardTicketBridgeError.noSessionTicketDetail)
         }
         return ticket
     }
@@ -310,13 +314,13 @@ final class NativeOAuthAPIClient {
         return tokens
     }
 
-    private func endpointRequest(path: String) throws -> URLRequest {
+    func endpointRequest(path: String) throws -> URLRequest {
         guard let normalized = try? ConnectionURLPolicy.normalizedBaseURL(baseURL),
               let url = URL(string: "\(normalized)\(path)"),
               ConnectionURLPolicy.originMatches(url, expected: URL(string: normalized)) else {
             throw NativeOAuthError.invalidURL
         }
-        return cloudflareAccess?.applying(to: URLRequest(url: url)) ?? URLRequest(url: url)
+        return URLRequest(url: url).applyingProxyHeaders(cloudflare: cloudflareAccess)
     }
 
     private static func errorDetail(_ data: Data) -> String? {
@@ -362,6 +366,7 @@ final class NativeOAuthSession {
         path: String,
         method: String = "GET",
         body: [String: Any]? = nil,
+        encodedBody: Data? = nil,
         timeoutMilliseconds: Int = 12_000,
         maxResponseBytes: Int = DataURLLimits.maxJSONResponseBytes
     ) async throws -> [String: Any] {
@@ -373,6 +378,7 @@ final class NativeOAuthSession {
                 path: path,
                 method: method,
                 body: body,
+                encodedBody: encodedBody,
                 accessToken: tokens.accessToken,
                 timeoutMilliseconds: timeoutMilliseconds,
                 maxResponseBytes: maxResponseBytes
@@ -388,7 +394,7 @@ final class NativeOAuthSession {
             guard replayIsSafe else {
                 throw DashboardTicketBridgeError.http(
                     status: 401,
-                    detail: "Authentication was refreshed; retry this action."
+                    detail: DashboardTicketBridgeError.signInRefreshedDetail
                 )
             }
             do {
@@ -396,6 +402,7 @@ final class NativeOAuthSession {
                     path: path,
                     method: method,
                     body: body,
+                    encodedBody: encodedBody,
                     accessToken: tokens.accessToken,
                     timeoutMilliseconds: timeoutMilliseconds,
                     maxResponseBytes: maxResponseBytes
@@ -415,10 +422,34 @@ final class NativeOAuthSession {
         }
     }
 
+    /// A GET for `path` carrying the current access token, refreshed first
+    /// when it is about to expire, for a response that is not JSON (a file
+    /// download, #569). Pass the request the server just rejected to
+    /// refresh past that token, as `requestJSON` does on a 401.
+    func authorizedRequest(path: String, replacing rejected: URLRequest? = nil) async throws -> URLRequest {
+        guard !isInvalidated else { throw CancellationError() }
+        if let header = rejected?.value(forHTTPHeaderField: "Authorization"), header.hasPrefix("Bearer ") {
+            try await refresh(rejectedAccessToken: String(header.dropFirst("Bearer ".count)))
+        } else if tokens.needsRefresh() {
+            try await refresh()
+        }
+        guard !isInvalidated else { throw CancellationError() }
+        var request = try client.endpointRequest(path: path)
+        request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    /// Forgets a grant the server rejected again right after a refresh, as
+    /// `requestJSON`'s replay does.
+    func discardRejectedGrant() {
+        guard !isInvalidated else { return }
+        KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID)
+    }
+
     func mintTicket() async throws -> String {
         let response = try await requestJSON(path: "/api/auth/ws-ticket", method: "POST")
         guard let ticket = response["ticket"] as? String, !ticket.isEmpty else {
-            throw DashboardTicketBridgeError.requestFailed("Dashboard did not return a WebSocket ticket.")
+            throw DashboardTicketBridgeError.requestFailed(DashboardTicketBridgeError.noSessionTicketDetail)
         }
         return ticket
     }
@@ -575,11 +606,11 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
                 self.queue.async { self.processRequest(request, on: connection) }
             } catch NativeOAuthHTTPReadError.tooLarge {
                 self.queue.async {
-                    self.sendResponse(on: connection, status: "431 Request Header Fields Too Large", message: "The sign-in response was too large.")
+                    self.sendResponse(on: connection, status: "431 Request Header Fields Too Large", message: AppLocalization.string("The sign-in response was too large."))
                 }
             } catch {
                 self.queue.async {
-                    self.sendResponse(on: connection, status: "400 Bad Request", message: "The sign-in response was incomplete.")
+                    self.sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was incomplete."))
                 }
             }
         }
@@ -609,16 +640,16 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
     private func processRequest(_ request: Data, on connection: NWConnection) {
         guard let requestText = String(data: request, encoding: .utf8),
               let requestLine = requestText.components(separatedBy: "\r\n").first else {
-            sendResponse(on: connection, status: "400 Bad Request", message: "The sign-in response was invalid.")
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid."))
             return
         }
         let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
         guard parts.count == 3, parts[0] == "GET" else {
-            sendResponse(on: connection, status: "405 Method Not Allowed", message: "Only GET callbacks are accepted.")
+            sendResponse(on: connection, status: "405 Method Not Allowed", message: AppLocalization.string("Only GET callbacks are accepted."))
             return
         }
         guard let port else {
-            sendResponse(on: connection, status: "503 Service Unavailable", message: "The sign-in callback is not ready.")
+            sendResponse(on: connection, status: "503 Service Unavailable", message: AppLocalization.string("The sign-in callback is not ready."))
             finish(.failure(NativeOAuthError.listenerFailed))
             return
         }
@@ -628,19 +659,19 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
                 expectedState: expectedState,
                 expectedPort: port
             )
-            sendResponse(on: connection, status: "200 OK", message: "✓ Signed in to Hermes. You can close this window and return to Conduit.")
+            sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("✓ Signed in to Hermes. You can close this window and return to Conduit."))
             finish(.success(code))
         } catch NativeOAuthError.callbackRejected {
-            sendResponse(on: connection, status: "400 Bad Request", message: "Sign-in was not completed. You can return to Conduit.")
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("Sign-in was not completed. You can return to Conduit."))
             finish(.failure(NativeOAuthError.callbackRejected))
         } catch NativeOAuthError.stateMismatch {
             // A different local process must not be able to terminate the
             // pending login without knowing the high-entropy state value.
-            sendResponse(on: connection, status: "400 Bad Request", message: "The sign-in response failed its security check.")
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response failed its security check."))
         } catch {
             // Ignore malformed probes and keep listening for the real browser
             // callback until cancellation or the bounded timeout.
-            sendResponse(on: connection, status: "400 Bad Request", message: "The sign-in response was invalid.")
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid."))
         }
     }
 
@@ -650,7 +681,7 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
-        let html = "<!doctype html><meta charset=\"utf-8\"><title>Hermes sign-in</title><body style=\"font:15px system-ui;margin:3rem;text-align:center\"><p>\(escaped)</p>"
+        let html = "<!doctype html><meta charset=\"utf-8\"><title>\(AppLocalization.string("Hermes sign-in"))</title><body style=\"font:15px system-ui;margin:3rem;text-align:center\"><p>\(escaped)</p>"
         let body = Data(html.utf8)
         let headers = "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"
         var response = Data(headers.utf8)

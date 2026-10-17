@@ -89,10 +89,12 @@ struct KanbanTaskComposerView: View {
             }
             .sheet(isPresented: $showModelSheet) {
                 KanbanModelOverrideSheet(value: modelOverrideBinding)
+                    .environmentObject(store)
                     .presentationDetents([.medium, .large])
             }
             .sheet(isPresented: $showSkillsSheet) {
                 KanbanSkillsPickerSheet(selected: skillsBinding)
+                    .environmentObject(appState)
                     .presentationDetents([.medium, .large])
             }
             .sheet(isPresented: $showParentSheet) {
@@ -100,6 +102,7 @@ struct KanbanTaskComposerView: View {
                     selectedParentID: parentBinding,
                     excludedTaskID: nil
                 )
+                .environmentObject(store)
                 .presentationDetents([.medium, .large])
             }
         }
@@ -411,9 +414,9 @@ struct KanbanTaskComposerView: View {
             _ = try await store.createTask(request, initialStatus: initialStatus)
             dismiss()
         } catch let error as KanbanDraftValidationError {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingError.message(for: error)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingError.message(for: error)
             if let kanbanError = error as? KanbanServiceError,
                case .taskCreatedButMoveFailed = kanbanError {
                 // Partial success: the task EXISTS but could not be moved into

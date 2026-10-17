@@ -12,37 +12,64 @@ import SwiftUI
 struct GatewayDiagnosticsSheet: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
+    /// The report copied last, so "Copied" clears once a newer step lands.
+    @State private var copiedTimelineReport: String?
+    @State private var confirmingRestart = false
+    /// Pushed inside Settings > Gateway rather than shown as its own sheet.
+    var embedded = false
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                ConduitBackdrop()
-                ScrollView {
-                    VStack(spacing: 14) {
-                        summary
-                        connectors
-                        logs
-                    }
-                    .padding(16)
+        if embedded {
+            page
+        } else {
+            NavigationStack { page }
+        }
+    }
+
+    private var page: some View {
+        ZStack {
+            ConduitBackdrop()
+            ScrollView {
+                VStack(spacing: 22) {
+                    summary
+                    lastConnection
+                    connectors
+                    logs
                 }
-            }
-            .navigationTitle("Gateway")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(.hidden, for: .navigationBar)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { Task { await appState.loadGatewayDiagnostics() } } label: {
-                        if appState.gatewayDiagnosticsLoading {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                    }
-                    .accessibilityLabel("Refresh gateway diagnostics")
-                }
+                .padding(16)
             }
         }
-        .task { await appState.loadGatewayDiagnostics() }
+        .navigationTitle(embedded ? AppLocalization.string("Diagnostics & logs") : AppLocalization.string("Gateway"))
+        .navigationBarTitleDisplayMode(.inline)
+        // Pushed, it keeps the Settings pages' bar.
+        .toolbarBackground(embedded ? .automatic : .hidden, for: .navigationBar)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button { confirmingRestart = true } label: {
+                    Image(systemName: "restart")
+                }
+                .disabled(!appState.canRestartGateway)
+                .accessibilityLabel(AppLocalization.string("Restart Gateway"))
+                .accessibilityIdentifier("gateway.restart")
+                Button { Task { await appState.refreshGatewayDiagnostics() } } label: {
+                    if appState.gatewayDiagnosticsLoading {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+                .accessibilityLabel(AppLocalization.string("Refresh gateway diagnostics"))
+            }
+        }
+        .gatewayRestartConfirmation(isPresented: $confirmingRestart)
+        // Pushed from Settings it only reloads; loading also raises the sheet.
+        .task {
+            if embedded {
+                await appState.refreshGatewayDiagnostics()
+            } else {
+                await appState.loadGatewayDiagnostics()
+            }
+        }
     }
 
     private var summary: some View {
@@ -55,15 +82,73 @@ struct GatewayDiagnosticsSheet: View {
             if let error = diagnostics?.error {
                 Text(error).font(.footnote).foregroundStyle(.red)
             }
-            if !running {
+            GatewayRestartStatusView()
+            if !running && !appState.activeGatewayRestart.isInProgress {
                 Button { Task { await appState.reconnect() } } label: {
-                    Label("Retry connection", systemImage: "arrow.clockwise")
+                    Label(AppLocalization.string("Retry connection"), systemImage: "arrow.clockwise")
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
-                        .frame(height: 44)
+                        .padding(.vertical, 6).frame(minHeight: 44)
                 }
                     .conduitGlassControl(cornerRadius: 16, tint: .conduitAccent.opacity(0.14))
             }
+        }
+    }
+
+    /// Where the last launch, return or reconnect spent its time (#417):
+    /// numbers someone on a slow network can paste into an issue. The report
+    /// itself is an English diagnostic log, like the gateway logs below.
+    private var lastConnection: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Last connection"), symbol: "stopwatch", tint: .conduitAccent) {
+            // The timeline isn't @Published, so recording a step re-renders
+            // nothing. Re-read it every second while this sheet is open, so
+            // steps still landing during a slow start show up, and Copy takes
+            // what is on screen.
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                VStack(alignment: .leading, spacing: 14) {
+                    lastConnectionContent
+                }
+            }
+        }
+    }
+
+    /// The connection timeline, then the last call from Hermes (#449) and
+    /// the last Grok Live call's tool steps, so one Copy takes them all.
+    private var lastConnectionReport: String? {
+        let reports = [appState.connectionTimeline?.report, HermesCallTrace.shared.timeline?.report, LiveCallTrace.shared.report].compactMap { $0 }
+        return reports.isEmpty ? nil : reports.joined(separator: "\n\n")
+    }
+
+    @ViewBuilder
+    private var lastConnectionContent: some View {
+        if let report = lastConnectionReport {
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(verbatim: report)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack(spacing: 8) {
+                Button {
+                    UIPasteboard.general.string = report
+                    copiedTimelineReport = report
+                } label: {
+                    Label("Copy", systemImage: copiedTimelineReport == report ? "checkmark" : "doc.on.doc")
+                }
+                .buttonStyle(.settings)
+                .accessibilityLabel("Copy connection timeline")
+                .accessibilityValue(copiedTimelineReport == report ? AppLocalization.string("Copied") : "")
+                if copiedTimelineReport == report {
+                    Text("Copied")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+        } else {
+            Text("No connection has been timed since Conduit opened.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -173,6 +258,7 @@ struct WorkspaceBrowserSheet: View {
         .sheet(isPresented: $previewOpen) {
             WorkspaceFilePreviewSheet()
                 .presentationDetents([.medium, .large])
+                .environmentObject(appState)
         }
     }
 
@@ -202,7 +288,7 @@ private struct WorkspaceFilePreviewSheet: View {
             ZStack {
                 ConduitBackdrop()
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 22) {
                         if appState.workspaceFileLoading {
                             ProgressView("Loading preview…").frame(maxWidth: .infinity, minHeight: 180)
                         } else if let error = appState.workspaceFileError {
@@ -226,7 +312,7 @@ private struct WorkspaceFilePreviewSheet: View {
                     .padding(16)
                 }
             }
-            .navigationTitle(appState.workspaceSelectedFile?.name ?? "File")
+            .navigationTitle(appState.workspaceSelectedFile?.name ?? AppLocalization.string("File"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -266,7 +352,7 @@ struct DelegateAgentsSheet: View {
             ZStack {
                 ConduitBackdrop()
                 ScrollView {
-                    VStack(spacing: 12) {
+                    VStack(spacing: 22) {
                         ConduitSettingsSection(title: AppLocalization.string("Delegate agents"), symbol: "person.2", tint: .conduitAccent) {
                             Text(activeSummary).font(.footnote).foregroundStyle(.secondary)
                         }
@@ -286,11 +372,12 @@ struct DelegateAgentsSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.hidden, for: .navigationBar)
         }
+        .task { await appState.refreshDelegateAgents() }
     }
 
     private var activeSummary: String {
-        let active = appState.delegateAgents.filter(\.status.isActive).count
-        return active == 0 ? AppLocalization.string("Latest delegation activity") : AppLocalization.string("\(String(active)) working now")
+        let activeCount = appState.delegateAgents.filter(\.status.isActive).count
+        return activeCount == 0 ? AppLocalization.string("Latest delegation activity") : AppLocalization.string("\(activeCount) working now")
     }
 }
 
@@ -305,7 +392,7 @@ private struct DelegateAgentCard: View {
                 HStack(spacing: 10) {
                     Circle().fill(statusColor).frame(width: 9, height: 9)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(agent.goal).font(.subheadline.weight(.semibold)).lineLimit(2)
+                        Text(agent.goal.isEmpty ? AppLocalization.string("Delegate agent") : agent.goal).font(.subheadline.weight(.semibold)).lineLimit(2)
                         Text([agent.model, agent.currentTool, agent.status.label].compactMap { $0 }.joined(separator: " · "))
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }

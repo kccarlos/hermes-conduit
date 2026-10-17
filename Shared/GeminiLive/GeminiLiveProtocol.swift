@@ -9,6 +9,22 @@
 
 import Foundation
 
+/// What a live voice conversation sends, in no provider's wire format: each
+/// session encodes it for its own server (Gemini Live, Grok Live).
+enum LiveVoiceClientMessage: Equatable {
+    /// 16 kHz PCM16 mono microphone audio.
+    case audio(Data)
+    /// The microphone was muted mid-utterance: end the user's turn now.
+    case audioStreamEnd
+    /// A text turn from the client (a background-job update).
+    case textTurn(String)
+    /// Context the model keeps without answering it (#363): a turn typed in
+    /// the attached chat.
+    case contextNote(String)
+    /// The answer to a function call.
+    case toolResponse(id: String, name: String, result: [String: String], scheduling: GeminiLiveProtocol.Scheduling?)
+}
+
 enum GeminiLiveProtocol {
     static let model = "models/gemini-3.8-live"
     static let inputSampleRate: Double = 16_000
@@ -133,6 +149,19 @@ enum GeminiLiveProtocol {
         ]
     }
 
+    /// Context added to the conversation without asking for a reply:
+    /// `turnComplete: false` leaves generation to the user's next turn.
+    static func contextNoteMessage(_ text: String) -> [String: Any] {
+        [
+            "clientContent": [
+                "turns": [
+                    ["role": "user", "parts": [["text": text]]],
+                ],
+                "turnComplete": false,
+            ] as [String: Any],
+        ]
+    }
+
     static func toolResponseMessage(
         id: String,
         name: String,
@@ -158,6 +187,18 @@ enum GeminiLiveProtocol {
         ]
     }
 
+    /// The Gemini Live frame for a client message.
+    static func message(for message: LiveVoiceClientMessage) -> [String: Any] {
+        switch message {
+        case .audio(let pcm16): return audioMessage(pcm16: pcm16)
+        case .audioStreamEnd: return audioStreamEndMessage()
+        case .textTurn(let text): return textTurnMessage(text)
+        case .contextNote(let text): return contextNoteMessage(text)
+        case .toolResponse(let id, let name, let result, let scheduling):
+            return toolResponseMessage(id: id, name: name, result: result, scheduling: scheduling)
+        }
+    }
+
     static func encode(_ message: [String: Any]) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: message, options: [])
         return String(decoding: data, as: UTF8.self)
@@ -170,6 +211,12 @@ enum GeminiLiveProtocol {
         let name: String
         /// String-valued arguments only: every Conduit tool takes strings.
         let arguments: [String: String]
+
+        /// Set (alone) when the call's arguments weren't valid JSON, so
+        /// the bridge answers that rather than a missing argument.
+        static let invalidArgumentsKey = "_conduit_invalid_arguments"
+
+        var hasInvalidArguments: Bool { arguments[Self.invalidArgumentsKey] != nil }
     }
 
     enum ServerEvent: Equatable {

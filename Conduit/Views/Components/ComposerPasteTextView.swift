@@ -17,8 +17,26 @@ struct PastedImage: Equatable {
 }
 
 struct ComposerPasteTextView: UIViewRepresentable {
-    static let minimumHeight: CGFloat = 44
-    static let maximumHeight: CGFloat = 160
+    /// One line of body text plus the text insets at the current text size,
+    /// so a large Text Size doesn't clip the first line.
+    static var minimumHeight: CGFloat { minimumHeight(for: nil) }
+    /// About four lines at large text sizes, never under the original
+    /// 160 pt, and capped so the composer can't cover the chat.
+    static var maximumHeight: CGFloat { maximumHeight(for: nil) }
+
+    /// The bounds for a text view's own traits, the same source its
+    /// `adjustsFontForContentSizeCategory` font scales from.
+    static func minimumHeight(for traits: UITraitCollection?) -> CGFloat {
+        max(44, ceil(bodyLineHeight(for: traits)) + 16)
+    }
+
+    static func maximumHeight(for traits: UITraitCollection?) -> CGFloat {
+        min(max(160, ceil(bodyLineHeight(for: traits)) * 4 + 16), 280)
+    }
+
+    private static func bodyLineHeight(for traits: UITraitCollection?) -> CGFloat {
+        UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits).lineHeight
+    }
 
     @Binding var text: String
     @Binding var isFocused: Bool
@@ -35,6 +53,9 @@ struct ComposerPasteTextView: UIViewRepresentable {
     /// bridge tells them apart from a deliberate replacement and from the
     /// echo of a user edit: they may not rewrite the editor.
     var programmaticRevision: UInt64 = 0
+    /// The replacement at `programmaticRevision` puts the cursor after the
+    /// text (dictation) instead of keeping its position (#333).
+    var programmaticCursorAtEnd = false
     /// Hardware-keyboard Return behavior. When true, a plain Return press
     /// submits through the composer action path; Shift-Return and every
     /// non-submittable state keep the default newline insertion.
@@ -67,6 +88,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
         let view = ImagePasteTextView()
         view.delegate = context.coordinator
         view.font = .preferredFont(forTextStyle: .body)
+        view.adjustsFontForContentSizeCategory = true
         view.backgroundColor = .clear
         view.textColor = .label
         view.tintColor = .systemOrange
@@ -98,11 +120,22 @@ struct ComposerPasteTextView: UIViewRepresentable {
 
     func updateUIView(_ uiView: ImagePasteTextView, context: Context) {
         TranscriptPerf.note(.composerUpdateUIView)
+        // Text Size changed while the app was open: the font follows on its
+        // own, the height bounds need re-reading. Checked by category so the
+        // hot update path doesn't look up fonts.
+        let category = uiView.traitCollection.preferredContentSizeCategory
+        if uiView.boundsContentSizeCategory != category {
+            uiView.boundsContentSizeCategory = category
+            uiView.minimumReportedHeight = Self.minimumHeight(for: uiView.traitCollection)
+            uiView.maximumReportedHeight = Self.maximumHeight(for: uiView.traitCollection)
+            uiView.setNeedsLayout()
+        }
         context.coordinator.parent = self
         context.coordinator.isActive = true
         context.coordinator.apply(
             text: text,
             programmaticRevision: programmaticRevision,
+            cursorAtEnd: programmaticCursorAtEnd,
             editorIdentity: editorIdentity,
             to: uiView
         )
@@ -144,7 +177,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
         /// An intentional replacement that arrived while IME marked text was
         /// active. Composition is never silently replaced; this lands as
         /// soon as it ends.
-        private var pendingProgrammatic: (text: String, revision: UInt64)?
+        private var pendingProgrammatic: (text: String, revision: UInt64, cursorAtEnd: Bool)?
         private var editorIdentity: UUID?
 
         init(_ parent: ComposerPasteTextView) {
@@ -193,6 +226,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
         func apply(
             text: String,
             programmaticRevision: UInt64,
+            cursorAtEnd: Bool = false,
             editorIdentity: UUID,
             to textView: UITextView
         ) {
@@ -215,6 +249,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
                     performProgrammaticReplacement(
                         text: text,
                         revision: programmaticRevision,
+                        cursorAtEnd: cursorAtEnd,
                         into: textView
                     )
                     return
@@ -230,7 +265,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
             // composition ends and stays the newest instruction.
             if textView.markedTextRange != nil {
                 TranscriptPerf.note(.composerMarkedTextDeferral)
-                pendingProgrammatic = (text, programmaticRevision)
+                pendingProgrammatic = (text, programmaticRevision, cursorAtEnd)
                 return
             }
 
@@ -252,6 +287,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
             performProgrammaticReplacement(
                 text: text,
                 revision: programmaticRevision,
+                cursorAtEnd: cursorAtEnd,
                 into: textView
             )
         }
@@ -296,6 +332,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
             performProgrammaticReplacement(
                 text: pending.text,
                 revision: pending.revision,
+                cursorAtEnd: pending.cursorAtEnd,
                 into: textView
             )
         }
@@ -303,12 +340,13 @@ struct ComposerPasteTextView: UIViewRepresentable {
         private func performProgrammaticReplacement(
             text: String,
             revision: UInt64,
+            cursorAtEnd: Bool,
             into textView: UITextView
         ) {
-            let clampedSelection = clampedSelectionRange(
-                textView.selectedRange,
-                maxLength: (text as NSString).length
-            )
+            let length = (text as NSString).length
+            let clampedSelection = cursorAtEnd
+                ? NSRange(location: length, length: 0)
+                : clampedSelectionRange(textView.selectedRange, maxLength: length)
 
             TranscriptPerf.note(.composerProgrammaticTextAssignment)
             TranscriptPerf.lastComposerSelectionBeforeAssignment = textView.selectedRange.location
@@ -345,6 +383,8 @@ final class ImagePasteTextView: UITextView {
     var onContentHeightChange: ((CGFloat) -> Void)?
     var editorIdentity: UUID?
     var minimumReportedHeight: CGFloat = 44
+    /// The Text Size the height bounds were last read at.
+    var boundsContentSizeCategory: UIContentSizeCategory?
     var maximumReportedHeight: CGFloat = 160
     private var lastReportedHeight: CGFloat = 0
 
@@ -684,7 +724,7 @@ final class ImagePasteTextView: UITextView {
         let pasteEditorIdentity = pasteEditorIdentity ?? editorIdentity
         DispatchQueue.main.async { [weak self] in
             guard let self, self.editorIdentity == pasteEditorIdentity else { return }
-            self.onPastedImageError?("The image provider returned invalid image data.")
+            self.onPastedImageError?(AppLocalization.string("The image provider returned invalid image data."))
         }
     }
 
@@ -693,7 +733,8 @@ final class ImagePasteTextView: UITextView {
         editorIdentity pasteEditorIdentity: UUID? = nil
     ) {
         let pasteEditorIdentity = pasteEditorIdentity ?? editorIdentity
-        let message = error?.localizedDescription ?? "The image provider returned no data."
+        let message = error.map { UserFacingError.message(for: $0) }
+            ?? AppLocalization.string("Conduit couldn't read that image. Try copying it again.")
         DispatchQueue.main.async { [weak self] in
             guard let self, self.editorIdentity == pasteEditorIdentity else { return }
             self.onPastedImageError?(message)

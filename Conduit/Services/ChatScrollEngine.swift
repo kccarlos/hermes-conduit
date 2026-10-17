@@ -63,13 +63,28 @@ enum ChatScrollEngineEvent: Equatable {
 /// them changes, so scrolling itself never re-evaluates the chat.
 struct ChatScrollRenderInputs: Equatable {
     var renderedSessionKey: ChatScrollSessionKey?
-    var isFollowingLatest = true
     var renderedScrollScope: ChatRenderedScrollScope?
-    var showsJumpToLatest = false
     /// The target cache's rendering revision. The scope above carries it
     /// too, but only while a session is rendered; rows without a session
     /// key must still re-run the body when they change.
     var targetsRevision: UInt64 = 0
+}
+
+/// The viewport values the chat's jump buttons render from. They change as
+/// the reader scrolls (a drag leaves the latest message, the jump button
+/// appears a screen up), so they publish on their own object: ChatView
+/// re-running for them re-ran every row in the transcript, a hitch at the
+/// start of each scroll.
+struct ChatScrollChromeInputs: Equatable {
+    var isFollowingLatest = true
+    var showsJumpToLatest = false
+    var visibilityTrackedMessageID: String? = nil
+    var isVisibilityTrackedMessageOffscreen = false
+}
+
+@MainActor
+final class ChatScrollChrome: ObservableObject {
+    @Published fileprivate(set) var inputs = ChatScrollChromeInputs()
 }
 
 /// Owns the chat viewport. Three rules replace the old follow-correction
@@ -84,8 +99,9 @@ struct ChatScrollRenderInputs: Equatable {
 ///    top, so messages arriving below never move what the user is reading.
 ///    The one change above the reader, a "Load earlier messages" prepend,
 ///    keeps the distance from the bottom instead.
-/// 3. Only the user leaves following (a drag), and only being near the
-///    bottom (or an explicit command) returns to it.
+/// 3. Only the user leaves following (a drag, or opening or closing a row
+///    such as Thinking or a tool card), and only being near the bottom (or
+///    an explicit command) returns to it.
 @MainActor
 final class ChatScrollEngine: ObservableObject {
     enum Mode: Equatable {
@@ -103,35 +119,58 @@ final class ChatScrollEngine: ObservableObject {
     }
 
     struct PrependAnchor: Equatable {
+        /// A row on screen when the backfill was requested.
+        struct Row: Equatable {
+            let id: String
+            /// Its top in the stack's space. A prepend always moves it
+            /// down, so a frame still reporting it is the old layout.
+            let minY: CGFloat
+            /// Its distance from the viewport top.
+            let screenY: CGFloat
+        }
+
         let sessionKey: ChatScrollSessionKey?
         /// Content height minus offset when the backfill was requested: the
         /// distance from the content bottom to the viewport top. Keeping it
         /// constant keeps every row below the prepended page in place.
         let bottomDistance: CGFloat
-        /// The row at the top of the viewport and its distance from the
-        /// viewport top. The bottom distance counts estimated heights of
-        /// rows not laid out yet, which change after a prepend; once the
-        /// row's own frame is believable it gives the exact position.
-        var rowID: String? = nil
-        var rowScreenY: CGFloat? = nil
-        /// The row's top when the backfill was requested. A prepend always
-        /// moves it down, so a frame still reporting it is the old layout.
-        var rowMinY: CGFloat? = nil
+        /// The rows on screen, top first. The bottom distance counts
+        /// estimated heights of rows not laid out yet, which change after a
+        /// prepend; once one of these rows reports a believable frame it
+        /// gives the exact position. Any of them will do: the estimate can
+        /// leave the top row just off screen, where it has no frame.
+        var rows: [Row] = []
         var landedAt: TimeInterval?
+        /// When the reader's rows were found where they were, by their own
+        /// frames in the new layout.
+        var settledAt: TimeInterval?
     }
 
     static let nearBottomTolerance: CGFloat = 40
     static let maximumRestorationChecks = 80
     static let restorationRevealInterval = 4
-    /// How long a landed prepend keeps holding the reader's position while
-    /// the prepended rows' estimated heights settle.
+    /// How long a prepend keeps holding the reader's position once their
+    /// rows' own frames have found them back where they were, for the
+    /// estimated heights still settling.
     static let prependHoldDuration: TimeInterval = 0.6
+    /// How long a prepend holds without that confirmation, counted from the
+    /// landing. The prepended page is laid out, SwiftUI writes its own
+    /// offset and the new row frames are reported over the next few passes;
+    /// on a busy main thread those can arrive seconds after the landing, and
+    /// a lapsed hold would leave the reader thousands of points away. No
+    /// hold outlives this plus one `prependHoldDuration`.
+    static let prependSettleLimit: TimeInterval = 5
     /// How long an animated jump to latest suspends pinning.
     static let latestAnimationDuration: TimeInterval = 0.4
+    /// How long after the reader opens or closes a row the engine waits
+    /// before checking whether they are still at the bottom: the row
+    /// animates open with ConduitMotion.response (a 0.34 s spring).
+    static let disclosureSettleDelay: TimeInterval = 0.5
     static let coordinateSpaceName = "chat-transcript-stack"
 
     var onEvent: (@MainActor (ChatScrollEngineEvent) -> Void)?
     @Published private(set) var renderInputs = ChatScrollRenderInputs()
+    let chrome = ChatScrollChrome()
     private var renderInputsPublishScheduled = false
 
     private(set) var mode: Mode = .following
@@ -149,23 +188,50 @@ final class ChatScrollEngine: ObservableObject {
     private(set) var isDragging = false
     private var latestAnimationUntil: TimeInterval?
     private var rowFrames: [String: ChatScrollRowFrame] = [:]
+    private var visibilityTrackedMessageID: String?
+    private var isVisibilityTrackedMessageOffscreen = false
     private(set) weak var surface: ChatScrollSurface?
     private var surfaceCallbackDepth = 0
     private var lastObservedOffsetY: CGFloat?
+    private var pastBottomCheckScheduled = false
+    /// Bumped when the reader or a command takes over, so a pending
+    /// past-the-bottom check does nothing when it runs.
+    private var pastBottomCheckGeneration: UInt64 = 0
+    /// Bumped by every row the reader opens or closes, and by a drag, the
+    /// explicit commands, a session switch and a restoration, so only the
+    /// latest settle check acts. Anything else that changes the mode leaves
+    /// browsing, which the check requires.
+    private var disclosureGeneration: UInt64 = 0
     private let now: () -> TimeInterval
     private let prefersReducedMotion: @MainActor () -> Bool
+    private let schedule: (TimeInterval, @escaping @MainActor () -> Void) -> Void
 
     init(
         now: @escaping () -> TimeInterval = { CACurrentMediaTime() },
-        prefersReducedMotion: @escaping @MainActor () -> Bool = { UIAccessibility.isReduceMotionEnabled }
+        prefersReducedMotion: @escaping @MainActor () -> Bool = { UIAccessibility.isReduceMotionEnabled },
+        schedule: @escaping (TimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, body in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { MainActor.assumeIsolated(body) }
+        }
     ) {
         self.now = now
         self.prefersReducedMotion = prefersReducedMotion
+        self.schedule = schedule
     }
 
     // MARK: - Derived facts
 
     var targets: [ChatMessageScrollTarget] { targetCache.targets }
+
+    /// Track one row's visibility without publishing on every scroll tick;
+    /// render inputs change only when it crosses the viewport edge.
+    func trackMessageVisibility(of id: String?) {
+        guard visibilityTrackedMessageID != id else {
+            refreshTrackedMessageVisibility()
+            return
+        }
+        visibilityTrackedMessageID = id
+        refreshTrackedMessageVisibility(forcePublish: true)
+    }
 
     var isFollowingLatest: Bool { mode == .following }
 
@@ -216,12 +282,11 @@ final class ChatScrollEngine: ObservableObject {
         defer { surfaceCallbackDepth -= 1 }
         guard let surface, !isPaused else { return }
         holdPrependAnchor(on: surface)
-        if mode == .following,
-           !surface.isTracking,
-           !surface.isDecelerating,
-           !latestAnimationInFlight {
+        relatchIfPastTheBottom(surface)
+        if canPinWhileFollowing(surface) {
             pin(surface)
         }
+        refreshTrackedMessageVisibility()
         refreshJumpButton()
     }
 
@@ -257,11 +322,35 @@ final class ChatScrollEngine: ObservableObject {
             setMode(.browsing)
             emit(.persistSnapshot(renderedSessionKey))
         }
+        // Not an else: a reader who relatched above may have done it past
+        // the bottom (content shrank under them), and that is empty space
+        // to close now, not on some later layout pass.
+        if canPinWhileFollowing(surface),
+           !isDragging,
+           surface.distanceFromBottom < -0.5 {
+            // Past the bottom with no finger or momentum: empty space under
+            // the last message. UIKit never clamps an offset when content
+            // shrinks, and SwiftUI writes offsets of its own during its
+            // update (HostingScrollView.updateContext), so following corrects
+            // here: once inline, then once more after the current update has
+            // finished, so the bottom is where it ends up whoever wrote last.
+            // While a check is pending there is no inline pin, so a writer
+            // that answers every pin cannot recurse with this. A drag, a
+            // title tap or going to the background cancels the check.
+            if !pastBottomCheckScheduled {
+                pin(surface)
+            }
+            schedulePastBottomCheck()
+        }
+        refreshTrackedMessageVisibility()
         refreshJumpButton()
     }
 
     func rowFramesChanged(_ frames: [String: ChatScrollRowFrame]) {
+        surfaceCallbackDepth += 1
+        defer { surfaceCallbackDepth -= 1 }
         rowFrames = frames
+        refreshTrackedMessageVisibility()
         guard mode == .browsing, !isPaused else { return }
         if prependAnchor?.landedAt != nil, let surface {
             holdPrependAnchor(on: surface)
@@ -272,7 +361,10 @@ final class ChatScrollEngine: ObservableObject {
     func setPaused(_ paused: Bool) {
         guard paused != isPaused else { return }
         isPaused = paused
-        guard !paused else { return }
+        guard !paused else {
+            cancelPastBottomCheck()
+            return
+        }
         // Catch up on whatever changed while backgrounded.
         surfaceLayoutChanged()
         surfaceScrolled()
@@ -284,6 +376,8 @@ final class ChatScrollEngine: ObservableObject {
         surfaceCallbackDepth += 1
         defer { surfaceCallbackDepth -= 1 }
         isDragging = true
+        cancelPastBottomCheck()
+        cancelDisclosureSettle()
         latestAnimationUntil = nil
         prependAnchor = nil
         restoration = nil
@@ -306,6 +400,49 @@ final class ChatScrollEngine: ObservableObject {
         }
         emit(.persistSnapshot(renderedSessionKey))
         emit(.flushPersistence)
+    }
+
+    // MARK: - Opening and closing rows
+
+    /// The reader is about to open or close a row (Thinking, a tool card,
+    /// "Show all"). The row they tapped must stay where it is. Following
+    /// would pin the content's bottom instead, so opening a row at the
+    /// bottom of the chat threw its header off the top of the screen and
+    /// showed the end of what it revealed. So this is the reader taking
+    /// over, like a drag: UIKit keeps the distance from the top, which keeps
+    /// the tapped row still. Once the row has animated, a reader still at
+    /// the bottom (the row was short, or it closed) follows again.
+    func userWillToggleRow() {
+        // Momentum is not excluded: following would pin the opened row's
+        // new bottom as soon as the momentum ended.
+        guard !isPaused, !isDragging, surface?.isTracking != true else { return }
+        cancelPastBottomCheck()
+        latestAnimationUntil = nil
+        // Both hold the viewport to something the toggle is about to change.
+        prependAnchor = nil
+        if restoration != nil {
+            restoration = nil
+            emit(.cancelAutomaticRestoration)
+        }
+        if mode != .browsing {
+            setMode(.browsing)
+            emit(.persistSnapshot(renderedSessionKey))
+        }
+        cancelDisclosureSettle()
+        let generation = disclosureGeneration
+        schedule(Self.disclosureSettleDelay) { [weak self] in
+            guard let self, generation == self.disclosureGeneration else { return }
+            self.disclosureSettled()
+        }
+    }
+
+    private func disclosureSettled() {
+        guard mode == .browsing, !isPaused, !isDragging, let surface,
+              !surface.isTracking, !surface.isDecelerating,
+              surface.distanceFromBottom <= Self.nearBottomTolerance else { return }
+        setMode(.following)
+        pin(surface)
+        emit(.persistSnapshot(renderedSessionKey))
     }
 
     // MARK: - Session identity
@@ -341,8 +478,10 @@ final class ChatScrollEngine: ObservableObject {
         }
         prependAnchor = nil
         latestAnimationUntil = nil
+        cancelDisclosureSettle()
         topVisibleMessageID = nil
         rowFrames = [:]
+        refreshTrackedMessageVisibility()
         guard !isDragging else {
             mode = .browsing
             return
@@ -425,13 +564,21 @@ final class ChatScrollEngine: ObservableObject {
     /// middle keeps their distance from the content bottom.
     func olderPageBackfillRequested(sessionKey: ChatScrollSessionKey?) {
         guard mode == .browsing, let surface else { return }
-        let row = topVisibleMessageID.flatMap { id in rowFrames[id].map { (id, $0.minY) } }
+        let visible = visibleStackRange(of: surface)
+        let rows = rowFrames
+            .filter { $0.value.maxY > visible.lowerBound && $0.value.minY < visible.upperBound }
+            .sorted { $0.value.order < $1.value.order }
+            .map { id, frame in
+                PrependAnchor.Row(
+                    id: id,
+                    minY: frame.minY,
+                    screenY: surface.transcriptOriginY + frame.minY - surface.contentOffsetY
+                )
+            }
         prependAnchor = PrependAnchor(
             sessionKey: sessionKey,
             bottomDistance: surface.contentHeight - surface.contentOffsetY,
-            rowID: row?.0,
-            rowScreenY: row.map { surface.transcriptOriginY + $0.1 - surface.contentOffsetY },
-            rowMinY: row?.1
+            rows: rows
         )
     }
 
@@ -453,6 +600,7 @@ final class ChatScrollEngine: ObservableObject {
         if surface?.isTracking == true { return }
         restoration = nil
         prependAnchor = nil
+        cancelDisclosureSettle()
         emit(.cancelAutomaticRestoration)
         setMode(.following)
         // In the background, setPaused(false) catches up and pins.
@@ -469,7 +617,27 @@ final class ChatScrollEngine: ObservableObject {
             latestAnimationUntil = nil
             pin(surface)
         }
+        refreshTrackedMessageVisibility()
         refreshJumpButton()
+    }
+
+    /// Jump to the answerable clarification in transcript order without
+    /// moving the card or converting browsing into follow-latest mode. The
+    /// pause guard is defensive: backgrounded UI cannot be tapped, and a stale
+    /// row reveal is intentionally not replayed when the app returns.
+    func explicitMessageRequested(id: String) {
+        guard !id.isEmpty,
+              !isPaused,
+              surface?.isTracking != true,
+              targetCache.targets.contains(where: { $0.id == id }) else { return }
+        restoration = nil
+        prependAnchor = nil
+        latestAnimationUntil = nil
+        cancelPastBottomCheck()
+        cancelDisclosureSettle()
+        emit(.cancelAutomaticRestoration)
+        setMode(.browsing)
+        emit(.revealRow(id: id))
     }
 
     /// The view calls this once an animated jump to latest has had time to
@@ -488,6 +656,8 @@ final class ChatScrollEngine: ObservableObject {
         restoration = nil
         prependAnchor = nil
         latestAnimationUntil = nil
+        cancelPastBottomCheck()
+        cancelDisclosureSettle()
         emit(.cancelAutomaticRestoration)
         setMode(.browsing)
         guard !isPaused else { return }
@@ -514,6 +684,7 @@ final class ChatScrollEngine: ObservableObject {
         }
         prependAnchor = nil
         latestAnimationUntil = nil
+        cancelDisclosureSettle()
         restoration = Restoration(
             request: request,
             destination: resolveRestorationDestination(for: request)
@@ -586,6 +757,7 @@ final class ChatScrollEngine: ObservableObject {
             state.placed = true
             restoration = state
             surface.setContentOffsetY(target, animated: false)
+            refreshTrackedMessageVisibility()
             return true
         }
     }
@@ -636,10 +808,10 @@ final class ChatScrollEngine: ObservableObject {
         onEvent?(event)
     }
 
-    /// Publishes `renderInputs` if any of them changed. A change made while
-    /// handling a UIKit callback can land in the middle of a SwiftUI update,
-    /// where publishing is not allowed, so it goes out on the next main-queue
-    /// turn instead (coalesced).
+    /// Publishes `renderInputs` and `chrome` if any of their values changed.
+    /// A change made while handling a UIKit callback can land in the middle
+    /// of a SwiftUI update, where publishing is not allowed, so it goes out
+    /// on the next main-queue turn instead (coalesced).
     private func renderInputsMayHaveChanged() {
         guard isHandlingSurfaceCallback else {
             publishRenderInputs()
@@ -657,14 +829,66 @@ final class ChatScrollEngine: ObservableObject {
     private func publishRenderInputs() {
         let inputs = ChatScrollRenderInputs(
             renderedSessionKey: renderedSessionKey,
-            isFollowingLatest: isFollowingLatest,
             renderedScrollScope: renderedScrollScope,
-            showsJumpToLatest: showsJumpToLatest,
             targetsRevision: targetCache.renderingRevision
         )
         if inputs != renderInputs {
             renderInputs = inputs
         }
+        let chromeInputs = ChatScrollChromeInputs(
+            isFollowingLatest: isFollowingLatest,
+            showsJumpToLatest: showsJumpToLatest,
+            visibilityTrackedMessageID: visibilityTrackedMessageID,
+            isVisibilityTrackedMessageOffscreen: isVisibilityTrackedMessageOffscreen
+        )
+        if chromeInputs != chrome.inputs {
+            chrome.inputs = chromeInputs
+        }
+    }
+
+    private func cancelDisclosureSettle() {
+        disclosureGeneration &+= 1
+    }
+
+    private func cancelPastBottomCheck() {
+        pastBottomCheckGeneration &+= 1
+        pastBottomCheckScheduled = false
+    }
+
+    private func schedulePastBottomCheck() {
+        guard !pastBottomCheckScheduled else { return }
+        pastBottomCheckScheduled = true
+        let generation = pastBottomCheckGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, generation == self.pastBottomCheckGeneration else { return }
+            self.pastBottomCheckScheduled = false
+            guard let surface = self.surface,
+                  !self.isPaused,
+                  !self.isDragging,
+                  self.canPinWhileFollowing(surface),
+                  surface.distanceFromBottom < -0.5 else { return }
+            self.pin(surface)
+            self.refreshJumpButton()
+        }
+    }
+
+    /// A reader whose content shrank under them (a row closing, a turn's
+    /// live rows settling into a shorter reply) can be left looking at empty
+    /// space below the last message, which UIKit never closes on its own.
+    /// Nothing there is worth staying on, so they are back at the latest
+    /// message and follow it.
+    private func relatchIfPastTheBottom(_ surface: ChatScrollSurface) {
+        guard mode == .browsing, !isDragging, !surface.isTracking, !surface.isDecelerating,
+              !latestAnimationInFlight, prependAnchor == nil,
+              surface.distanceFromBottom < -0.5 else { return }
+        setMode(.following)
+        emit(.persistSnapshot(renderedSessionKey))
+    }
+
+    /// Following, with no finger, momentum or jump animation moving the
+    /// content.
+    private func canPinWhileFollowing(_ surface: ChatScrollSurface) -> Bool {
+        mode == .following && !surface.isTracking && !surface.isDecelerating && !latestAnimationInFlight
     }
 
     private func pin(_ surface: ChatScrollSurface) {
@@ -702,6 +926,10 @@ final class ChatScrollEngine: ObservableObject {
         var landed = anchor
         landed.landedAt = now()
         prependAnchor = landed
+        ChatViewportTrace.shared.log(String(
+            format: "prepend landed content %.1f offset %.1f",
+            surface?.contentHeight ?? -1, surface?.contentOffsetY ?? -1
+        ))
         // SwiftUI can lay out the prepended rows (and report the new content
         // size) before its onChange hands over the new transcript, so the
         // layout pass that should hold the reader may already be over. Hold
@@ -711,40 +939,98 @@ final class ChatScrollEngine: ObservableObject {
         }
     }
 
+    /// Keeps the reader where they were while a landed prepend is laid out.
+    /// The hold lasts until the reader's rows' own frames find them back in
+    /// place, plus `prependHoldDuration` for heights still settling, not a
+    /// fixed time from the landing: the landing comes a pass before the
+    /// layout, or seconds before it on a busy main thread. Without those
+    /// frames it gives up `prependSettleLimit` after the landing.
     private func holdPrependAnchor(on surface: ChatScrollSurface) {
-        guard let anchor = prependAnchor, let landedAt = anchor.landedAt else { return }
-        guard now() - landedAt <= Self.prependHoldDuration, mode == .browsing else {
+        guard var anchor = prependAnchor, let landedAt = anchor.landedAt else { return }
+        if mode != .browsing || prependHoldLapsed(anchor, landedAt: landedAt) {
+            ChatViewportTrace.shared.log(String(
+                format: "prepend hold ended (%@) content %.1f offset %.1f",
+                mode != .browsing ? "mode" : anchor.settledAt == nil ? "unsettled" : "settled",
+                surface.contentHeight, surface.contentOffsetY
+            ))
             prependAnchor = nil
             return
         }
         // A flick after the prepend belongs to the reader.
         guard !surface.isTracking, !surface.isDecelerating else { return }
-        var target = surface.clampedOffsetY(surface.contentHeight - anchor.bottomDistance)
-        // The row's frame refines the estimate only once it describes the
-        // new layout (a prepend moved the row down) and is believable: right
-        // after a prepend LazyVStack reports provisional frames that can be
-        // thousands of points off, so it must agree with the bottom-distance
-        // estimate to within a viewport.
-        if let id = anchor.rowID, let screenY = anchor.rowScreenY, let requestedMinY = anchor.rowMinY,
-           let frame = rowFrames[id], frame.minY > requestedMinY + 0.5 {
-            let rowTarget = surface.clampedOffsetY(surface.transcriptOriginY + frame.minY - screenY)
-            if abs(rowTarget - target) < surface.viewportHeight {
-                target = rowTarget
+        let estimate = surface.clampedOffsetY(surface.contentHeight - anchor.bottomDistance)
+        let rowTarget = prependRowTarget(anchor, on: surface, near: estimate)
+        let target = rowTarget ?? estimate
+        let moves = abs(surface.contentOffsetY - target) > 0.5
+        if moves {
+            // Moving the reader needs a fresh confirmation, which the
+            // correction's own scroll callback usually gives. Past the limit
+            // that callback would find an unconfirmed hold and end it, so a
+            // confirmed hold restarts its tail instead, and a writer's
+            // follow-up writes are answered too.
+            let pastLimit = now() - landedAt > Self.prependSettleLimit
+            anchor.settledAt = anchor.settledAt != nil && pastLimit ? now() : nil
+        } else if rowTarget != nil, anchor.settledAt == nil {
+            anchor.settledAt = now()
+            ChatViewportTrace.shared.log(String(format: "prepend hold settled offset %.1f", target))
+        }
+        prependAnchor = anchor
+        guard moves else { return }
+        ChatViewportTrace.shared.log(String(
+            format: "prepend hold content %.1f offset %.1f -> %.1f (%@)",
+            surface.contentHeight, surface.contentOffsetY, target, rowTarget == nil ? "estimate" : "row"
+        ))
+        surface.setContentOffsetY(target, animated: false)
+    }
+
+    private func prependHoldLapsed(_ anchor: PrependAnchor, landedAt: TimeInterval) -> Bool {
+        let sinceLanding = now() - landedAt
+        // No hold outlives the limit plus one tail, whatever keeps moving
+        // the reader.
+        if sinceLanding > Self.prependSettleLimit + Self.prependHoldDuration {
+            return true
+        }
+        // A late confirmation still gets its tail, past the limit.
+        if let settledAt = anchor.settledAt {
+            return now() - settledAt > Self.prependHoldDuration
+        }
+        return sinceLanding > Self.prependSettleLimit
+    }
+
+    /// The offset that puts a row from the reader's screen back where it
+    /// was, once one reports a frame that describes the new layout (moved
+    /// down) and is believable: right after a prepend LazyVStack reports
+    /// provisional frames that can be thousands of points off, so it must
+    /// agree with the bottom-distance estimate to within a viewport.
+    private func prependRowTarget(
+        _ anchor: PrependAnchor,
+        on surface: ChatScrollSurface,
+        near estimate: CGFloat
+    ) -> CGFloat? {
+        for row in anchor.rows {
+            guard let frame = rowFrames[row.id], frame.minY > row.minY + 0.5 else { continue }
+            let target = surface.clampedOffsetY(surface.transcriptOriginY + frame.minY - row.screenY)
+            if abs(target - estimate) < surface.viewportHeight {
+                return target
             }
         }
-        if abs(surface.contentOffsetY - target) > 0.5 {
-            surface.setContentOffsetY(target, animated: false)
-        }
+        return nil
+    }
+
+    /// The viewport's top and bottom in the transcript stack's space.
+    private func visibleStackRange(of surface: ChatScrollSurface) -> ClosedRange<CGFloat> {
+        let top = surface.contentOffsetY + surface.insetTop - surface.transcriptOriginY
+        let bottom = surface.contentOffsetY + surface.viewportHeight
+            - surface.insetBottom - surface.transcriptOriginY
+        return top...max(top, bottom)
     }
 
     private func refreshTopVisibleRow(persist: Bool) {
         guard let surface else { return }
         TranscriptPerf.stableTopScanTargetCount = rowFrames.count
-        let visibleTop = surface.contentOffsetY + surface.insetTop - surface.transcriptOriginY
-        let visibleBottom = surface.contentOffsetY + surface.viewportHeight
-            - surface.insetBottom - surface.transcriptOriginY
+        let visible = visibleStackRange(of: surface)
         var best: (id: String, order: Int)?
-        for (id, frame) in rowFrames where frame.maxY > visibleTop && frame.minY < visibleBottom {
+        for (id, frame) in rowFrames where frame.maxY > visible.lowerBound && frame.minY < visible.upperBound {
             if best.map({ frame.order < $0.order }) ?? true {
                 best = (id, frame.order)
             }
@@ -764,6 +1050,24 @@ final class ChatScrollEngine: ObservableObject {
         renderInputsMayHaveChanged()
     }
 
+    private func refreshTrackedMessageVisibility(forcePublish: Bool = false) {
+        let isOffscreen: Bool
+        if let id = visibilityTrackedMessageID,
+           let surface,
+           let frame = rowFrames[id] {
+            let visible = visibleStackRange(of: surface)
+            isOffscreen = !(frame.maxY > visible.lowerBound && frame.minY < visible.upperBound)
+        } else {
+            // A row without a laid-out frame is outside the visible viewport
+            // (or has not been rendered yet), so the jump remains useful.
+            isOffscreen = visibilityTrackedMessageID != nil
+        }
+        let visibilityChanged = isVisibilityTrackedMessageOffscreen != isOffscreen
+        isVisibilityTrackedMessageOffscreen = isOffscreen
+        guard forcePublish || visibilityChanged else { return }
+        renderInputsMayHaveChanged()
+    }
+
     private func resolveRestorationDestination(
         for request: ChatResumeRestorationRequest
     ) -> ChatResumeViewportDestination {
@@ -771,19 +1075,35 @@ final class ChatScrollEngine: ObservableObject {
         case .latest:
             return .latest
         case .snapshot(let snapshot):
-            // The resolver speaks semantic ids; rows are keyed by message id.
-            let resolved = ChatResumeViewportResolver.destination(
-                for: snapshot,
-                availableTargets: ChatScrollTargetAvailability(targets: targetCache.targets)
-            )
-            switch resolved {
-            case .latest:
-                return .latest
-            case .anchor(let semanticAnchor):
-                let sourceAnchor = targetCache.targets
-                    .first { $0.semanticID == semanticAnchor }?.id ?? semanticAnchor
-                return .anchor(sourceAnchor)
+            return resolveSnapshotRestorationDestination(snapshot)
+        case .pendingClarify(let messageID, let fallbackSnapshot):
+            if let target = targetCache.targets.first(where: { $0.id == messageID }),
+               let clarify = target.message.clarify,
+               clarify.needsAnswer {
+                return .anchor(messageID)
             }
+            // The answer may have landed after reconciliation selected this
+            // row; prefer the saved viewport to restoring a resolved card.
+            guard let fallbackSnapshot else { return .latest }
+            return resolveSnapshotRestorationDestination(fallbackSnapshot)
+        }
+    }
+
+    private func resolveSnapshotRestorationDestination(
+        _ snapshot: ChatScrollSnapshot
+    ) -> ChatResumeViewportDestination {
+        // The resolver speaks semantic ids; rows are keyed by message id.
+        let resolved = ChatResumeViewportResolver.destination(
+            for: snapshot,
+            availableTargets: ChatScrollTargetAvailability(targets: targetCache.targets)
+        )
+        switch resolved {
+        case .latest:
+            return .latest
+        case .anchor(let semanticAnchor):
+            let sourceAnchor = targetCache.targets
+                .first { $0.semanticID == semanticAnchor }?.id ?? semanticAnchor
+            return .anchor(sourceAnchor)
         }
     }
 }

@@ -61,8 +61,8 @@ enum MarkdownLargeDocumentPolicy {
     /// Textual rich blocks (callouts, columns) above this size reproject
     /// their bodies into bounded inner text pieces.
     static let largeTextBlockBytes = chunkTargetBytes
-    /// Math and Mermaid sources above this size drop the render action (the
-    /// renderers are not chunkable); the source stays previewable/copyable.
+    /// Math and Mermaid sources above this size aren't drawn (the renderers
+    /// are not chunkable); the source stays previewable/copyable.
     static let mathGuardBytes = 100_000
     static let mermaidGuardBytes = 100_000
     /// Byte budget for the per-chunk subset of message-wide reference
@@ -623,7 +623,7 @@ extension MarkdownBlock {
         case .code(_, let source): return source.utf8.count + 16
         case .callout(_, let text): return text.utf8.count + 16
         case .columns(let columns): return columns.reduce(0) { $0 + $1.utf8.count + 4 }
-        case .image, .math, .divider: return 64
+        case .image, .math, .divider, .htmlPreview: return 64
         }
     }
 }

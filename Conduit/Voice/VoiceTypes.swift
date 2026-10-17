@@ -23,6 +23,9 @@ struct VoiceCapabilitySnapshot: Equatable {
     var supportsTranscription: Bool
     var supportsSpeech: Bool
     var unavailableReason: String?
+    /// Hermes' text-to-speech provider for the profile ("edge", "openai"…),
+    /// empty when unknown.
+    var selectedTTSProvider: String = ""
 
     /// Computed so the reason re-resolves under the in-app App Language.
     static var unavailable: VoiceCapabilitySnapshot {
@@ -30,7 +33,7 @@ struct VoiceCapabilitySnapshot: Equatable {
             isGatewayConnected: false,
             supportsTranscription: false,
             supportsSpeech: false,
-            unavailableReason: AppLocalization.string("This Hermes gateway does not expose voice endpoints.")
+            unavailableReason: AppLocalization.string("Your Hermes server doesn't offer voice. Update Hermes to use Voice.")
         )
     }
 }
@@ -55,135 +58,36 @@ struct VoiceProviderDescriptor: Codable, Equatable, Identifiable {
     }
 }
 
-/// Shared canonicalization and whole-utterance matching for the spoken Voice
-/// command phrase lists (Stop, End Conversation). Matching is deliberately
-/// conservative: a command fires only when the ENTIRE transcribed utterance
-/// equals an ENTIRE configured phrase after normalization — no substring,
-/// fuzzy, or semantic matching. Both the transcript and the configured
-/// phrases are normalized the same way, so stored phrases need not be
-/// pre-trimmed or lowercased.
-enum VoiceSpokenCommands {
-    /// Built-in spoken commands. Additive across languages BY DESIGN: both
-    /// the English and the Simplified Chinese commands are recognized no
-    /// matter which App Language the interface uses — commands match the
-    /// transcribed utterance, never the UI locale.
-    static let defaultStopPhrases = [
-        "stop", "stop talking", "be quiet",
-        "停止", "别说了", "不要说了",
-    ]
-    static let defaultEndConversationPhrases = [
-        "goodbye", "bye", "end conversation", "that's all",
-        "再见", "拜拜", "结束对话", "就这样吧",
-    ]
+/// The built-in spoken Stop and End Conversation phrases, in the app
+/// language. Each language's list is a catalog value ("stop|stop
+/// talking|be quiet"), so a new language brings its own phrases the same
+/// way it brings its strings.
+enum VoiceSpokenCommandDefaults {
+    static let englishStopPhrases = VoiceSpokenCommands.previousDefaultStopPhrases
+    static let englishEndConversationPhrases = VoiceSpokenCommands.previousDefaultEndConversationPhrases
 
-    /// Defaults as originally shipped. The spoken-phrase preferences have
-    /// not shipped in a stable release, but development builds may have
-    /// persisted the original lists verbatim.
-    static let previousDefaultStopPhrases = ["stop", "stop talking", "be quiet"]
-    static let previousDefaultEndConversationPhrases = ["goodbye", "bye", "end conversation", "that's all"]
-
-    /// Persistence migration for extended built-ins: a stored list that is
-    /// exactly a previous default (the user never customized it) upgrades
-    /// to the current defaults, so multilingual commands appear for
-    /// existing persisted blobs. A customized list — including one where
-    /// the user deliberately removed a built-in — is preserved untouched.
-    static func migratedDefaultPhrases(_ stored: [String], previous: [String], current: [String]) -> [String] {
-        let canonicalStored = Set(stored.map(canonicalized))
-        let canonicalPrevious = Set(previous.map(canonicalized))
-        return canonicalStored == canonicalPrevious ? current : stored
+    static var stopPhrases: [String] {
+        phrases(
+            catalogValue: AppLocalization.string("Built-in stop phrases"),
+            key: "Built-in stop phrases",
+            fallback: englishStopPhrases
+        )
     }
 
-    /// The single normalization used on both utterances and configured
-    /// phrases: case folding, typographic apostrophe folding (ASR emits
-    /// U+2019 for the U+0027 in defaults like "that's all"), and
-    /// leading/trailing whitespace and punctuation stripping (internal
-    /// punctuation such as the folded apostrophe survives).
-    static func canonicalized(_ text: String) -> String {
-        text.lowercased()
-            .replacingOccurrences(of: "\u{2019}", with: "'")
-            .trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+    static var endConversationPhrases: [String] {
+        phrases(
+            catalogValue: AppLocalization.string("Built-in end conversation phrases"),
+            key: "Built-in end conversation phrases",
+            fallback: englishEndConversationPhrases
+        )
     }
 
-    /// True only when the whole utterance matches a whole configured phrase.
-    /// An utterance that canonicalizes to empty never matches.
-    static func matches(_ utterance: String, phrases: [String]) -> Bool {
-        let normalized = canonicalized(utterance)
-        guard !normalized.isEmpty else { return false }
-        return phrases.contains { canonicalized($0) == normalized }
-    }
-
-    /// Spoken courtesies around an end phrase ("okay, goodbye", "bye,
-    /// thanks"). Pairs are written as one entry, ahead of their single
-    /// words so "for now" goes as a whole.
-    private static let leadingCourtesies: [[String]] = [
-        ["all", "right"], ["thank", "you"],
-        ["ok"], ["okay"], ["alright"], ["thanks"], ["cool"], ["great"], ["well"], ["so"], ["好的"], ["好"], ["谢谢"],
-    ]
-    private static let trailingCourtesies: [[String]] = [
-        ["for", "now"], ["thank", "you"],
-        ["thanks"], ["now"], ["then"], ["谢谢"],
-    ]
-
-    /// Like `matches`, but for how a live model transcribes speech: inner
-    /// spaces and punctuation don't count ("Good bye." is "goodbye"), a
-    /// phrase may be repeated ("bye bye"), and courtesies around it are
-    /// allowed ("Okay, goodbye.", "Bye, thanks!"). Anything else in the
-    /// utterance still means it isn't a command ("goodbye to the old
-    /// server" never matches).
-    static func matchesSpokenCommand(_ utterance: String, phrases: [String]) -> Bool {
-        if matches(utterance, phrases: phrases) { return true }
-        var words = commandWords(utterance)
-        stripCourtesies(&words)
-        let spoken = words.joined()
-        guard !spoken.isEmpty else { return false }
-        return phrases.contains { phrase in
-            var phraseWords = commandWords(phrase)
-            stripCourtesies(&phraseWords)
-            let key = phraseWords.joined()
-            guard !key.isEmpty else { return false }
-            return (1...3).contains { spoken == String(repeating: key, count: $0) }
-        }
-    }
-
-    private static func commandWords(_ text: String) -> [String] {
-        let separators = CharacterSet.whitespacesAndNewlines
-            .union(.punctuationCharacters)
-            .subtracting(CharacterSet(charactersIn: "'"))
-        return canonicalized(text)
-            .components(separatedBy: separators)
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "'")) }
-            .filter { !$0.isEmpty }
-    }
-
-    private static func stripCourtesies(_ words: inout [String]) {
-        var changed = true
-        while changed {
-            changed = false
-            for courtesy in leadingCourtesies where words.count > courtesy.count && Array(words.prefix(courtesy.count)) == courtesy {
-                words.removeFirst(courtesy.count)
-                changed = true
-            }
-            for courtesy in trailingCourtesies where words.count > courtesy.count && Array(words.suffix(courtesy.count)) == courtesy {
-                words.removeLast(courtesy.count)
-                changed = true
-            }
-        }
-    }
-
-    /// Save-time canonicalization for a phrase list: trim each entry, drop
-    /// entries that canonicalize to empty, and de-duplicate by the same
-    /// canonical form used at runtime — keeping the first occurrence's
-    /// trimmed display form so user capitalization survives.
-    static func canonicalizedPhraseList(_ phrases: [String]) -> [String] {
-        var seen: Set<String> = []
-        var result: [String] = []
-        for phrase in phrases {
-            let trimmed = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
-            let canonical = canonicalized(trimmed)
-            guard !canonical.isEmpty, seen.insert(canonical).inserted else { continue }
-            result.append(trimmed)
-        }
-        return result
+    /// Splits a catalog value on "|". A missing entry resolves to its key
+    /// (AppLocalization's fallback contract), which means English.
+    static func phrases(catalogValue: String, key: String, fallback: [String]) -> [String] {
+        guard catalogValue != key else { return fallback }
+        let phrases = VoiceSpokenCommands.canonicalizedPhraseList(catalogValue.components(separatedBy: "|"))
+        return phrases.isEmpty ? fallback : phrases
     }
 }
 
@@ -194,12 +98,32 @@ struct VoiceProfilePreferences: Codable, Equatable {
     /// barge-in, or route policy.
     var continuousConversation: Bool = true
     var continueWakeConversation: Bool = false
-    var spokenStopPhrases: [String] = VoiceSpokenCommands.defaultStopPhrases
+    /// Whether an open classic Voice conversation keeps listening with the
+    /// phone locked or Conduit in the background, like a live call. Nil is
+    /// off.
+    var keepListeningWhenLocked: Bool? = nil
+    /// Spoken phrases that stop the current reply. Nil follows the app
+    /// language's built-ins (`resolvedSpokenStopPhrases`); a list is the
+    /// user's own. An empty list disables the category.
+    var spokenStopPhrases: [String]? = nil
     /// Spoken phrases that close the whole Voice session through the
-    /// existing Close teardown path. An empty list disables the category.
-    var spokenEndConversationPhrases: [String] = VoiceSpokenCommands.defaultEndConversationPhrases
+    /// existing Close teardown path. Nil follows the app language's
+    /// built-ins; an empty list disables the category.
+    var spokenEndConversationPhrases: [String]? = nil
+
+    var resolvedSpokenStopPhrases: [String] {
+        spokenStopPhrases ?? VoiceSpokenCommandDefaults.stopPhrases
+    }
+
+    var resolvedSpokenEndConversationPhrases: [String] {
+        spokenEndConversationPhrases ?? VoiceSpokenCommandDefaults.endConversationPhrases
+    }
     /// Nil decodes older preferences as the Hermes-hosted route.
     var transcriptionMode: VoiceTranscriptionMode? = nil
+    /// Who speaks Classic voice replies. Nil is automatic
+    /// (`VoiceSpeechOutput.resolved`): this iPhone unless the profile has
+    /// its own ready Hermes voice.
+    var speechOutput: VoiceSpeechOutput? = nil
     /// Opt-in Gemini Live voice mode (off by default; older blobs decode off).
     var geminiLiveEnabled: Bool = false
     /// Where Gemini Live's quick lookups search. Nil is automatic.
@@ -221,6 +145,31 @@ struct VoiceProfilePreferences: Codable, Equatable {
     var gptLiveMemory: Bool? = nil
     /// Whether GPT-Live speaks as the profile's SOUL.md persona. Nil is off.
     var gptLivePersonality: Bool? = nil
+    /// Who pays for GPT-Live calls. Nil is the ChatGPT subscription; the
+    /// API key is only ever chosen in Settings, after a confirmation.
+    var gptLiveBilling: GPTLiveBilling? = nil
+    /// GPT-Live's voice on the API key ("marin", "cedar"…), which has its
+    /// own voices. Nil is the host's (voice.gpt_live.voice).
+    var gptLiveAPIVoice: String? = nil
+    /// Whether a call Hermes places (#449) may run on the API key. Nil is
+    /// off: such calls use the ChatGPT subscription.
+    var gptLiveAPIHermesCalls: Bool? = nil
+    /// Minutes an API-key call may run before it ends itself. Nil is
+    /// `GPTLiveAPICallLimit.defaultMinutes`; 0 is no limit.
+    var gptLiveAPIMaxMinutes: Int? = nil
+
+    var resolvedGPTLiveBilling: GPTLiveBilling { gptLiveBilling ?? .subscription }
+    /// Opt-in Grok Live voice mode through the host's SuperGrok sign-in (off
+    /// by default; older blobs decode off). Never on with another live mode.
+    var grokLiveEnabled: Bool = false
+    /// Whether Grok Live gets the Hermes host's memory. Nil is off.
+    var grokLiveMemory: Bool? = nil
+    /// Whether Grok Live speaks as the profile's SOUL.md persona. Nil is off.
+    var grokLivePersonality: Bool? = nil
+    /// Opt-in Local Live voice mode: a live call through the user's own
+    /// speech server, with Hermes answering each turn in the call's chat
+    /// (off by default; older blobs decode off). Never on with another live mode.
+    var localLiveEnabled: Bool = false
     /// Model for the Hermes sessions voice background jobs create. Nil keeps
     /// the profile's current model (the pre-existing behavior).
     var voiceJobModel: String? = nil
@@ -228,9 +177,35 @@ struct VoiceProfilePreferences: Codable, Equatable {
     /// Reasoning effort for voice jobs ("none", "low", …). Nil keeps the
     /// profile default.
     var voiceJobReasoningEffort: String? = nil
-    /// Whether Gemini Live and GPT-Live calls are saved to the Hermes
+    /// Whether live voice calls (Gemini Live, GPT-Live, Grok Live) are saved to the Hermes
     /// host's session history. Nil is on.
     var saveVoiceCalls: Bool? = nil
+    /// Whether Gemini Live and Grok Live keep the microphone open while
+    /// the model speaks on the loudspeaker or in the car, with echo
+    /// cancellation. Nil is off (experimental).
+    var liveVoiceSpeakerBargeIn: Bool? = nil
+    /// How every live mode sounds (#290). Nil tone keeps the model's own.
+    var liveVoiceTone: LiveVoiceTone? = nil
+    /// Whether live models say "mm-hmm" while the user talks. Nil is on.
+    var liveVoiceBackchannels: Bool? = nil
+    /// Greeting when a live call connects. Nil is off; empty is a short
+    /// greeting in the model's own words.
+    var liveVoiceGreeting: String? = nil
+    /// How much live models say. Nil is Default.
+    var liveVoiceAnswerLength: LiveVoiceAnswerLength? = nil
+    /// Whether live calls start asking before sending a request to Hermes
+    /// (#451). Nil is off.
+    var liveVoiceAskBeforeSending: Bool? = nil
+
+    var liveVoiceStyle: LiveVoiceStyle {
+        LiveVoiceStyle(
+            tone: liveVoiceTone,
+            backchannels: liveVoiceBackchannels ?? true,
+            greeting: liveVoiceGreeting,
+            answerLength: liveVoiceAnswerLength ?? .standard,
+            asksBeforeSending: liveVoiceAskBeforeSending ?? false
+        )
+    }
 
     var resolvedTranscriptionMode: VoiceTranscriptionMode {
         transcriptionMode ?? .hermes
@@ -250,24 +225,26 @@ struct VoiceProfilePreferences: Codable, Equatable {
         outputMuted = try container.decodeIfPresent(Bool.self, forKey: .outputMuted) ?? false
         continuousConversation = try container.decodeIfPresent(Bool.self, forKey: .continuousConversation) ?? true
         continueWakeConversation = try container.decodeIfPresent(Bool.self, forKey: .continueWakeConversation) ?? false
+        keepListeningWhenLocked = try? container.decodeIfPresent(Bool.self, forKey: .keepListeningWhenLocked)
+        // A list that is still a built-in list as shipped follows the app
+        // language now; a customized one is kept.
         spokenStopPhrases = try container.decodeIfPresent([String].self, forKey: .spokenStopPhrases)
-            .map {
-                VoiceSpokenCommands.migratedDefaultPhrases(
-                    $0,
-                    previous: VoiceSpokenCommands.previousDefaultStopPhrases,
-                    current: VoiceSpokenCommands.defaultStopPhrases
-                )
-            } ?? VoiceSpokenCommands.defaultStopPhrases
-        spokenEndConversationPhrases = try container.decodeIfPresent(
-            [String].self, forKey: .spokenEndConversationPhrases
-        ).map {
-            VoiceSpokenCommands.migratedDefaultPhrases(
-                $0,
-                previous: VoiceSpokenCommands.previousDefaultEndConversationPhrases,
-                current: VoiceSpokenCommands.defaultEndConversationPhrases
-            )
-        } ?? VoiceSpokenCommands.defaultEndConversationPhrases
+            .flatMap { stored in
+                VoiceSpokenCommands.isUncustomized(stored, legacy: [
+                    VoiceSpokenCommands.previousDefaultStopPhrases,
+                    VoiceSpokenCommands.legacyStopPhrases,
+                ]) ? nil : stored
+            }
+        spokenEndConversationPhrases = try container.decodeIfPresent([String].self, forKey: .spokenEndConversationPhrases)
+            .flatMap { stored in
+                VoiceSpokenCommands.isUncustomized(stored, legacy: [
+                    VoiceSpokenCommands.previousDefaultEndConversationPhrases,
+                    VoiceSpokenCommands.legacyEndConversationPhrases,
+                ]) ? nil : stored
+            }
         transcriptionMode = try container.decodeIfPresent(VoiceTranscriptionMode.self, forKey: .transcriptionMode)
+        // An unknown choice (a newer build's) is automatic.
+        speechOutput = (try? container.decodeIfPresent(VoiceSpeechOutput.self, forKey: .speechOutput)) ?? nil
         geminiLiveEnabled = try container.decodeIfPresent(Bool.self, forKey: .geminiLiveEnabled) ?? false
         // An unknown mode (a newer build's) falls back to automatic rather
         // than failing the whole blob.
@@ -279,10 +256,28 @@ struct VoiceProfilePreferences: Codable, Equatable {
         gptLiveVoice = (try? container.decodeIfPresent(String.self, forKey: .gptLiveVoice)) ?? nil
         gptLiveMemory = (try? container.decodeIfPresent(Bool.self, forKey: .gptLiveMemory)) ?? nil
         gptLivePersonality = (try? container.decodeIfPresent(Bool.self, forKey: .gptLivePersonality)) ?? nil
+        // Anything unreadable (a newer build's value) is the subscription:
+        // nothing ever turns into API billing by accident.
+        gptLiveBilling = (try? container.decodeIfPresent(GPTLiveBilling.self, forKey: .gptLiveBilling)) ?? nil
+        gptLiveAPIVoice = (try? container.decodeIfPresent(String.self, forKey: .gptLiveAPIVoice)) ?? nil
+        gptLiveAPIHermesCalls = (try? container.decodeIfPresent(Bool.self, forKey: .gptLiveAPIHermesCalls)) ?? nil
+        gptLiveAPIMaxMinutes = (try? container.decodeIfPresent(Int.self, forKey: .gptLiveAPIMaxMinutes)) ?? nil
+        grokLiveEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .grokLiveEnabled)) ?? false
+        grokLiveMemory = (try? container.decodeIfPresent(Bool.self, forKey: .grokLiveMemory)) ?? nil
+        grokLivePersonality = (try? container.decodeIfPresent(Bool.self, forKey: .grokLivePersonality)) ?? nil
+        localLiveEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .localLiveEnabled)) ?? false
         voiceJobModel = try container.decodeIfPresent(String.self, forKey: .voiceJobModel)
         voiceJobProvider = try container.decodeIfPresent(String.self, forKey: .voiceJobProvider)
         voiceJobReasoningEffort = try container.decodeIfPresent(String.self, forKey: .voiceJobReasoningEffort)
         saveVoiceCalls = try? container.decodeIfPresent(Bool.self, forKey: .saveVoiceCalls)
+        liveVoiceSpeakerBargeIn = try? container.decodeIfPresent(Bool.self, forKey: .liveVoiceSpeakerBargeIn)
+        // An unknown tone (a newer build's) keeps the model's own.
+        liveVoiceTone = try? container.decodeIfPresent(LiveVoiceTone.self, forKey: .liveVoiceTone)
+        liveVoiceBackchannels = try? container.decodeIfPresent(Bool.self, forKey: .liveVoiceBackchannels)
+        liveVoiceGreeting = try? container.decodeIfPresent(String.self, forKey: .liveVoiceGreeting)
+        // An unknown length (a newer build's) is Default.
+        liveVoiceAnswerLength = try? container.decodeIfPresent(LiveVoiceAnswerLength.self, forKey: .liveVoiceAnswerLength)
+        liveVoiceAskBeforeSending = try? container.decodeIfPresent(Bool.self, forKey: .liveVoiceAskBeforeSending)
     }
 
     /// What a voice job's `session.create` asks for: the chosen voice-job
@@ -335,6 +330,61 @@ enum VoiceScreenAwake {
     }
 }
 
+/// How hard the live call orb works the GPU (#432). It is a heavy
+/// Metal shader, so frames are spent only where they show: 60 fps while the
+/// assistant speaks, 30 the rest of the call, 30 throughout in Low Power
+/// Mode, and a still frame when the user turns the motion off, Reduce Motion
+/// is on, or the phone runs hot.
+enum LiveVoiceOrbPower {
+    /// "Animate the call orb": a device-wide choice (not per profile).
+    static let preferenceKey = "conduit.voice.animateCallOrb"
+
+    static func animates(
+        requested: Bool,
+        enabled: Bool,
+        reduceMotion: Bool,
+        thermalState: ProcessInfo.ThermalState
+    ) -> Bool {
+        guard requested, enabled, !reduceMotion else { return false }
+        switch thermalState {
+        case .serious, .critical: return false
+        case .nominal, .fair: return true
+        // A state iOS adds later is most likely hotter still.
+        @unknown default: return false
+        }
+    }
+
+    static func framesPerSecond(speaking: Bool, lowPowerMode: Bool) -> Int {
+        speaking && !lowPowerMode ? 60 : 30
+    }
+}
+
+/// Read Aloud playback speed: a device-wide choice (not per profile) for the
+/// speaker button under replies. Voice conversations always play at 1x.
+enum ReadAloudSpeed: Double, CaseIterable, Identifiable {
+    case normal = 1.0
+    case fast = 1.25
+    case faster = 1.5
+    case fastest = 1.75
+    case double = 2.0
+
+    static let preferenceKey = "conduit.voice.readAloudSpeed"
+
+    var id: Double { rawValue }
+    var rate: Float { Float(rawValue) }
+
+    /// "1x", "1.25x", …, the same in every locale like the speed labels of
+    /// system media players.
+    var label: String {
+        String(format: "%gx", locale: Locale(identifier: "en_US_POSIX"), rawValue)
+    }
+
+    /// The stored choice; anything missing or unrecognised reads as 1x.
+    static func current(defaults: UserDefaults = .standard) -> ReadAloudSpeed {
+        ReadAloudSpeed(rawValue: defaults.double(forKey: preferenceKey)) ?? .normal
+    }
+}
+
 /// A prebuilt Gemini Live voice: its API name and Google's one-word
 /// description of how it sounds.
 struct GeminiLiveVoice: Equatable, Identifiable {
@@ -381,6 +431,26 @@ struct GeminiLiveVoice: Equatable, Identifiable {
     }
 }
 
+/// How long an API-key GPT-Live call may run (#559).
+enum GPTLiveAPICallLimit {
+    static let defaultMinutes = 20
+    /// The longest limit Conduit honours; anything above is a stored value
+    /// it can't trust (and would overflow as seconds).
+    static let maximumMinutes = 24 * 60
+    /// The choices Settings offers; 0 is no limit.
+    static let choices = [5, 10, 20, 30, 60, 0]
+
+    static func minutes(_ stored: Int?) -> Int {
+        guard let stored, (0...maximumMinutes).contains(stored) else { return defaultMinutes }
+        return stored
+    }
+
+    static func duration(_ stored: Int?) -> Duration? {
+        let minutes = minutes(stored)
+        return minutes == 0 ? nil : .seconds(minutes * 60)
+    }
+}
+
 /// A GPT-Live voice: the name the host sends to GPT-Live, and how it sounds.
 /// The names are ChatGPT's voices; a voice the account doesn't have is
 /// refused by GPT-Live when the call starts.
@@ -405,6 +475,13 @@ struct GPTLiveVoice: Equatable, Identifiable {
         ]
     }
 
+    /// The public GPT-Live API's voices (an API-key call), as Hermes lists
+    /// them. A voice GPT-Live doesn't have is refused when the call starts.
+    static let apiNames = [
+        "marin", "cedar", "quartz", "ripple", "vesper", "willow", "stone",
+        "gleam", "meridian", "bossa", "tempo", "beacon", "delta", "cinder",
+    ]
+
     /// The name as shown in the picker ("Cove · Composed").
     var label: String { "\(name.prefix(1).uppercased())\(name.dropFirst()) · \(style)" }
 }
@@ -413,12 +490,17 @@ struct GPTLiveVoice: Equatable, Identifiable {
 enum GeminiLiveSearchSource: Equatable {
     case hermes
     case google
+    /// Grok Live's own web_search and x_search, run by xAI (#598).
+    case grok
     case none
 }
 
 enum VoiceTranscriptionMode: String, Codable, Equatable {
     case hermes
     case appleOnDevice
+    /// The user's own speech server (voice.speech_server), reached through
+    /// the notifier's relay on the Hermes host.
+    case speechServer
 }
 
 enum AppleSpeechRecognitionAvailability: Equatable {
@@ -432,6 +514,11 @@ enum AppleSpeechRecognitionAvailability: Equatable {
         case .ready, .permissionRequired: return true
         case .permissionDenied, .unsupported: return false
         }
+    }
+
+    var isReady: Bool {
+        if case .ready = self { return true }
+        return false
     }
 
     var title: String {
@@ -463,7 +550,48 @@ struct PendingVoiceIntent: Equatable {
     /// deadline waiter; nil for requests with no external budget.
     var externalLaunchElapsedDeadline: ContinuousClock.Instant? = nil
 
-    enum Source: String, Equatable { case composer, wakePhrase, siri }
+    /// The screenshot (and optional question) of an Ask Hermes About
+    /// Screen launch; nil for every other source.
+    var screenQuestion: ScreenQuestionRequest? = nil
+
+    /// `newCall`: the sidebar's New voice call, never attached to a chat.
+    /// `screenQuestion`: the Ask Hermes About Screen action.
+    /// `hermesCall`: Talk on a "Hermes wants to talk" notification (#449),
+    /// in the job's chat it opened.
+    enum Source: String, Equatable { case composer, wakePhrase, siri, newCall, screenQuestion, hermesCall }
+}
+
+/// How the chat opened by Ask Hermes About Screen takes the question.
+enum ScreenQuestionStart: String, Codable, Equatable, CaseIterable {
+    case voice
+    case keyboard
+}
+
+/// One image handed to Conduit by the Ask Hermes About Screen action. It
+/// waits on a chat until the next question is sent there.
+struct ScreenQuestionRequest: Equatable {
+    var attachment: Attachment
+    /// A question that came with the image; it is sent at once.
+    var question: String?
+    /// nil starts voice, falling back to the keyboard when voice can't start.
+    var startWith: ScreenQuestionStart?
+    /// When the action ran, before Conduit came to the foreground: the
+    /// recent-chat rule measures from here.
+    var enqueuedAt: Date
+    /// The shortcut's Chat option asked for a new chat instead of the
+    /// recent one.
+    var startsNewChat = false
+}
+
+/// What became of words spoken to steer a running Hermes turn.
+enum VoiceSteerOutcome: Equatable {
+    /// Hermes took them into the running turn.
+    case steered
+    /// No turn was running: the words should go out as a new turn.
+    case noRunningTurn
+    /// The steer was refused or failed; the running turn carries on
+    /// without it.
+    case failed
 }
 
 /// AppState emits these from its authoritative Hermes socket event path. Voice
@@ -525,7 +653,7 @@ enum VoiceAudioError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .microphonePermissionDenied: return AppLocalization.string("Microphone access is required for voice conversations.")
+        case .microphonePermissionDenied: return AppLocalization.string("Conduit needs the microphone for voice. Allow it in iPhone Settings > Conduit.")
         case .noAudioCaptured: return AppLocalization.string("No speech was captured.")
         case .unavailable(let detail): return detail
         }
@@ -557,9 +685,44 @@ protocol AudioCaptureService: AnyObject {
     func startListening(includePreRoll: Bool) throws
     func beginBargeInMonitoring() throws
     func pause()
+    /// Silences capture for assistant playback without releasing the
+    /// microphone, so listening can reopen while Conduit is in the
+    /// background. Starting, resuming, pausing, or stopping capture ends it.
+    func holdForPlayback()
+    var isHeldForPlayback: Bool { get }
     func resume() throws
     func finishUtterance() throws -> VoiceCapturedAudio
     func stop()
+    /// PCM16 recorded so far in the open utterance (pre-roll included), at
+    /// `VoiceAudioSessionConfiguration.capture.outputSampleRate`. Live
+    /// transcription reads it as it grows; empty when none is open.
+    var recordedPCM16: Data { get }
+}
+
+extension AudioCaptureService {
+    /// Captures that can't expose the open utterance just never stream it.
+    var recordedPCM16: Data { Data() }
+}
+
+/// Words recognized while the user is still speaking: microphone PCM goes
+/// in as it is recorded, partial text comes out, and `finish()` returns the
+/// final transcript, or nil when the recording's upload must be used.
+@MainActor
+protocol VoiceLiveTranscription: AnyObject {
+    func push(_ pcm16: Data)
+    func finish() async -> String?
+    func cancel()
+}
+
+/// A gateway that can transcribe while the user speaks. Nil when this
+/// Hermes has no live speech-to-text for the profile.
+@MainActor
+protocol VoiceLiveTranscriptionGateway: AnyObject {
+    func openLiveTranscription(
+        sampleRate: Double,
+        onPartial: @escaping @MainActor (String) -> Void,
+        onUnavailable: @escaping @MainActor () -> Void
+    ) async -> VoiceLiveTranscription?
 }
 
 @MainActor
@@ -576,12 +739,35 @@ protocol SpeechPlaybackService: AnyObject {
     /// Conversation playback joins the capture-owned session; standalone
     /// flows (Read Aloud, provider tests) own the session alone.
     var ownershipIntent: VoiceAudioIntent { get set }
+    /// Speed applied to the next stream or clip; 1.0 is normal speed.
+    var playbackRate: Float { get set }
     func start(sampleRate: Double) throws
     func enqueuePCM16(_ data: Data, sampleRate: Double) throws -> Int
     func playEncodedAudioData(_ data: Data) throws
     func finish() throws
     func drain() async
     func stop()
+    /// Holds the current audio in place (Now Playing pause, #373). Returns
+    /// false when nothing is playing that can be paused. Scheduled and
+    /// newly enqueued audio waits until `resume()`.
+    func pause() -> Bool
+    func resume()
+    /// Whether audio is currently held by `pause()`. A stream restart (route
+    /// change) clears it even though nobody resumed.
+    var isPaused: Bool { get }
+}
+
+extension SpeechPlaybackService {
+    /// Services without a speed control play at normal speed.
+    var playbackRate: Float {
+        get { 1 }
+        set {}
+    }
+
+    /// Services without pause support refuse it; the caller keeps playing.
+    func pause() -> Bool { false }
+    func resume() {}
+    var isPaused: Bool { false }
 }
 
 @MainActor

@@ -3,8 +3,9 @@
 //  Conduit
 //
 //  Profile-scoped voice configuration is intentionally kept on the Hermes
-//  host. This client only reads redacted credential metadata and submits a new
-//  value when the user explicitly saves one.
+//  host. This client only reads credential metadata (set or not, and the
+//  masked value Hermes shows) and submits a new value when the user
+//  explicitly saves one.
 //
 
 import Combine
@@ -14,8 +15,20 @@ struct VoiceCredentialStatus: Equatable, Identifiable {
     let key: String
     let isSet: Bool
     let description: String
+    /// Hermes' masked form ("sk-p...abcd"), shown so the user can tell
+    /// which key is on the host. Never the key itself.
+    var redactedValue: String? = nil
 
     var id: String { key }
+
+    /// A masked value as Hermes sends it ("sk-p...abcd", or "***" for a
+    /// short key). A value with no mask in it could be a whole key, so it
+    /// is dropped rather than shown.
+    static func maskedValue(_ value: Any?) -> String? {
+        guard let text = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        let masked = text.contains("…") || text.contains("...") || text.contains("*")
+        return masked ? text : nil
+    }
 }
 
 struct VoiceProviderReadiness: Equatable, Identifiable {
@@ -33,6 +46,20 @@ struct VoiceProviderReadiness: Equatable, Identifiable {
     /// must fail closed, never fall back to a raw config write of "nous".
     let isManagedNous: Bool
     let requiredCredentials: [VoiceCredentialStatus]
+
+    var statusLabel: String { Self.label(forStatus: status) }
+
+    /// A readiness status as a label. Hermes sends a code ("needs_keys");
+    /// one Conduit doesn't know is shown capitalized, underscores as spaces.
+    static func label(forStatus status: String) -> String {
+        switch status.lowercased() {
+        case "ready": return AppLocalization.string("Ready")
+        case "needs_keys": return AppLocalization.string("Needs an API key")
+        case "needs_auth": return AppLocalization.string("Needs sign-in")
+        case "needs_install": return AppLocalization.string("Not installed")
+        default: return status.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
 }
 
 struct VoiceTypedField: Equatable, Identifiable {
@@ -69,6 +96,15 @@ struct VoiceConfigurationSnapshot: Equatable {
     /// Values are explicit strings, never credential values.
     var values: [String: String]
     var credentials: [VoiceCredentialStatus]
+    /// Every `/api/env` row Hermes reported, keyed by variable name, so a
+    /// live mode's key (GEMINI_API_KEY, XAI_API_KEY…) can be shown where
+    /// that mode is turned on.
+    var environment: [String: VoiceCredentialStatus] = [:]
+    /// False when `/api/env` didn't answer: then "not set" is unknown.
+    var environmentLoaded = false
+    /// `stt.streaming`: Hermes recognizes speech while the user talks
+    /// (providers with a live wire), so Voice shows the words as they come.
+    var liveTranscription = false
 
     static func unavailable(profile: String, reason: String) -> Self {
         .init(
@@ -104,18 +140,27 @@ final class HermesVoiceConfigurationService: ObservableObject {
     @Published private(set) var snapshot: VoiceConfigurationSnapshot
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
+    /// The last speech server status read for this profile, for the setup step.
+    @Published private(set) var speechServer: SpeechServerStatus?
+    /// The last read of what the speech server needs to speak the replies,
+    /// for the Assistant voice step.
+    @Published private(set) var speechServerVoice: SpeechServerVoiceStatus?
 
     private let requester: VoiceConfigurationRequesting
     let profile: String
+    /// The dashboard address this phone uses, which the speech server's
+    /// model address starts with. Nil when the service has no bridge.
+    let dashboardBaseURL: String?
 
-    init(requester: VoiceConfigurationRequesting, profile: String) {
+    init(requester: VoiceConfigurationRequesting, profile: String, dashboardBaseURL: String? = nil) {
         self.requester = requester
         self.profile = profile
+        self.dashboardBaseURL = dashboardBaseURL
         snapshot = .unavailable(profile: profile, reason: AppLocalization.string("Voice settings have not been loaded."))
     }
 
     convenience init(bridge: DashboardTicketBridge, profile: String) {
-        self.init(requester: bridge, profile: profile)
+        self.init(requester: bridge, profile: profile, dashboardBaseURL: bridge.baseURL)
     }
 
     func reload() async {
@@ -136,7 +181,7 @@ final class HermesVoiceConfigurationService: ObservableObject {
         let environment = await environmentResult
 
         guard case .success(let configObject) = config else {
-            let reason = "This gateway does not expose Hermes voice configuration. Text chat is unchanged."
+            let reason = AppLocalization.string("This Hermes server doesn't offer voice settings. Update Hermes to use Voice. Text chat still works.")
             snapshot = .unavailable(profile: profile, reason: reason)
             errorMessage = Self.message(from: config)
             return
@@ -155,10 +200,13 @@ final class HermesVoiceConfigurationService: ObservableObject {
             ttsToolsetConfigAvailable: (try? tts.get()) != nil
         )
         snapshot = parsed
+        // The speech server step refreshes with the rest once it was shown.
+        if speechServer != nil { _ = await speechServerStatus() }
+        if speechServerVoice != nil { _ = await speechServerVoiceStatus() }
         // Toolset config was added after some public gateways. Its absence is
         // a capability limitation, not a failed text-chat connection.
         if (try? stt.get()) == nil && (try? tts.get()) == nil {
-            errorMessage = AppLocalization.string("This Hermes gateway is too old to report voice readiness.")
+            errorMessage = AppLocalization.string("Update Hermes to use Voice. This version can't tell Conduit whether voice is ready.")
         }
     }
 
@@ -221,7 +269,7 @@ final class HermesVoiceConfigurationService: ObservableObject {
             await reload()
             return true
         } catch {
-            errorMessage = AppLocalization.string("Could not save \(sectionKey).provider: \(error.localizedDescription)")
+            errorMessage = AppLocalization.string("Could not save \(sectionKey).provider: \(UserFacingError.message(for: error))")
             return false
         }
     }
@@ -246,7 +294,7 @@ final class HermesVoiceConfigurationService: ObservableObject {
             }
             return true
         } catch {
-            errorMessage = AppLocalization.string("Could not select \(rowName): \(error.localizedDescription)")
+            errorMessage = AppLocalization.string("Could not select \(rowName): \(UserFacingError.message(for: error))")
             return false
         }
     }
@@ -279,8 +327,9 @@ final class HermesVoiceConfigurationService: ObservableObject {
                 body: ["config": config]
             )
             // The snapshot only reflects a confirmed write; a failed PUT
-            // must leave it matching the server.
-            if clears {
+            // must leave it matching the server. A key saved into the config
+            // (the speech server's) is never kept in memory.
+            if clears || key.hasSuffix("api_key") {
                 snapshot.values.removeValue(forKey: key)
             } else {
                 snapshot.values[key] = stored
@@ -289,25 +338,139 @@ final class HermesVoiceConfigurationService: ObservableObject {
             if key == "tts.provider" { snapshot.selectedTTSProvider = value }
             return true
         } catch {
-            errorMessage = AppLocalization.string("Could not save \(key): \(error.localizedDescription)")
+            errorMessage = AppLocalization.string("Could not save \(key): \(UserFacingError.message(for: error))")
             return false
         }
     }
 
-    /// This deliberately never requests `/api/env/reveal`; the only read
-    /// state in Conduit is whether a credential is configured.
-    func saveCredential(_ value: String, key: String) async -> Bool {
-        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+    /// Turns Hermes' live speech-to-text (`stt.streaming`) on or off for
+    /// this profile. It is a Hermes setting, so it also applies to Hermes'
+    /// own CLI and Desktop voice input.
+    func saveLiveTranscription(_ enabled: Bool) async -> Bool {
+        guard var config = try? await requester.requestJSON(path: profilePath("/api/config"), method: "GET", body: nil) else {
+            errorMessage = AppLocalization.string("Could not load voice settings to save this change.")
+            return false
+        }
+        var stt = config["stt"] as? [String: Any] ?? [:]
+        stt["streaming"] = enabled
+        config["stt"] = stt
         do {
             _ = try await requester.requestJSON(
+                path: profilePath("/api/config"), method: "PUT",
+                body: ["config": config]
+            )
+            snapshot.liveTranscription = enabled
+            return true
+        } catch {
+            errorMessage = AppLocalization.string("Could not save live transcription: \(UserFacingError.message(for: error))")
+            return false
+        }
+    }
+
+    /// The user's own speech server as the notifier reads it
+    /// (`voice.speech_server`). A plugin without the route predates it.
+    func speechServerStatus() async -> SpeechServerStatus {
+        let status: SpeechServerStatus
+        do {
+            let response = try await requester.requestJSON(
+                path: profilePath(SpeechServerTranscription.statusPath), method: "GET", body: nil)
+            status = SpeechServerStatus(response: response)
+        } catch let error as DashboardTicketBridgeError where GeminiLiveTokenClient.isMissingRoute(error) {
+            status = .pluginMissing
+        } catch {
+            status = SpeechServerStatus(configured: false, available: false, url: nil, hasKey: false,
+                                        reason: UserFacingError.message(for: error), pluginMissing: false)
+        }
+        // A profile switch cancels the older read; it must not overwrite the
+        // newer profile's status.
+        if !Task.isCancelled { speechServer = status }
+        return status
+    }
+
+    /// What the speech server needs to speak Classic's replies: the model
+    /// address and key the notifier's Local Live route takes.
+    func speechServerVoiceStatus() async -> SpeechServerVoiceStatus {
+        let status: SpeechServerVoiceStatus
+        do {
+            let response = try await requester.requestJSON(
+                path: profilePath(SpeechServerSpeechStream.statusPath), method: "GET", body: nil)
+            status = SpeechServerVoiceStatus(response: response, dashboardBaseURL: dashboardBaseURL)
+        } catch let error as DashboardTicketBridgeError where GeminiLiveTokenClient.isMissingRoute(error) {
+            status = .pluginMissing
+        } catch {
+            status = SpeechServerVoiceStatus(unavailable: UserFacingError.message(for: error))
+        }
+        if !Task.isCancelled { speechServerVoice = status }
+        return status
+    }
+
+    /// A new key for the speech server; the old one stops working at once.
+    func rotateSpeechServerVoiceKey() async -> Bool {
+        do {
+            let response = try await requester.requestJSON(
+                path: profilePath(SpeechServerSpeechStream.keyPath), method: "POST", body: [:])
+            if (response["api_key"] as? String)?.isEmpty == false {
+                errorMessage = nil
+                return true
+            }
+            let reason = (response["error"] as? String ?? response["detail"] as? String)
+                .flatMap { $0.isEmpty ? nil : $0 } ?? AppLocalization.string("Your Hermes host didn't send a key.")
+            errorMessage = AppLocalization.string("Could not make a new key: \(reason)")
+            return false
+        } catch {
+            errorMessage = AppLocalization.string("Could not make a new key: \(UserFacingError.message(for: error))")
+            return false
+        }
+    }
+
+    /// Asks the Hermes host to dial the speech server and report back.
+    func testSpeechServer() async -> SpeechServerTestResult {
+        do {
+            let response = try await requester.requestJSON(
+                path: profilePath(SpeechServerTranscription.testPath), method: "POST", body: [:])
+            return SpeechServerTestResult(response: response)
+        } catch let error as DashboardTicketBridgeError where GeminiLiveTokenClient.isMissingRoute(error) {
+            return SpeechServerTestResult(connected: false, latencyMilliseconds: nil, reason: SpeechServerStatus.pluginMissingReason)
+        } catch {
+            return SpeechServerTestResult(connected: false, latencyMilliseconds: nil, reason: UserFacingError.message(for: error))
+        }
+    }
+
+    /// The first of `keys` that is set on Hermes, else nil. Used for keys
+    /// Hermes reads in order (GEMINI_API_KEY, then GOOGLE_API_KEY).
+    func configuredCredential(among keys: [String]) -> VoiceCredentialStatus? {
+        keys.lazy.compactMap { self.credential($0) }.first(where: \.isSet)
+    }
+
+    /// The `/api/env` row, unless only a provider's readiness row knows the
+    /// key is set (Hermes can read it from outside the profile's .env).
+    func credential(_ key: String) -> VoiceCredentialStatus? {
+        let row = snapshot.environment[key]
+        let listed = snapshot.credentials.first(where: { $0.key == key })
+        if row?.isSet == true { return row }
+        if listed?.isSet == true { return listed }
+        return row ?? listed
+    }
+
+    /// This deliberately never requests `/api/env/reveal`; Conduit only
+    /// reads whether a credential is set and Hermes' masked form of it.
+    func saveCredential(_ value: String, key: String) async -> Bool {
+        let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, !key.isEmpty else { return false }
+        do {
+            let response = try await requester.requestJSON(
                 path: profilePath("/api/env"), method: "PUT",
                 body: ["key": key, "value": value, "profile": profile]
             )
+            if let error = response["error"] as? String, !error.isEmpty {
+                errorMessage = AppLocalization.string("Could not save credential: \(error)")
+                return false
+            }
             replaceCredential(VoiceCredentialStatus(key: key, isSet: true, description: credentialDescription(key)))
             await reload()
             return true
         } catch {
-            errorMessage = AppLocalization.string("Could not save credential: \(error.localizedDescription)")
+            errorMessage = AppLocalization.string("Could not save credential: \(UserFacingError.message(for: error))")
             return false
         }
     }
@@ -332,17 +495,20 @@ final class HermesVoiceConfigurationService: ObservableObject {
     }
 
     private func replaceCredential(_ credential: VoiceCredentialStatus) {
-        snapshot.credentials.removeAll { $0.key == credential.key }
-        snapshot.credentials.append(credential)
-        snapshot.credentials.sort { $0.key < $1.key }
+        if snapshot.credentials.contains(where: { $0.key == credential.key }) {
+            snapshot.credentials.removeAll { $0.key == credential.key }
+            snapshot.credentials.append(credential)
+            snapshot.credentials.sort { $0.key < $1.key }
+        }
+        snapshot.environment[credential.key] = credential
     }
 
     private func credentialDescription(_ key: String) -> String {
-        snapshot.credentials.first(where: { $0.key == key })?.description ?? key
+        credential(key)?.description ?? key
     }
 
     private static func message(from result: Result<[String: Any], Error>) -> String? {
-        if case .failure(let error) = result { return error.localizedDescription }
+        if case .failure(let error) = result { return UserFacingError.message(for: error) }
         return nil
     }
 
@@ -389,9 +555,14 @@ enum VoiceConfigurationParser {
         let selectedSTT = nestedString(config, "stt.provider") ?? "local"
         let selectedTTS = nestedString(config, "tts.provider") ?? "edge"
         let readiness = readinessRows(sttReadiness, kind: .stt) + readinessRows(ttsReadiness, kind: .tts)
+        let environmentRows = allCredentialRows(environment)
         let credentials = mergedCredentials(
             credentialRows(environment) + readiness.flatMap(\.requiredCredentials)
-        )
+        ).map { credential in
+            var credential = credential
+            if credential.isSet { credential.redactedValue = environmentRows[credential.key]?.redactedValue }
+            return credential
+        }
         let schemaProviderIDs = providerIDs(schema)
         let sttIDs = unique(schemaProviderIDs.stt + readiness.filter { $0.kind == .stt }.map(\.id) + [selectedSTT])
         let ttsIDs = unique(schemaProviderIDs.tts + readiness.filter { $0.kind == .tts }.map(\.id) + [selectedTTS])
@@ -423,12 +594,15 @@ enum VoiceConfigurationParser {
             isGatewayConnected: true,
             supportsTranscription: supportsTranscription,
             supportsSpeech: supportsSpeech,
-            unavailableReason: unavailableReason
+            unavailableReason: unavailableReason,
+            selectedTTSProvider: selectedTTS
         )
         return .init(
             profile: profile, capability: capability, sttProviders: stt, ttsProviders: tts,
             selectedSTTProvider: selectedSTT, selectedTTSProvider: selectedTTS,
-            values: values, credentials: credentials
+            values: values, credentials: credentials,
+            environment: environmentRows, environmentLoaded: environment != nil,
+            liveTranscription: nestedBool(config, "stt.streaming") ?? false
         )
     }
 
@@ -455,23 +629,27 @@ enum VoiceConfigurationParser {
         })
     }
 
-    /// Display catalog matching Hermes' current STT picker. Providers outside
+    /// Display catalog matching Hermes' current STT picker (STT model lists
+    /// mirror upstream `STT_MODEL_CATALOG` in tools/transcription_common.py,
+    /// first entry = Hermes' default). Providers outside
     /// this table (plugin rows such as StepFun/Xiaomi MiMo, or future
     /// gateways) fall back to a generated descriptor and still work.
     static func catalogDescriptor(id: String, kind: VoiceProviderDescriptor.Kind) -> VoiceProviderDescriptor? {
         switch (id, kind) {
         case ("local", .stt):
-            return .init(id: id, displayName: "Local", kind: kind, models: ["tiny", "base", "small", "medium", "large-v3"], supportsStreaming: false)
+            return .init(id: id, displayName: AppLocalization.string("Local"), kind: kind, models: ["base", "tiny", "small", "medium", "large-v3", "turbo"], supportsStreaming: false)
         case ("nous", .stt), ("openai", .stt):
             // The managed Nous route resolves models from the same
             // OpenAI-compatible catalog as the direct key.
             return .init(id: id, displayName: id == "nous" ? AppLocalization.string("Nous Subscription") : "OpenAI", kind: kind, models: ["whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"], supportsStreaming: false)
         case ("groq", .stt):
-            return .init(id: id, displayName: "Groq", kind: kind, models: ["whisper-large-v3-turbo", "whisper-large-v3", "distil-whisper-large-v3-en"], supportsStreaming: false)
+            return .init(id: id, displayName: "Groq", kind: kind, models: ["whisper-large-v3-turbo", "whisper-large-v3"], supportsStreaming: false)
+        case ("mistral", .stt):
+            return .init(id: id, displayName: "Mistral", kind: kind, models: ["voxtral-mini-latest", "voxtral-mini-2602"], supportsStreaming: false)
         case ("xai", .stt):
-            return .init(id: id, displayName: "xAI", kind: kind, supportsStreaming: false)
+            return .init(id: id, displayName: "xAI", kind: kind, models: ["grok-voice-transcribe-2.0", "grok-voice-transcribe-1.0"], supportsStreaming: false)
         case ("elevenlabs", .stt):
-            return .init(id: id, displayName: "ElevenLabs Scribe", kind: kind, supportsStreaming: false)
+            return .init(id: id, displayName: "ElevenLabs Scribe", kind: kind, models: ["scribe_v2", "scribe_v1"], supportsStreaming: false)
         case ("deepinfra", .stt):
             return .init(id: id, displayName: "DeepInfra", kind: kind, supportsStreaming: false)
         case ("nous", .tts):
@@ -492,6 +670,9 @@ enum VoiceConfigurationParser {
             return .init(id: id, displayName: "xAI", kind: kind, supportsStreaming: true)
         case ("gemini", .tts):
             return .init(id: id, displayName: "Gemini", kind: kind, supportsStreaming: true)
+        case ("edge", .tts):
+            // Hermes' default voice: free, no key, nothing to install.
+            return .init(id: id, displayName: "Edge TTS", kind: kind, supportsStreaming: false)
         case ("stepfun", .stt):
             return .init(id: id, displayName: "StepFun", kind: kind, models: ["stepaudio-2.5-asr", "step-asr"], supportsStreaming: false)
         case ("stepfun", .tts):
@@ -570,7 +751,7 @@ enum VoiceConfigurationParser {
     /// Shared help copy for provider endpoint overrides: this redirects the
     /// provider Hermes calls, never Conduit's own dashboard connection.
     private static func customEndpointHelp(_ provider: String) -> String {
-        "Optional \(provider)-compatible speech endpoint Hermes should call (for example https://your-host/v1). Leave blank for the provider default. This does not change the server Conduit connects to."
+        AppLocalization.string("Optional \(provider)-compatible speech endpoint Hermes should call (for example https://your-host/v1). Leave blank for the provider default. This does not change the server Conduit connects to.")
     }
 
     private static func decimalField(for key: String) -> VoiceTypedField? {
@@ -596,10 +777,10 @@ enum VoiceConfigurationParser {
         let normalized = normalizedNumber(value)
         guard !normalized.isEmpty else { return nil }
         guard let parsed = Double(normalized) else {
-            return "\(field.label) must be a number between \(range.lowerBound) and \(range.upperBound), or leave blank to remove the override."
+            return AppLocalization.string("\(field.label) must be a number between \(String(range.lowerBound)) and \(String(range.upperBound)), or leave blank to remove the override.")
         }
         guard range.contains(parsed) else {
-            return "\(field.label) must be between \(range.lowerBound) and \(range.upperBound). Hermes clamps values into this range; Conduit refuses them instead of saving something upstream would silently rewrite."
+            return AppLocalization.string("\(field.label) must be between \(String(range.lowerBound)) and \(String(range.upperBound)). Hermes clamps values into this range; Conduit refuses them instead of saving something upstream would silently rewrite.")
         }
         return nil
     }
@@ -658,12 +839,21 @@ enum VoiceConfigurationParser {
             let status: String
             if let text = row["status"] as? String { status = text }
             else if let object = row["status"] as? [String: Any] { status = object["state"] as? String ?? object["label"] as? String ?? AppLocalization.string("Unknown") }
-            else { status = AppLocalization.string("Unknown") }
+            else { status = legacyStatus(credentials) }
             // providerID resolves to "nous" only for the managed route (the
             // managed feature marker or the legacy managed-row label), so the
             // canonical ID doubles as the structured managed marker.
             return .init(id: id, kind: kind, status: status, isActive: row["is_active"] as? Bool ?? false, displayName: row["name"] as? String ?? id, isManagedNous: id == "nous", requiredCredentials: credentials)
         }
+    }
+
+    /// Hermes before 0.19 sends no readiness status, only each row's keys.
+    /// Its own picker then showed a row as ready once every key it lists was
+    /// set, keyless rows included, so Conduit judges those hosts the same way
+    /// instead of refusing Voice on a host that can speak. The real speech
+    /// attempt reports anything else (a logged-out Nous row, say).
+    private static func legacyStatus(_ credentials: [VoiceCredentialStatus]) -> String {
+        credentials.allSatisfy(\.isSet) ? "ready" : "needs_keys"
     }
 
     /// Hermes' toolset response keys each row by its picker label; only TTS
@@ -691,6 +881,10 @@ enum VoiceConfigurationParser {
         case "openai", "openai tts": return "openai"
         case "elevenlabs scribe": return "elevenlabs"
         case "microsoft edge tts": return "edge"
+        // Hermes before 0.19 sends TTS rows without `tts_provider`.
+        case "xai tts": return "xai"
+        case "mistral (voxtral tts)": return "mistral"
+        case "google gemini tts": return "gemini"
         default: break
         }
         return name
@@ -706,6 +900,20 @@ enum VoiceConfigurationParser {
             guard let row = value as? [String: Any], key == "STEPFUN_API_KEY" || key == "MIMO_API_KEY" else { return nil }
             return .init(key: key, isSet: row["is_set"] as? Bool ?? false, description: row["description"] as? String ?? key)
         }.sorted { $0.key < $1.key }
+    }
+
+    private static func allCredentialRows(_ payload: [String: Any]?) -> [String: VoiceCredentialStatus] {
+        var rows: [String: VoiceCredentialStatus] = [:]
+        for (key, value) in payload ?? [:] {
+            guard let row = value as? [String: Any] else { continue }
+            let isSet = row["is_set"] as? Bool ?? false
+            rows[key] = .init(
+                key: key, isSet: isSet,
+                description: row["description"] as? String ?? key,
+                redactedValue: isSet ? VoiceCredentialStatus.maskedValue(row["redacted_value"]) : nil
+            )
+        }
+        return rows
     }
 
     private static func mergedCredentials(_ values: [VoiceCredentialStatus]) -> [VoiceCredentialStatus] {

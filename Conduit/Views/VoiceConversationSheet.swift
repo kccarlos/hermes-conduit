@@ -12,6 +12,11 @@ struct VoiceConversationSheet: View {
     @ObservedObject var controller: VoiceConversationController
     @ObservedObject var backgroundJobs: VoiceBackgroundJobSupervisor
     let profile: String
+    /// The chat the conversation talks in, for V2's call header.
+    var chatTitle: String? = nil
+    /// Handed to V2's job result sheet, which reads it from the
+    /// environment. A plain reference: the sheet never redraws for it.
+    var appState: AppState? = nil
     let onClose: () -> Void
     /// One-shot gate armed by a fresh `openVoiceConversation` and consumed
     /// exactly once. A restored suspended conversation deliberately does NOT
@@ -21,13 +26,46 @@ struct VoiceConversationSheet: View {
     var startsListening: Bool = true
 
     @State private var didRequestStart = false
+    /// V2 draws the conversation as a call screen, like the live modes.
+    @AppStorage(V2ShellPreference.key) private var usesV2 = V2ShellPreference.defaultValue
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var showsTranscript = false
+    /// When the sheet opened, for V2's call clock.
+    @State private var openedAt = Date()
+    /// The job whose result V2 shows over the conversation.
+    @State private var selectedJob: SelectedJob?
+    /// The job chat to open once the result sheet has gone.
+    @State private var pendingJobChat: String?
+    @Environment(\.openURL) private var openURL
+
+    private struct SelectedJob: Identifiable {
+        let id: UUID
+    }
 
     var body: some View {
+        Group {
+            if usesV2 {
+                v2Body
+            } else {
+                v1Body
+            }
+        }
+        .task {
+            guard startsListening, !didRequestStart else { return }
+            didRequestStart = true
+            guard shouldAutoListen() else { return }
+            await controller.startListening()
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var v1Body: some View {
         NavigationStack {
             ZStack {
                 ConduitBackdrop()
                 ScrollView {
-                    VStack(spacing: 14) {
+                    VStack(spacing: 22) {
                         statusCard
                         conversationCard
                         backgroundJobsCard
@@ -46,13 +84,6 @@ struct VoiceConversationSheet: View {
                 ConduitSheetHeader(title: AppLocalization.string("Voice conversation"), close: close)
             }
         }
-        .task {
-            guard startsListening, !didRequestStart else { return }
-            didRequestStart = true
-            guard shouldAutoListen() else { return }
-            await controller.startListening()
-        }
-        .accessibilityElement(children: .contain)
     }
 
     private var statusCard: some View {
@@ -79,8 +110,8 @@ struct VoiceConversationSheet: View {
                 VoiceInputLevelMeter(level: inputMeterLevel, isActive: isInputMeterActive)
                     .frame(height: 20)
                     .accessibilityHint(Text(isInputMeterActive
-                        ? "Shows audio reaching Conduit while the microphone is live."
-                        : "The microphone is not capturing right now."))
+                        ? AppLocalization.string("Shows audio reaching Conduit while the microphone is live.")
+                        : AppLocalization.string("The microphone is not capturing right now.")))
                 Spacer(minLength: 0)
             }
         }
@@ -88,7 +119,7 @@ struct VoiceConversationSheet: View {
 
     private var conversationCard: some View {
         ConduitSettingsSection(title: AppLocalization.string("Conversation"), symbol: "text.bubble", tint: .conduitAura) {
-            if controller.conversationTranscript.isEmpty {
+            if controller.conversationTranscript.isEmpty, controller.liveTranscript.isEmpty {
                 Text("Your spoken words and Hermes' replies will appear here.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -99,6 +130,15 @@ struct VoiceConversationSheet: View {
                     ForEach(controller.conversationTranscript) { entry in
                         VoiceConversationTranscriptBubble(entry: entry)
                     }
+                    // Words Hermes has heard so far, while the user is
+                    // still talking (live speech-to-text).
+                    if !controller.liveTranscript.isEmpty {
+                        VoiceConversationTranscriptBubble(
+                            entry: VoiceConversationTranscriptEntry(speaker: .user, text: controller.liveTranscript)
+                        )
+                        .opacity(0.6)
+                        .accessibilityHint("Still listening")
+                    }
                 }
             }
         }
@@ -106,14 +146,14 @@ struct VoiceConversationSheet: View {
 
     private var backgroundJobsCard: some View {
         ConduitSettingsSection(title: AppLocalization.string("Background jobs"), symbol: "square.stack.3d.up", tint: .conduitAccent) {
-            if backgroundJobs.jobs.isEmpty {
+            if backgroundJobs.backgroundJobs.isEmpty {
                 Text("Say “background job” and then a task to run it as its own chat while you keep talking.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(backgroundJobs.jobs.reversed()) { job in
+                    ForEach(backgroundJobs.backgroundJobs.reversed()) { job in
                         HStack(spacing: 10) {
                             Image(systemName: Self.jobSymbol(job.status))
                                 .foregroundStyle(Self.jobTint(job.status))
@@ -172,20 +212,20 @@ struct VoiceConversationSheet: View {
 
     private var controlsCard: some View {
         ConduitSettingsSection(title: AppLocalization.string("Microphone and audio"), symbol: "slider.horizontal.3", tint: .conduitAccent) {
-            HStack(spacing: 10) {
+            AdaptiveStack(spacing: 10) {
                 Button { microphoneTapped() } label: {
                     Label(microphoneLabel, systemImage: microphoneSymbol)
                         .frame(maxWidth: .infinity)
-                        .frame(height: 48)
+                        .padding(.vertical, 6).frame(minHeight: 48)
                 }
                 .conduitGlassControl(cornerRadius: 17, tint: .conduitAccent.opacity(0.16))
                 .accessibilityHint(microphoneHint)
                 .disabled(controller.state == .transcribing)
 
                 Button { controller.setOutputMuted(!controller.isOutputMuted) } label: {
-                    Label(controller.isOutputMuted ? "Unmute" : "Mute", systemImage: controller.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    Label(controller.isOutputMuted ? AppLocalization.string("Unmute") : AppLocalization.string("Mute"), systemImage: controller.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                         .frame(maxWidth: .infinity)
-                        .frame(height: 48)
+                        .padding(.vertical, 6).frame(minHeight: 48)
                 }
                 .conduitGlassControl(cornerRadius: 17, tint: controller.isOutputMuted ? .orange.opacity(0.18) : .conduitAura.opacity(0.14))
                 .accessibilityHint("Mutes assistant audio without changing chat messages")
@@ -257,6 +297,9 @@ struct VoiceConversationSheet: View {
     private var statusTitle: String {
         if isInterruptAvailable { return AppLocalization.string("Hermes is speaking") }
         if controller.isMicrophonePaused { return AppLocalization.string("Microphone paused") }
+        if controller.isSteeringTurn, controller.state == .listening || controller.state == .transcribing {
+            return AppLocalization.string("Steering Hermes")
+        }
         switch controller.state {
         case .idle: return AppLocalization.string("Ready to listen")
         case .listening: return AppLocalization.string("Listening")
@@ -271,12 +314,15 @@ struct VoiceConversationSheet: View {
     private var statusDetail: String {
         if isInterruptAvailable { return AppLocalization.string("Tap Interrupt to speak.") }
         if controller.isMicrophonePaused { return AppLocalization.string("Tap Listen when you are ready to resume.") }
+        if controller.isSteeringTurn, controller.state == .listening || controller.state == .transcribing {
+            return AppLocalization.string("Hermes keeps working with your words added.")
+        }
         switch controller.state {
         case .idle: return AppLocalization.string("Tap Listen when you are ready.")
         case .listening: return AppLocalization.string("Pause the microphone whenever you need a break.")
         case .transcribing: return AppLocalization.string("Sending your speech to Hermes.")
-        case .thinking: return AppLocalization.string("Speak to interrupt and start a new turn.")
-        case .speaking: return AppLocalization.string("Speak over Hermes to interrupt it.")
+        case .thinking: return AppLocalization.string("Speak to steer Hermes while it works.")
+        case .speaking: return AppLocalization.string("Speak over Hermes to start a new turn.")
         case .muted: return AppLocalization.string("Assistant text is still continuing in chat.")
         case .failed(let detail): return detail
         }
@@ -320,17 +366,288 @@ struct VoiceConversationSheet: View {
     }
 }
 
+// MARK: - V2
+
+/// V2 draws classic voice as the live modes' call screen: the last two
+/// lines large at the top, thirty level bars that rise with the microphone,
+/// the state under them, and the round controls with End in red. Closing
+/// still ends the conversation: classic voice doesn't minimise.
+extension VoiceConversationSheet {
+    fileprivate var v2Body: some View {
+        ZStack {
+            ConduitBackdrop()
+            VStack(spacing: 0) {
+                v2Header
+                if showsTranscript {
+                    v2TranscriptList
+                } else if dynamicTypeSize >= .xxLarge {
+                    // Large text can outgrow a small screen.
+                    ScrollView { v2Stage }
+                        .scrollBounceBehavior(.basedOnSize)
+                } else {
+                    v2Stage
+                }
+                v2Controls
+            }
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: showsTranscript)
+        // VoiceOver hears the conversation change state, not every word.
+        .onChange(of: callPhase) { _, _ in
+            AccessibilityNotification.Announcement(statusTitle).post()
+        }
+        .sheet(item: $selectedJob, onDismiss: {
+            // Leaving for the job's chat ends the voice conversation, as
+            // closing it does.
+            guard let chatID = pendingJobChat else { return }
+            pendingJobChat = nil
+            close()
+            openURL(ConduitAppLink.session(id: chatID).url)
+        }) { selected in
+            if let appState {
+                LiveVoiceJobResultSheet(jobs: backgroundJobs, jobID: selected.id) { chatID in
+                    pendingJobChat = chatID
+                    selectedJob = nil
+                }
+                .environmentObject(appState)
+                .presentationDetents([.medium, .large])
+            }
+        }
+    }
+
+    /// The conversation as the call screen's bars draw it.
+    fileprivate var callPhase: LiveVoiceCallPhase {
+        if controller.isMicrophonePaused { return .muted }
+        switch controller.state {
+        case .idle: return .idle
+        case .listening: return .listening
+        // Working: a slow blue, like a call connecting.
+        case .transcribing, .thinking: return .connecting
+        case .speaking: return .speaking
+        case .muted: return .muted
+        case .failed: return .failed
+        }
+    }
+
+    private var v2Title: String {
+        let title = chatTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return title.isEmpty ? AppLocalization.string("Voice conversation") : title
+    }
+
+    private func v2Subtitle(at now: Date) -> String {
+        [profileDisplayName, AppLocalization.string("Classic voice"), V2CallHeaderTitle.clock(max(0, now.timeIntervalSince(openedAt)))]
+            .joined(separator: " · ")
+    }
+
+    private var v2Header: some View {
+        HStack(spacing: 12) {
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .conduitGlassControl(cornerRadius: 22)
+            .accessibilityLabel(Text("Close"))
+            // Unlike a live call's chevron, this ends the conversation.
+            .accessibilityHint(Text("Your conversation also continues in chat. Close ends this voice session."))
+
+            VStack(spacing: 2) {
+                Text(verbatim: v2Title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    // VoiceOver hears the profile and mode, not the clock.
+                    .accessibilityValue(Text(verbatim: "\(profileDisplayName), \(AppLocalization.string("Classic voice"))"))
+                TimelineView(.animation(minimumInterval: 1)) { context in
+                    Text(verbatim: v2Subtitle(at: context.date))
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .accessibilityHidden(true)
+            }
+            .frame(maxWidth: .infinity)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+
+            // Balances the close button so the title stays centred.
+            Color.clear
+                .frame(width: 44, height: 44)
+                .accessibilityHidden(true)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+    }
+
+    /// Hermes' `@session:<id>` chat links read as the chat's name, as in
+    /// the transcript bubbles.
+    private var v2CaptionLines: [VoiceConversationTranscriptEntry] {
+        controller.conversationTranscript.suffix(2).map { entry in
+            entry.speaker == .user
+                ? entry
+                : VoiceConversationTranscriptEntry(id: entry.id, speaker: entry.speaker, text: HermesSessionReference.plain(entry.text))
+        }
+    }
+
+    private func v2Label(for entry: VoiceConversationTranscriptEntry) -> String {
+        entry.speaker == .user
+            ? AppLocalization.string("You: \(entry.text)")
+            : "\(AppLocalization.string("Hermes")): \(entry.text)"
+    }
+
+    private var v2Stage: some View {
+        VStack(spacing: 0) {
+            V2CallCaptions(
+                lines: v2CaptionLines,
+                pending: controller.liveTranscript.isEmpty ? nil : controller.liveTranscript,
+                label: v2Label(for:)
+            )
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            Spacer(minLength: 16)
+            V2CallLevelBars(
+                phase: callPhase,
+                inputFraction: isInputMeterActive ? VoiceLevelMeterMath.displayFraction(forLevel: controller.microphoneLevel) : nil
+            )
+            .frame(height: 96)
+            .padding(.horizontal, 28)
+            .accessibilityHidden(true)
+            VStack(spacing: 6) {
+                Text(statusTitle)
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
+                Text(statusDetail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 24)
+            .padding(.top, 18)
+            .accessibilityElement(children: .combine)
+            Spacer(minLength: 16)
+            v2JobStrip
+                .padding(.horizontal, 24)
+                .padding(.bottom, 8)
+        }
+        .transition(.opacity)
+    }
+
+    /// The newest background job, with how many more there are.
+    @ViewBuilder
+    private var v2JobStrip: some View {
+        let jobs = backgroundJobs.backgroundJobs
+        if let latest = jobs.last {
+            VStack(spacing: 6) {
+                LiveVoiceJobCard(job: latest) { selectJob(latest.id) }
+                if jobs.count > 1 {
+                    Text("\(jobs.count - 1) more in the transcript")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private func selectJob(_ id: UUID) {
+        // Without the app state the result sheet can't open; the
+        // transcript lists every job instead.
+        if appState == nil {
+            showsTranscript = true
+        } else {
+            selectedJob = SelectedJob(id: id)
+        }
+    }
+
+    private var v2TranscriptList: some View {
+        ScrollView {
+            LazyVStack(spacing: 10) {
+                if controller.conversationTranscript.isEmpty, controller.liveTranscript.isEmpty {
+                    Text("What you and the assistant say will appear here.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 24)
+                }
+                ForEach(controller.conversationTranscript) { entry in
+                    VoiceConversationTranscriptBubble(entry: entry)
+                }
+                if !controller.liveTranscript.isEmpty {
+                    VoiceConversationTranscriptBubble(
+                        entry: VoiceConversationTranscriptEntry(speaker: .user, text: controller.liveTranscript)
+                    )
+                    .opacity(0.6)
+                    .accessibilityHint("Still listening")
+                }
+                ForEach(backgroundJobs.backgroundJobs) { job in
+                    LiveVoiceJobCard(job: job) { selectJob(job.id) }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+        }
+        .defaultScrollAnchor(.bottom)
+        .transition(.opacity)
+    }
+
+    private var v2Controls: some View {
+        HStack(alignment: .top, spacing: 0) {
+            LiveVoiceCallButton(
+                symbol: microphoneSymbol,
+                title: microphoneLabel,
+                style: controller.isMicrophonePaused ? .selected : .normal,
+                voiceOverHint: microphoneHint,
+                action: microphoneTapped
+            )
+            .disabled(controller.state == .transcribing)
+            LiveVoiceCallButton(
+                symbol: controller.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                title: controller.isOutputMuted ? AppLocalization.string("Sound on") : AppLocalization.string("Silence"),
+                style: controller.isOutputMuted ? .selected : .normal,
+                voiceOverLabel: controller.isOutputMuted
+                    ? AppLocalization.string("Turn the assistant's sound back on")
+                    : AppLocalization.string("Silence the assistant"),
+                action: { controller.setOutputMuted(!controller.isOutputMuted) }
+            )
+            LiveVoiceCallButton(
+                symbol: "text.bubble.fill",
+                title: AppLocalization.string("Transcript"),
+                style: showsTranscript ? .selected : .normal,
+                action: { showsTranscript.toggle() }
+            )
+            .accessibilityAddTraits(showsTranscript ? .isSelected : [])
+            LiveVoiceCallButton(
+                symbol: "phone.down.fill",
+                title: AppLocalization.string("End"),
+                style: .destructive,
+                voiceOverLabel: AppLocalization.string("End call"),
+                voiceOverHint: AppLocalization.string("Hangs up the call"),
+                action: close
+            )
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 12)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+    }
+}
+
 private struct VoiceConversationTranscriptBubble: View {
     let entry: VoiceConversationTranscriptEntry
 
     private var isUser: Bool { entry.speaker == .user }
+    /// Hermes' `@session:<id>` chat links read as the chat's name; the reply
+    /// in the chat links them.
+    private var shownText: String { isUser ? entry.text : HermesSessionReference.plain(entry.text) }
 
     var body: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
             Text(isUser ? AppLocalization.string("You") : AppLocalization.string("Hermes"))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            Text(entry.text)
+            Text(shownText)
                 .font(.body)
                 .foregroundStyle(.primary)
                 .textSelection(.enabled)
@@ -341,6 +658,6 @@ private struct VoiceConversationTranscriptBubble: View {
         .background((isUser ? Color.conduitAccent : Color.conduitAura).opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(isUser ? "You" : "Hermes"): \(entry.text)")
+        .accessibilityLabel("\(isUser ? AppLocalization.string("You") : AppLocalization.string("Hermes")): \(shownText)")
     }
 }

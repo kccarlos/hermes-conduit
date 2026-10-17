@@ -14,6 +14,9 @@ struct ChatMessageScrollTarget: Identifiable, Equatable {
     /// per body evaluation) and still report stable row order to the
     /// viewport geometry.
     let order: Int
+    /// Where this row sits in its turn's run of thinking and tool steps, so
+    /// the run can draw as one card. Nil for every other row.
+    var step: ChatStepPlacement? = nil
 
     /// SwiftUI keeps the existing source-row identity for rendering and
     /// controls. Only scroll targeting uses the source-independent ID.
@@ -87,6 +90,7 @@ struct ChatMessageScrollTargetCache: Equatable {
                 )
             }
             targets.replaceSubrange(suffixStart..., with: replacement)
+            placeSteps(from: suffixStart)
             renderingRevision &+= 1
             return .renderingChanged
         }
@@ -113,6 +117,7 @@ struct ChatMessageScrollTargetCache: Equatable {
             )
             fingerprints.replaceSubrange(suffixStart..., with: suffixFingerprints)
             targets.replaceSubrange(suffixStart..., with: suffixTargets)
+            placeSteps(from: suffixStart)
             renderingRevision &+= 1
             return .semanticsChanged
         }
@@ -129,8 +134,40 @@ struct ChatMessageScrollTargetCache: Equatable {
             for: messages,
             fingerprints: updatedFingerprints
         )
+        placeSteps(from: 0)
         renderingRevision &+= 1
         return .semanticsChanged
+    }
+
+    /// Re-place the runs of steps from `index` on, starting at the run
+    /// that reaches it: a change at the end can grow that run, settle its
+    /// steps, or end it.
+    private mutating func placeSteps(from index: Int) {
+        var start = min(index, targets.count)
+        while start > 0, ChatStepGroup.isStep(targets[start - 1].message) {
+            start -= 1
+        }
+        var i = start
+        while i < targets.count {
+            guard ChatStepGroup.isStep(targets[i].message) else {
+                if targets[i].step != nil { targets[i].step = nil }
+                i += 1
+                continue
+            }
+            var end = i
+            while end < targets.count, ChatStepGroup.isStep(targets[end].message) {
+                end += 1
+            }
+            let group = ChatStepGroup(
+                members: targets[i..<end].map { ChatStepGroupMember($0.message) },
+                isTrailing: end == targets.count
+            )
+            for k in i..<end {
+                let placement = ChatStepPlacement(group: group, index: k - i)
+                if targets[k].step != placement { targets[k].step = placement }
+            }
+            i = end
+        }
     }
 
     private static func fingerprintedBytes(of messages: [ChatMessage]) -> Int {
@@ -449,6 +486,40 @@ enum ChatScrollSessionIdentityResolver {
             || reconciliationIDs.contains(where: previous.contains)
             || !reconciliationCatalogIDs.isDisjoint(with: previous.equivalentSessionIDs)
             || activeID.map(reconciliationCatalogIDs.contains) == true
+
+        // An explicit open moves the active id to the NEW conversation while
+        // the reconciliation boundary still names the one being left (the
+        // boundary is taken before the new id lands). That active id belongs
+        // to neither the previous identity nor the reconciliation's
+        // conversation: it is navigation, so the identity starts over from it,
+        // exactly as it does with no reconciliation in flight. Carrying it as
+        // a continuation merged the two conversations' ids and, for a chat
+        // with no catalog row (a Bot Chat), kept the LEFT conversation's id as
+        // canonical — a later preserve-current sync then resumed that other
+        // chat under the open one's header (#442).
+        // Reachable only before the new conversation's resume lands: the
+        // reconcile publishes `resolvedSessionId` (part of `reconciliationIDs`)
+        // before it moves the active id, so a rotated runtime never takes this
+        // branch, and any durable id resolved here belongs to the chat being
+        // left, which is why it is not carried over.
+        if let activeID, !reconciliationIDs.isEmpty,
+           !reconciliationIDs.contains(activeID),
+           !reconciliationCatalogIDs.contains(activeID),
+           !previous.contains(activeID) {
+            let activeSession = matchingSession(for: [activeID])
+            let activeSessionIDs = activeSession?.identifiers ?? []
+            if activeSessionIDs.isDisjoint(with: previous.equivalentSessionIDs) {
+                return ChatScrollSessionIdentity(
+                    profile: normalizedProfile,
+                    canonicalSessionID: activeSession?.canonicalSessionID ?? activeID,
+                    equivalentSessionIDs: activeSessionIDs.union([activeID]),
+                    isReconciling: isReconciling,
+                    settledRevision: advanceSettledRevision
+                        ? current.settledRevision &+ 1
+                        : current.settledRevision
+                )
+            }
+        }
 
         var candidates = reconciliationIDs
         if reconciliationIDs.isEmpty || reconciliationContinuesPrevious,

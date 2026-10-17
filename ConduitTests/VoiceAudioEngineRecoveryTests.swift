@@ -9,8 +9,8 @@ import XCTest
 /// engine subclass, so no test renders audio or starts a real engine.
 ///
 /// Hosted as an extension of an existing voice-audio test class rather than a
-/// new XCTestCase: the CI planner's per-job batch policy is at capacity, and
-/// one more planned class fails plan validation.
+/// new XCTestCase: the CI planner's per-job batch policy was at capacity, and
+/// one more planned class would have failed plan validation.
 extension VoiceAudioSessionCoordinatorTests {
     private var formatNotSupported: NSError {
         NSError(
@@ -191,6 +191,21 @@ extension VoiceAudioSessionCoordinatorTests {
         XCTAssertEqual(factory.startAttempts, 4)
     }
 
+    /// A configuration change settles the stream only when it comes from the
+    /// live engine and that engine stopped rendering under a lease: one from
+    /// a replaced engine (delivered after the rebuild) leaves the new stream
+    /// alone.
+    func testOnlyTheLiveEnginesConfigurationChangeSettlesPlayback() {
+        typealias Service = AVSpeechPlaybackService
+        XCTAssertTrue(Service.settlesOnConfigurationChange(from: 2, liveEngine: 2, holdsLease: true, engineRunning: false))
+        XCTAssertFalse(Service.settlesOnConfigurationChange(from: 1, liveEngine: 2, holdsLease: true, engineRunning: false),
+                       "a replaced engine's change must not stop the live stream")
+        XCTAssertFalse(Service.settlesOnConfigurationChange(from: 2, liveEngine: 2, holdsLease: false, engineRunning: false),
+                       "nothing is playing")
+        XCTAssertFalse(Service.settlesOnConfigurationChange(from: 2, liveEngine: 2, holdsLease: true, engineRunning: true),
+                       "the engine kept rendering through the change")
+    }
+
     // MARK: - Capture engine recovery (fake capture graph)
 
     private func makeCaptureService(_ factory: FakeCaptureEngineFactory) -> AVAudioCaptureService {
@@ -215,6 +230,64 @@ extension VoiceAudioSessionCoordinatorTests {
         XCTAssertFalse(factory.engines[1].isRunning, "the previous engine was stopped")
         XCTAssertTrue(factory.engines[2].isRunning)
         service.stop()
+    }
+
+    /// A locked phone can't start a new capture engine, so a playback hold
+    /// must keep the running one and drop its frames instead.
+    func testPlaybackHoldKeepsTheRunningEngineAndDropsFrames() throws {
+        let factory = FakeCaptureEngineFactory()
+        let service = makeCaptureService(factory)
+        try service.startListening()
+        let generation = service.captureGeneration
+
+        service.holdForPlayback()
+
+        XCTAssertTrue(factory.engines[1].isRunning, "the microphone stays up")
+        XCTAssertEqual(service.captureGeneration, generation)
+        XCTAssertFalse(service.acceptsFrame(generation: generation), "the reply never reaches capture")
+
+        try service.startListening()
+
+        XCTAssertEqual(factory.engines.count, 2, "listening reuses the held engine")
+        XCTAssertTrue(service.acceptsFrame(generation: generation))
+        service.stop()
+    }
+
+    /// A frame tapped during the hold but still queued for the MainActor
+    /// when listening reopens is reply audio, and must not be recorded.
+    func testFrameTappedDuringAHoldIsDroppedAfterTheHoldLifts() async throws {
+        let factory = FakeCaptureEngineFactory()
+        let service = makeCaptureService(factory)
+        try service.startListening()
+        let tap = try XCTUnwrap(factory.engines.last?.tapBlock)
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_800))
+        buffer.frameLength = 4_800
+        let samples = try XCTUnwrap(buffer.floatChannelData?[0])
+        for index in 0..<4_800 { samples[index] = 0.25 }
+
+        service.holdForPlayback()
+        tap(buffer, AVAudioTime(hostTime: 0))
+        try service.startListening()
+        await drainPendingMainActorWork()
+
+        XCTAssertTrue(service.capturedPCM.isEmpty, "reply audio from the hold never reaches the new window")
+
+        tap(buffer, AVAudioTime(hostTime: 0))
+        await drainPendingMainActorWork()
+
+        XCTAssertFalse(service.capturedPCM.isEmpty, "frames tapped after the hold are recorded")
+        service.stop()
+    }
+
+    func testPlaybackHoldWithoutARunningEngineIsARealPause() {
+        let factory = FakeCaptureEngineFactory()
+        let service = makeCaptureService(factory)
+
+        service.holdForPlayback()
+
+        XCTAssertTrue(service.paused)
+        XCTAssertFalse(service.heldForPlayback)
     }
 
     func testCaptureTapsAtTheHardwareFormatWhenTheNodeRateIsStale() throws {
@@ -291,6 +364,132 @@ extension VoiceAudioSessionCoordinatorTests {
         XCTAssertEqual(factory.engines.count, 2)
     }
 
+    // MARK: - Capture after a hardware change
+
+    func testOnlyTheLiveEnginesStopRestartsCapture() {
+        typealias Service = AVAudioCaptureService
+        XCTAssertTrue(Service.restartsOnConfigurationChange(from: 3, liveEngine: 3, keepsRunning: true, engineRunning: false))
+        XCTAssertFalse(Service.restartsOnConfigurationChange(from: 2, liveEngine: 3, keepsRunning: true, engineRunning: false),
+                       "a replaced engine's change leaves the new one alone")
+        XCTAssertFalse(Service.restartsOnConfigurationChange(from: 3, liveEngine: 3, keepsRunning: false, engineRunning: false),
+                       "capture is paused or stopped")
+        XCTAssertFalse(Service.restartsOnConfigurationChange(from: 3, liveEngine: 3, keepsRunning: true, engineRunning: true),
+                       "the route change already restarted it, or it never stopped")
+    }
+
+    /// CarPlay moving a running conversation onto the car's microphone stops
+    /// the capture engine. The engine's own change notice brings capture
+    /// back on a fresh engine, even when the route change was handled while
+    /// the engine still read as running.
+    func testCaptureRestartsWhenTheHardwareStopsItsEngine() async throws {
+        let factory = FakeCaptureEngineFactory()
+        let service = makeCaptureService(factory)
+        try service.startListening()
+        let stopped = try XCTUnwrap(factory.engines.last)
+
+        // What the system does to an engine whose hardware changed.
+        stopped.stop()
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: stopped)
+        let restarted = await waitForCondition { factory.engines.count == 3 }
+
+        XCTAssertTrue(restarted, "capture moved to a fresh engine")
+        let fresh = try XCTUnwrap(factory.engines.last)
+        XCTAssertTrue(fresh.isRunning)
+        XCTAssertTrue(fresh.hasTap)
+        XCTAssertTrue(service.acceptsFrame(generation: service.captureGeneration), "the new engine's frames are recorded")
+
+        // A late notice from the replaced engine restarts nothing.
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: stopped)
+        await drainPendingMainActorWork()
+        XCTAssertEqual(factory.engines.count, 3)
+        service.stop()
+    }
+
+    func testAStoppedCaptureIgnoresAHardwareChange() async throws {
+        let factory = FakeCaptureEngineFactory()
+        let service = makeCaptureService(factory)
+        try service.startListening()
+        let engine = try XCTUnwrap(factory.engines.last)
+        service.stop()
+
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: engine)
+        await drainPendingMainActorWork()
+
+        XCTAssertEqual(factory.engines.count, 2, "nothing restarts a capture that ended")
+        XCTAssertFalse(engine.isRunning)
+    }
+
+    /// Waits on `condition`, never on a count of turns; the cap only stops a
+    /// stuck test.
+    private func waitForCondition(timeout: TimeInterval = 10, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else { return false }
+            await drainPendingMainActorWork(rounds: 1)
+        }
+        return true
+    }
+
+    // MARK: - Read Aloud speed
+
+    func testPlaybackRateNeverSlowsBelowNormalSpeed() {
+        XCTAssertEqual(AVSpeechPlaybackService.clampedRate(1.5), 1.5)
+        XCTAssertEqual(AVSpeechPlaybackService.clampedRate(0.5), 1, "slowed audio would outlast the drain watchdog")
+        XCTAssertEqual(AVSpeechPlaybackService.clampedRate(10), 4)
+        XCTAssertEqual(AVSpeechPlaybackService.clampedRate(.nan), 1)
+    }
+
+    func testStretchedStreamConvertsUnalignedPCM16ToFloat() throws {
+        // One leading byte puts the samples at an odd offset, as a Data
+        // slice can.
+        let bytes: [UInt8] = [0xFF, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0xFF, 0x7F]
+        var samples = [Float](repeating: .nan, count: 4)
+        try bytes.withUnsafeBytes { raw in
+            try samples.withUnsafeMutableBufferPointer { destination in
+                AVSpeechPlaybackService.convertPCM16(
+                    UnsafeRawBufferPointer(rebasing: raw[1...]),
+                    into: try XCTUnwrap(destination.baseAddress),
+                    frames: 4
+                )
+            }
+        }
+        XCTAssertEqual(samples, [0, 0.5, -1, Float(32_767) / 32_768])
+    }
+
+    // MARK: - Teardown of a graph that never rendered
+
+    // Every Voice teardown (server switch, disconnect, Close) stops capture
+    // and playback whether or not they ever ran. On a hosted simulator a
+    // stalled audio server turns any CoreAudio call there into a process
+    // abort ("AURemoteIO: RPC timeout. Apparently deadlocked."), which took
+    // down AppStateMultiDashboardTests mid-run.
+
+    func testStoppingCaptureThatNeverStartedNeverReachesCoreAudio() {
+        let probe = AudioEngineProbe()
+        let service = AVAudioCaptureService(
+            coordinator: VoiceAudioSessionCoordinator(session: InertVoiceAudioSession()),
+            makeEngine: { SystemVoiceCaptureEngine(engine: probe) }
+        )
+
+        service.stop()
+        service.stop()
+
+        probe.assertUntouched()
+    }
+
+    func testStoppingPlaybackThatNeverStartedNeverReachesCoreAudio() {
+        let probe = AudioEngineProbe()
+        let service = AVSpeechPlaybackService(
+            coordinator: VoiceAudioSessionCoordinator(session: InertVoiceAudioSession()),
+            makeEngine: { probe }
+        )
+
+        service.stop()
+        service.stop()
+
+        probe.assertUntouched()
+    }
+
     // MARK: - Playback drain watchdog
 
     func testDrainSettlesWhenRenderingDiesWithoutANotification() async {
@@ -329,14 +528,18 @@ extension VoiceAudioSessionCoordinatorTests {
     /// reply drains, the next reply's chunks must report playing again, or
     /// a hands-free end closes the call over the goodbye still queued.
     func testChunkAfterADrainReportsPlayingAgain() throws {
-        let service = AVSpeechPlaybackService(coordinator: VoiceAudioSessionCoordinator(session: InertVoiceAudioSession()))
+        // An offline engine: a real output I/O unit talks to the simulator's
+        // audio server, which on hosted CI stalls until CoreAudio aborts the
+        // test process ("RPC timeout. Apparently deadlocked").
+        let service = AVSpeechPlaybackService(
+            coordinator: VoiceAudioSessionCoordinator(session: InertVoiceAudioSession()),
+            makeEngine: { OfflineRenderingEngine.make() }
+        )
         defer { service.stop() }
         let chunk = Data(count: 480)
-        do {
-            _ = try service.enqueuePCM16(chunk, sampleRate: 24_000)
-        } catch {
-            throw XCTSkip("no audio output available: \(error)")
-        }
+        // An offline engine needs no audio output, so a start failure is a
+        // real failure, not a missing device.
+        _ = try service.enqueuePCM16(chunk, sampleRate: 24_000)
         XCTAssertTrue(service.isPlaying)
 
         // The first reply finished rendering; the stream stays open.
@@ -350,6 +553,7 @@ extension VoiceAudioSessionCoordinatorTests {
 
 @MainActor
 private final class InertVoiceAudioSession: VoiceAudioSessionControlling {
+    var isOtherAudioPlaying = true
     func setCategory(
         _ category: AVAudioSession.Category,
         mode: AVAudioSession.Mode,
@@ -357,6 +561,22 @@ private final class InertVoiceAudioSession: VoiceAudioSessionControlling {
     ) throws {}
 
     func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {}
+}
+
+/// An engine in offline manual rendering mode, switched before anything
+/// reads its output node, so no output I/O unit is ever built. It starts and
+/// plays like a device engine but renders only when pulled, which these
+/// tests never do: drains are driven by hand. A failed switch traps rather
+/// than quietly handing back a device engine, which would bring back the
+/// CoreAudio abort this exists to avoid.
+private enum OfflineRenderingEngine {
+    static func make() -> AVAudioEngine {
+        let engine = AVAudioEngine()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try! engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4_096)
+        precondition(engine.isInManualRenderingMode, "the test engine must render offline")
+        return engine
+    }
 }
 
 private final class CountingEngineFactory {
@@ -378,12 +598,61 @@ private final class FormatRejectingEngine: AVAudioEngine {
         super.init()
     }
 
+    /// No-op: the real prepare initializes the output AURemoteIO through the
+    /// audio server, and on a hosted simulator a stalled server makes
+    /// CoreAudio abort the test process ("Initialize: RPC timeout").
+    override func prepare() {}
+
+    /// No-op for the same reason: the failed attempts leave connected graphs
+    /// that the service then stops.
+    override func stop() {}
+
     override func start() throws {
         onStart()
         throw NSError(
             domain: "com.apple.coreaudio.avfaudio",
             code: VoiceAudioEngineRecovery.formatNotSupported
         )
+    }
+}
+
+/// Counts the engine calls teardown could make to the audio server: the I/O
+/// nodes (and the main mixer, which pulls in the output node), prepare, and
+/// stop. prepare and stop only count. The node getters must return a real
+/// node, so a node-read regression may abort the process rather than fail
+/// the assertion.
+private final class AudioEngineProbe: AVAudioEngine {
+    private(set) var inputNodeReads = 0
+    private(set) var outputNodeReads = 0
+    private(set) var mixerReads = 0
+    private(set) var prepares = 0
+    private(set) var stops = 0
+
+    override var inputNode: AVAudioInputNode {
+        inputNodeReads += 1
+        return super.inputNode
+    }
+
+    override var outputNode: AVAudioOutputNode {
+        outputNodeReads += 1
+        return super.outputNode
+    }
+
+    override var mainMixerNode: AVAudioMixerNode {
+        mixerReads += 1
+        return super.mainMixerNode
+    }
+
+    override func prepare() { prepares += 1 }
+
+    override func stop() { stops += 1 }
+
+    func assertUntouched(file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(inputNodeReads, 0, "the input node was built", file: file, line: line)
+        XCTAssertEqual(outputNodeReads, 0, "the output node was built", file: file, line: line)
+        XCTAssertEqual(mixerReads, 0, "the main mixer was built", file: file, line: line)
+        XCTAssertEqual(prepares, 0, "the engine was prepared", file: file, line: line)
+        XCTAssertEqual(stops, 0, "an engine that never rendered was stopped", file: file, line: line)
     }
 }
 
@@ -412,6 +681,7 @@ private final class FakeCaptureEngine: VoiceCaptureEngine {
     private(set) var isRunning = false
     private(set) var hasTap = false
     private(set) var installedTapFormats: [AVAudioFormat?] = []
+    private(set) var tapBlock: AVAudioNodeTapBlock?
 
     init(factory: FakeCaptureEngineFactory) { self.factory = factory }
 
@@ -420,11 +690,14 @@ private final class FakeCaptureEngine: VoiceCaptureEngine {
 
     func installInputTap(bufferSize: AVAudioFrameCount, format: AVAudioFormat?, block: @escaping AVAudioNodeTapBlock) {
         installedTapFormats.append(format)
+        tapBlock = block
         hasTap = true
     }
 
     func removeInputTap() { hasTap = false }
     func prepare() {}
+    /// Tests post the engine's configuration change with the fake itself.
+    var configurationChangeSource: AnyObject? { self }
 
     func start() throws {
         if let failure = factory.nextStartFailure() { throw failure }

@@ -20,6 +20,7 @@ final class LoginKeyboardUITests: XCTestCase {
     /// Stable XCUI handles defined in LoginView (decoupled from copy).
     private enum Identity {
         static let serverURL = "login.server-url"
+        static let advanced = "login.advanced"
         static let cloudflareToggle = "login.cloudflare-toggle"
         static let cloudflareClientID = "login.cloudflare-client-id"
         static let cloudflareClientSecret = "login.cloudflare-client-secret"
@@ -40,6 +41,12 @@ final class LoginKeyboardUITests: XCTestCase {
 
         let serverField = app.textFields[Identity.serverURL]
         XCTAssertTrue(serverField.waitForExistence(timeout: 10), "Login screen did not appear. Tree:\n\(app.debugDescription)")
+
+        // The Cloudflare token lives under Advanced on the address step.
+        let advanced = app.buttons[Identity.advanced]
+        XCTAssertTrue(advanced.waitForExistence(timeout: 5), "Advanced row missing. Tree:\n\(app.debugDescription)")
+        XCTAssertTrue(pollHittability(of: advanced, timeout: 5))
+        advanced.tap()
 
         let cfToggle = app.switches[Identity.cloudflareToggle]
         XCTAssertTrue(
@@ -78,16 +85,29 @@ final class LoginKeyboardUITests: XCTestCase {
         )
         secret.typeText("access-client-secret")
 
-        // The Connect control itself must also remain reachable on the
-        // compact keyboard-obscured layout.
+        // Continue itself must also remain reachable on the compact
+        // keyboard-obscured layout.
         let connect = app.buttons[Identity.connect]
         XCTAssertTrue(connect.waitForExistence(timeout: 5))
-        if !connect.isHittable {
-            app.swipeUp()
+        let beforeScroll = "connect=\(connect.frame) enabled=\(connect.isEnabled) keyboard=\(app.keyboards.firstMatch.frame)"
+        // The focus scroll leaves Connect just under the keyboard toolbar.
+        // Scroll it up the way a person would: drag the form from a point
+        // above the keyboard. A plain app.swipeUp() never moved the form on
+        // hosted runs (Connect kept its exact frame in every nightly from
+        // 2026-10-05 to 2026-10-11). Each drag gets a moment to settle before
+        // the next, so a slow scroll is not mistaken for a stuck one.
+        var drags = 0
+        while app.keyboards.firstMatch.exists && !pollAboveKeyboard(connect, in: app, timeout: 1) && drags < 3 {
+            dragFormUp(app)
+            drags += 1
         }
         XCTAssertTrue(
-            pollHittability(of: connect, timeout: 5),
-            "Connect must remain reachable with the keyboard visible"
+            app.keyboards.firstMatch.exists,
+            "The keyboard must still be up after scrolling, or this test no longer covers the keyboard layout. Tree:\n\(app.debugDescription)"
+        )
+        XCTAssertTrue(
+            pollAboveKeyboard(connect, in: app, timeout: 5),
+            "Connect must remain reachable with the keyboard visible. Before scrolling: \(beforeScroll). After \(drags) drag(s): connect=\(connect.frame) enabled=\(connect.isEnabled) keyboard=\(app.keyboards.firstMatch.frame) done=\(app.buttons["Done"].firstMatch.frame). Tree:\n\(app.debugDescription)"
         )
     }
 
@@ -125,23 +145,8 @@ final class LoginKeyboardUITests: XCTestCase {
         )
     }
 
-    /// Fills credentials for the password-login keyboard/focus scenarios.
-    /// Connect itself is URL-gated so OAuth-only dashboards can be discovered.
-    private func fillRequiredCredentials(_ app: XCUIApplication) throws {
-        let username = app.textFields["login.username"]
-        XCTAssertTrue(username.waitForExistence(timeout: 5), "Username field did not appear. Tree:\n\(app.debugDescription)")
-        username.tap()
-        username.typeText("ui-test-user")
-
-        let password = app.secureTextFields["login.password"]
-        XCTAssertTrue(password.waitForExistence(timeout: 5), "Password field did not appear. Tree:\n\(app.debugDescription)")
-        password.tap()
-        password.typeText("ui-test-password")
-    }
-
-    /// Types text after clearing any existing content. The login screen
-    /// prefills the server URL from the last saved dashboard address
-    /// (LoginView.onAppear), so appended typing would form an unpredictable
+    /// Types text after clearing any existing content, so a filled-in
+    /// address (a Connection Setup handoff) can never form an unpredictable
     /// value. Deletes past the start of an empty field are no-ops, so the
     /// overshooting delete count lands on exactly `text` no matter where the
     /// tap placed the cursor.
@@ -177,11 +182,11 @@ final class LoginKeyboardUITests: XCTestCase {
 
         let serverField = app.textFields[Identity.serverURL]
         XCTAssertTrue(serverField.waitForExistence(timeout: 10), "Login screen did not appear. Tree:\n\(app.debugDescription)")
-        // No scheme → invalidURL policy failure; classification never hits
-        // the network, so this stays deterministic offline. Any prefilled
-        // dashboard address is cleared first.
-        clearAndType("not-a-dashboard-url", into: serverField)
-        try fillRequiredCredentials(app)
+        // A scheme Conduit doesn't speak → invalidURL policy failure;
+        // classification never hits the network, so this stays deterministic
+        // offline. (A bare host is no longer malformed: Conduit adds https.)
+        // Any prefilled dashboard address is cleared first.
+        clearAndType("ftp://not-a-dashboard", into: serverField)
         dismissKeyboard(app)
 
         let connect = app.buttons[Identity.connect]
@@ -228,7 +233,6 @@ final class LoginKeyboardUITests: XCTestCase {
         // TEST-NET-3 documentation address: never routed, and the transport
         // policy rejects it before any connection attempt.
         clearAndType("http://203.0.113.10:9119", into: serverField)
-        try fillRequiredCredentials(app)
         dismissKeyboard(app)
 
         let connect = app.buttons[Identity.connect]
@@ -313,6 +317,40 @@ final class LoginKeyboardUITests: XCTestCase {
             Thread.sleep(forTimeInterval: 0.1)
         }
         return switchIsOn(element)
+    }
+
+    /// Drags the login form up by about a third of the screen. It starts at
+    /// 6% of the width, left of every control (on the iPhone 17 Pro the
+    /// nightly runs, that is the card's own padding, and controls start at
+    /// 44 pt), at 45% of the height, which is above the keyboard and its
+    /// toolbar there. The short press before the move makes it a drag, not a
+    /// fling, so the distance scrolled is predictable.
+    private func dragFormUp(_ app: XCUIApplication) {
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.06, dy: 0.45))
+        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.06, dy: 0.12))
+        start.press(forDuration: 0.1, thenDragTo: end)
+    }
+
+    /// Polls until `element` is hittable AND sits entirely above the keyboard
+    /// and its Done toolbar. isHittable alone is not enough here: XCUI has
+    /// reported Connect hittable behind the keyboard window (see
+    /// dismissKeyboard), so the frame check is what proves it is reachable.
+    private func pollAboveKeyboard(_ element: XCUIElement, in app: XCUIApplication, timeout: TimeInterval) -> Bool {
+        func isAbove() -> Bool {
+            // No keyboard means no keyboard layout to check; the caller's
+            // keyboard assertion reports that case.
+            guard app.keyboards.firstMatch.exists, element.isHittable else { return false }
+            var top = app.keyboards.firstMatch.frame.minY
+            let done = app.buttons["Done"].firstMatch
+            if done.exists { top = min(top, done.frame.minY) }
+            return element.frame.maxY <= top
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if isAbove() { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return isAbove()
     }
 
     /// XCUIElement has no waitForHittability; poll isHittable on a deadline.

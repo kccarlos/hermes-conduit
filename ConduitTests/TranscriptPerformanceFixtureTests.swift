@@ -173,7 +173,7 @@ final class TranscriptPerformanceFixtureTests: XCTestCase {
         appState: AppState,
         streaming: String
     ) -> UIHostingController<PinnedChatRoot> {
-        appState.streamingText = streaming
+        appState.setStreamingTextForTesting(streaming)
         let host = UIHostingController(rootView: PinnedChatRoot(appState: appState))
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         window.rootViewController = host
@@ -233,9 +233,10 @@ final class TranscriptPerformanceFixtureTests: XCTestCase {
     ) {
         let steadyBody = String(repeating: "Steady padding body text for the live row. ", count: 10)
         for tick in 0..<ticks {
-            appState.streamingText =
+            appState.setStreamingTextForTesting(
                 "Live streaming delta \(tick) — the only view that should change. "
-                + steadyBody
+                    + steadyBody
+            )
             host.view.setNeedsLayout()
             host.view.layoutIfNeeded()
             RunLoop.current.run(until: Date())
@@ -471,13 +472,14 @@ final class TranscriptPerformanceFixtureTests: XCTestCase {
         }
         let bubblesAfterRecreation = TranscriptPerf.settledMessageBubbleBodyEvaluations
 
-        // A streaming publish tick in the same window: the publish
-        // invalidation re-runs the settled rows' body chains THROUGH the
-        // re-created environment (the same vector the streaming fixtures
-        // drive), so the dormancy assertions below measure a genuinely
-        // consulted gate under the churned preference — not a pruned
-        // subtree.
-        appState.streamingText = "Shared-preference churn tick — the live row only."
+        // An AppState publish in the same window: its invalidation re-runs
+        // ChatView's body and the settled rows' body chains THROUGH the
+        // re-created environment, so the dormancy assertions below measure
+        // a genuinely consulted gate under the churned preference — not a
+        // pruned subtree. (A streaming tick no longer serves: live text
+        // publishes on `LiveTurnProjection`, which only the live rows
+        // observe.)
+        appState.objectWillChange.send()
         host.view.setNeedsLayout()
         host.view.layoutIfNeeded()
 
@@ -653,7 +655,7 @@ final class TranscriptPerformanceFixtureTests: XCTestCase {
         appState.messages = messages
 
         let host = mountChat(appState: appState, streaming: "")
-        appState.streamingText = ""  // StreamingBubble unmounts
+        appState.setStreamingTextForTesting("")  // StreamingBubble unmounts
 
         TranscriptPerf.reset()
         messages.append(

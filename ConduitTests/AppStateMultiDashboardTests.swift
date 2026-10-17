@@ -10,6 +10,7 @@
 //
 
 import UIKit
+import UserNotifications
 import XCTest
 @testable import Conduit
 
@@ -131,6 +132,46 @@ final class AppStateMultiDashboardTests: XCTestCase {
             defaults.string(forKey: AppState.chatResumeServerIdentityKey),
             "https://other.example.com"
         )
+    }
+
+    // MARK: - Add a dashboard closed without signing in
+
+    func testClosingAddForgetsTheDashboardAnUnfinishedSignInSaved() throws {
+        let appState = makeAppState(registry: SavedDashboardRegistry())
+        let flow = LoginFlowModel()
+        flow.attach(appState)
+        let url = "https://new.example.com"
+        flow.noteUnsavedSignIn(at: url)
+        // The single sign-on sheet saves the dashboard and its token as it opens.
+        let id = track(try XCTUnwrap(appState.resolveDashboardID(forURL: url, registerIfMissing: true)))
+        let token = try XCTUnwrap(CloudflareAccessCredentials.from(clientID: "cf-id", clientSecret: "cf-secret"))
+        KeychainHelper.saveCloudflareAccess(token, origin: url, dashboardID: id)
+
+        flow.discardUnfinishedDashboards()
+
+        XCTAssertNil(appState.savedDashboardRegistry.dashboard(with: id))
+        XCTAssertNil(KeychainHelper.loadCloudflareAccess(dashboardID: id, for: url))
+    }
+
+    func testClosingAddKeepsDashboardsSavedBeforeOrSignedIn() throws {
+        let appState = makeAppState(registry: SavedDashboardRegistry())
+        let savedURL = "https://saved.example.com"
+        let saved = track(try XCTUnwrap(appState.resolveDashboardID(forURL: savedURL, registerIfMissing: true)))
+        let flow = LoginFlowModel()
+        flow.attach(appState)
+        flow.noteUnsavedSignIn(at: savedURL)
+        let signedInURL = "https://signed-in.example.com"
+        flow.noteUnsavedSignIn(at: signedInURL)
+        let signedIn = track(try XCTUnwrap(appState.resolveDashboardID(forURL: signedInURL, registerIfMissing: true)))
+        KeychainHelper.saveCredentials(
+            DashboardCredentials(baseURL: signedInURL, username: "eric", password: "p", requiresFaceID: false),
+            dashboardID: signedIn
+        )
+
+        flow.discardUnfinishedDashboards()
+
+        XCTAssertNotNil(appState.savedDashboardRegistry.dashboard(with: saved))
+        XCTAssertNotNil(appState.savedDashboardRegistry.dashboard(with: signedIn))
     }
 
     // MARK: - Server-change identity (the boundary)
@@ -307,6 +348,89 @@ final class AppStateMultiDashboardTests: XCTestCase {
         XCTAssertEqual(appState.activeDashboardID, mac.id)
     }
 
+    func testSignOutKeepsTheUsernameAndCloudflareTokenForTheNextSignIn() throws {
+        let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let vps = dashboard("VPS", "https://hermes.example.com")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: mac.id, dashboards: [mac, vps]))
+        let token = try XCTUnwrap(CloudflareAccessCredentials.from(clientID: "cf-id", clientSecret: "cf-secret"))
+        for entry in [mac, vps] {
+            KeychainHelper.saveCredentials(
+                DashboardCredentials(baseURL: entry.normalizedURL, username: "eric-\(entry.label)", password: "p", requiresFaceID: false),
+                dashboardID: entry.id
+            )
+            KeychainHelper.saveCloudflareAccess(token, origin: entry.normalizedURL, dashboardID: entry.id)
+        }
+
+        // The active dashboard takes the full disconnect; the other the
+        // scoped sign-out.
+        appState.signOutDashboard(mac.id)
+        appState.signOutDashboard(vps.id)
+
+        for entry in [mac, vps] {
+            // The password is gone; the username and the Cloudflare token
+            // stay for the next sign-in.
+            XCTAssertNil(KeychainHelper.loadCredentials(dashboardID: entry.id))
+            XCTAssertEqual(appState.savedSignIn(for: entry.id), .signInNeeded)
+            XCTAssertEqual(appState.savedDashboardRegistry.dashboard(with: entry.id)?.username, "eric-\(entry.label)")
+            XCTAssertEqual(KeychainHelper.loadCloudflareAccess(dashboardID: entry.id, for: entry.normalizedURL), token)
+        }
+        XCTAssertEqual(SavedDashboardRegistryStore.load()?.dashboard(with: mac.id)?.username, "eric-Mac")
+    }
+
+    func testRemoveDashboardDeletesItsCloudflareToken() throws {
+        let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let vps = dashboard("VPS", "https://hermes.example.com")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: mac.id, dashboards: [mac, vps]))
+        let token = try XCTUnwrap(CloudflareAccessCredentials.from(clientID: "cf-id", clientSecret: "cf-secret"))
+        for entry in [mac, vps] {
+            KeychainHelper.saveCloudflareAccess(token, origin: entry.normalizedURL, dashboardID: entry.id)
+        }
+
+        appState.removeDashboard(vps.id)
+        XCTAssertNil(KeychainHelper.loadCloudflareAccess(dashboardID: vps.id, for: vps.normalizedURL))
+        XCTAssertEqual(KeychainHelper.loadCloudflareAccess(dashboardID: mac.id, for: mac.normalizedURL), token)
+
+        appState.removeDashboard(mac.id)
+        XCTAssertNil(KeychainHelper.loadCloudflareAccess(dashboardID: mac.id, for: mac.normalizedURL))
+    }
+
+    func testSavedSignInNamesWhatEachDashboardCanSignInWith() {
+        let home = dashboard("Home", "https://home.example")
+        let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let review = dashboard("Review", "https://review.example.com")
+        let fresh = dashboard("Fresh", "https://fresh.example.com")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: home.id, dashboards: [home, mac, review, fresh]))
+        KeychainHelper.saveCredentials(
+            DashboardCredentials(baseURL: home.normalizedURL, username: "u", password: "p", requiresFaceID: true),
+            dashboardID: home.id
+        )
+        KeychainHelper.saveCredentials(
+            DashboardCredentials(baseURL: mac.normalizedURL, username: "u", password: "p", requiresFaceID: false),
+            dashboardID: mac.id
+        )
+        KeychainHelper.saveConnection(HermesConnection(baseUrl: review.normalizedURL, ticket: "t"), dashboardID: review.id)
+
+        XCTAssertEqual(appState.savedSignIn(for: home.id), .biometric)
+        XCTAssertEqual(appState.savedSignIn(for: mac.id), .password)
+        XCTAssertEqual(appState.savedSignIn(for: review.id), .session)
+        XCTAssertEqual(appState.savedSignIn(for: fresh.id), .signInNeeded)
+        XCTAssertFalse(SavedSignInKind.signInNeeded.canSignInWithoutTyping)
+        XCTAssertTrue(SavedSignInKind.session.canSignInWithoutTyping)
+    }
+
+    func testASignInRemembersItsUsernameAndABlankOneNeverReplacesIt() {
+        let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: mac.id, dashboards: [mac]))
+
+        appState.rememberDashboardUsername("  eric ", dashboardID: mac.id)
+        appState.rememberDashboardUsername("   ", dashboardID: mac.id)
+        // An unknown dashboard is ignored.
+        appState.rememberDashboardUsername("someone", dashboardID: UUID())
+
+        XCTAssertEqual(appState.savedDashboardRegistry.dashboard(with: mac.id)?.username, "eric")
+        XCTAssertEqual(appState.savedDashboardRegistry.dashboards.count, 1)
+    }
+
     func testRemoveActiveDashboardLeavesDisconnectedWithoutAutoConnect() throws {
         let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
         let vps = dashboard("VPS", "https://hermes.example.com")
@@ -325,6 +449,27 @@ final class AppStateMultiDashboardTests: XCTestCase {
         XCTAssertFalse(appState.isConnected)
         XCTAssertNil(appState.connection)
         XCTAssertNotNil(appState.savedDashboardRegistry.dashboard(with: vps.id))
+    }
+
+    func testRemovingADashboardDropsExtraHeadersOnlyWhenNoOtherDashboardSharesTheOrigin() {
+        let active = dashboard("Active", "https://shared.example/two")
+        let sibling = dashboard("Sibling", "https://shared.example/one")
+        let solo = dashboard("Solo", "https://solo.example")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: active.id, dashboards: [active, sibling, solo]))
+        addTeardownBlock {
+            CustomHeaderStore.shared.removeHeaders(forServerURL: "https://shared.example")
+            CustomHeaderStore.shared.removeHeaders(forServerURL: "https://solo.example")
+        }
+        CustomHeaderStore.shared.setHeaders([CustomHeader(name: "X-Shared", value: "s")], forServerURL: sibling.normalizedURL)
+        CustomHeaderStore.shared.setHeaders([CustomHeader(name: "X-Solo", value: "o")], forServerURL: solo.normalizedURL)
+
+        appState.removeDashboard(sibling.id)
+        appState.removeDashboard(solo.id)
+
+        // The active dashboard still reaches the shared origin, so its
+        // headers stay; nothing else uses the solo origin, so they go.
+        XCTAssertEqual(CustomHeaderStore.shared.headers(forServerURL: active.normalizedURL).map(\.name), ["X-Shared"])
+        XCTAssertTrue(CustomHeaderStore.shared.headers(forServerURL: solo.normalizedURL).isEmpty)
     }
 
     func testRemoveInactiveDashboardNeverTouchesActiveOrOthers() throws {
@@ -445,7 +590,7 @@ extension AppStateMultiDashboardTests {
         let review = dashboard("Review", "https://review.example.com")
         let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: primary.id, dashboards: [primary, review]))
         appState.saveDefaultProfileName("Atlas")
-        try appState.saveProfileAvatar(photoData(), for: "default")
+        try appState.saveProfileAvatarOnDevice(photoData(), for: "default")
         XCTAssertEqual(appState.profileDisplayName("default"), "Atlas")
         XCTAssertNotNil(appState.profileAvatarURL(for: "default"))
 
@@ -532,12 +677,191 @@ extension AppStateMultiDashboardTests {
         let review = dashboard("Review", "https://review.example.com")
         let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: review.id, dashboards: [primary, review]))
         appState.saveDefaultProfileName("Reviewer")
-        try appState.saveProfileAvatar(photoData(), for: "default")
+        try appState.saveProfileAvatarOnDevice(photoData(), for: "default")
 
         appState.removeDashboard(review.id)
 
         let store = makeAppearanceStore()
         XCTAssertEqual(store.loadDefaultName(dashboardID: review.id), ProfileAppearanceStore.defaultName)
         XCTAssertTrue(store.loadAvatarURLs(dashboardID: review.id).isEmpty)
+    }
+
+    // MARK: - Photos from Hermes
+
+    func testMirroredPhotoKeepsHermesBytesAndIsScopedToItsDashboard() throws {
+        let primary = UUID()
+        let review = UUID()
+        let store = makeAppearanceStore()
+        let png = photoData()
+
+        let saved = try store.saveMirroredAvatar(png, for: "coder", dashboardID: primary)
+        let url = saved.url
+        XCTAssertTrue(saved.changed)
+        XCTAssertFalse(try store.saveMirroredAvatar(png, for: "coder", dashboardID: primary).changed, "the same bytes are not rewritten")
+
+        XCTAssertEqual(try Data(contentsOf: url), png, "the Hermes bytes are kept as they are, transparency included")
+        XCTAssertTrue(store.isMirrored("coder", dashboardID: primary))
+        XCTAssertFalse(store.isMirrored("coder", dashboardID: review))
+        XCTAssertEqual(store.loadAvatarURLs(dashboardID: primary)["coder"], url)
+        XCTAssertThrowsError(try store.saveMirroredAvatar(Data("not an image".utf8), for: "coder", dashboardID: primary))
+        XCTAssertEqual(try Data(contentsOf: url), png, "an unreadable answer leaves the copy alone")
+    }
+
+    func testDevicePhotoAndRemovalClearTheMirrorMark() throws {
+        let primary = UUID()
+        let store = makeAppearanceStore()
+        _ = try store.saveMirroredAvatar(photoData(), for: "default", dashboardID: primary)
+
+        _ = try store.saveAvatar(photoData(), for: "default", dashboardID: primary)
+        XCTAssertFalse(store.isMirrored("default", dashboardID: primary), "a device pick is not a Hermes copy")
+        XCTAssertNotNil(store.avatarData(for: "default", dashboardID: primary))
+
+        _ = try store.saveMirroredAvatar(photoData(), for: "default", dashboardID: primary)
+        store.removeAvatar(for: "default", dashboardID: primary)
+        XCTAssertFalse(store.isMirrored("default", dashboardID: primary))
+        XCTAssertNil(store.avatarData(for: "default", dashboardID: primary))
+
+        _ = try store.saveMirroredAvatar(photoData(), for: "default", dashboardID: primary)
+        store.removeAll(dashboardID: primary)
+        XCTAssertFalse(store.isMirrored("default", dashboardID: primary))
+    }
+
+    func testRosterSyncFetchesUploadsOrDropsByWhereThePhotoCameFrom() {
+        // Hermes has a picture: it wins, whatever is on the device.
+        XCTAssertEqual(ProfileAvatarSyncAction.action(hermesHasAvatar: true, hasPhotoOnDevice: false, photoIsMirror: false), .fetch)
+        XCTAssertEqual(ProfileAvatarSyncAction.action(hermesHasAvatar: true, hasPhotoOnDevice: true, photoIsMirror: false), .fetch)
+        XCTAssertEqual(ProfileAvatarSyncAction.action(hermesHasAvatar: true, hasPhotoOnDevice: true, photoIsMirror: true), .fetch)
+        // A photo picked here before photos moved to Hermes carries over.
+        XCTAssertEqual(ProfileAvatarSyncAction.action(hermesHasAvatar: false, hasPhotoOnDevice: true, photoIsMirror: false), .upload)
+        // A copy of a picture removed elsewhere goes.
+        XCTAssertEqual(ProfileAvatarSyncAction.action(hermesHasAvatar: false, hasPhotoOnDevice: true, photoIsMirror: true), .dropMirror)
+        XCTAssertEqual(ProfileAvatarSyncAction.action(hermesHasAvatar: false, hasPhotoOnDevice: false, photoIsMirror: false), .keep)
+    }
+
+    // MARK: - Avatar images
+
+    private func photoData(_ color: UIColor, side: CGFloat) -> Data {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: format).image { context in
+            color.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: side, height: side))
+        }.pngData()!
+    }
+
+    private func averageColor(of image: UIImage) throws -> (red: CGFloat, green: CGFloat, blue: CGFloat) {
+        let cgImage = try XCTUnwrap(image.cgImage)
+        // CoreGraphics owns the one-pixel buffer, so no pointer outlives its array.
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bytesPerRow: 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        let pixel = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
+        return (CGFloat(pixel[0]) / 255, CGFloat(pixel[1]) / 255, CGFloat(pixel[2]) / 255)
+    }
+
+    func testAvatarImagesAreDownsampledAndFollowSavesAndRemoval() throws {
+        let store = makeAppearanceStore()
+        let dashboardID = UUID()
+        let url = try store.saveAvatar(photoData(.red, side: 1_200), for: "default", dashboardID: dashboardID)
+
+        let first = try XCTUnwrap(ProfileAvatarImageCache.image(at: url))
+        let firstImage = try XCTUnwrap(first.cgImage)
+        XCTAssertLessThanOrEqual(CGFloat(max(firstImage.width, firstImage.height)), ProfileAvatarImageCache.maxPixelSize)
+        XCTAssertTrue(ProfileAvatarImageCache.image(at: url) === first, "a second read comes from the cache")
+        XCTAssertGreaterThan(try averageColor(of: first).red, 0.8)
+
+        // A new photo is written to the same file name.
+        let replacedURL = try store.saveAvatar(photoData(.blue, side: 600), for: "default", dashboardID: dashboardID)
+        XCTAssertEqual(replacedURL, url)
+        let replaced = try XCTUnwrap(ProfileAvatarImageCache.image(at: url))
+        XCTAssertGreaterThan(try averageColor(of: replaced).blue, 0.8)
+        XCTAssertLessThan(try averageColor(of: replaced).red, 0.2)
+
+        store.removeAvatar(for: "default", dashboardID: dashboardID)
+        XCTAssertNil(ProfileAvatarImageCache.image(at: url))
+
+        // A photo saved where a read had failed is read again.
+        _ = try store.saveAvatar(photoData(.green, side: 300), for: "default", dashboardID: dashboardID)
+        let restored = try XCTUnwrap(ProfileAvatarImageCache.image(at: url))
+        XCTAssertGreaterThan(try averageColor(of: restored).green, 0.6)
+    }
+}
+
+// MARK: - Finish setting up
+
+extension AppStateMultiDashboardTests {
+    func testANewDashboardOffersFinishSetupUntilItEnds() {
+        let appState = makeAppState(registry: SavedDashboardRegistry())
+        let id = track(appState.adoptDashboard(forNormalizedURL: "https://mac.tailnet.ts.net"))
+        XCTAssertEqual(appState.dashboardsFinishingSetup, [id])
+        // Only a connected dashboard shows the card.
+        XCTAssertFalse(appState.showsFinishSetup)
+        appState.isConnected = true
+        XCTAssertTrue(appState.showsFinishSetup)
+
+        appState.endFinishSetup()
+        XCTAssertTrue(appState.dashboardsFinishingSetup.isEmpty)
+        XCTAssertFalse(appState.showsFinishSetup)
+        // Connecting again doesn't bring it back.
+        _ = appState.adoptDashboard(forNormalizedURL: "https://mac.tailnet.ts.net")
+        XCTAssertTrue(appState.dashboardsFinishingSetup.isEmpty)
+    }
+
+    func testDashboardsSavedBeforeAreNotOfferedFinishSetup() {
+        let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: mac.id, dashboards: [mac]))
+        _ = appState.adoptDashboard(forNormalizedURL: mac.normalizedURL)
+        XCTAssertTrue(appState.dashboardsFinishingSetup.isEmpty)
+    }
+
+    func testRemovingADashboardForgetsItsFinishSetup() throws {
+        let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: mac.id, dashboards: [mac]))
+        let added = track(try XCTUnwrap(appState.resolveDashboardID(forURL: "https://hermes.example.com", registerIfMissing: true)))
+        XCTAssertEqual(appState.dashboardsFinishingSetup, [added])
+
+        appState.removeDashboard(added)
+        XCTAssertTrue(appState.dashboardsFinishingSetup.isEmpty)
+    }
+
+    func testFinishSetupPluginStepFollowsTheHostsReport() {
+        let current = NotifierPluginStatus.recommendedVersion
+        let running = NotifierPluginStatus.Runtime(loadedVersion: current, restartNeeded: false, bootID: nil)
+        let reported = NotifierPluginStatus.State.reported(version: current, capabilities: Set(NotifierPluginStatus.usedCapabilities))
+        XCTAssertEqual(FinishSetupStatus.plugin(NotifierPluginStatus(state: .unknown), updating: false), .unknown)
+        XCTAssertEqual(FinishSetupStatus.plugin(NotifierPluginStatus(state: .predatesCapabilities), updating: false), .install)
+        XCTAssertEqual(FinishSetupStatus.plugin(NotifierPluginStatus(state: .predatesCapabilities), updating: true), .updating)
+        XCTAssertEqual(FinishSetupStatus.plugin(NotifierPluginStatus(state: reported, runtime: running), updating: false), .done)
+        XCTAssertEqual(
+            FinishSetupStatus.plugin(NotifierPluginStatus(
+                state: .reported(version: "0.10.0", capabilities: Set(NotifierPluginStatus.usedCapabilities))
+            ), updating: false),
+            .update
+        )
+        var waiting = running
+        waiting.restartNeeded = true
+        XCTAssertEqual(FinishSetupStatus.plugin(NotifierPluginStatus(state: reported, runtime: waiting), updating: false), .restart)
+    }
+
+    func testFinishSetupNotificationsStepNeedsIOSPermissionToo() {
+        XCTAssertEqual(FinishSetupStatus.notifications(enabled: false, authorization: .notDetermined), .off)
+        XCTAssertEqual(FinishSetupStatus.notifications(enabled: true, authorization: .authorized), .done)
+        XCTAssertEqual(FinishSetupStatus.notifications(enabled: true, authorization: .provisional), .done)
+        // Registered but iOS not asked (a reinstall keeps the registration).
+        XCTAssertEqual(FinishSetupStatus.notifications(enabled: true, authorization: .notDetermined), .off)
+        XCTAssertEqual(FinishSetupStatus.notifications(enabled: true, authorization: .denied), .denied)
+        XCTAssertEqual(FinishSetupStatus.notifications(enabled: false, authorization: .denied), .denied)
+
+        XCTAssertTrue(FinishSetupStatus(plugin: .done, notifications: .done, voiceReady: true).isComplete)
+        XCTAssertFalse(FinishSetupStatus(plugin: .unknown, notifications: .done, voiceReady: true).isComplete)
+        XCTAssertFalse(FinishSetupStatus(plugin: .done, notifications: .off, voiceReady: true).isComplete)
+        XCTAssertFalse(FinishSetupStatus(plugin: .done, notifications: .done, voiceReady: false).isComplete)
     }
 }

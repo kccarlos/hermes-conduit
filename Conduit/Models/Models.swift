@@ -47,9 +47,9 @@ enum SessionSource: String, Codable, CaseIterable {
         case .discord: return "Discord"
         case .telegram: return "Telegram"
         case .api: return "API"
-        case .webhook: return "Webhook"
-        case .cron: return "Cron"
-        case .other: return "Other"
+        case .webhook: return AppLocalization.string("Webhook")
+        case .cron: return AppLocalization.string("Cron")
+        case .other: return AppLocalization.string("Other")
         }
     }
 
@@ -88,11 +88,33 @@ struct Attachment: Codable, Identifiable, Equatable {
     var uri: String
     var mimeType: String?
     var kind: Kind
+    /// A picture Hermes also stored inside the message itself. Chats load
+    /// without those copies (#652); this says where to fetch one when its
+    /// file is gone from the server.
+    var inlineImage: InlineImageRef? = nil
 
     enum Kind: String, Codable {
         case image
+        case video
         case document
     }
+}
+
+/// One picture stored inside a persisted Hermes message: the row's durable
+/// id, the picture's place among the row's pictures, and the session and
+/// profile whose database holds the row.
+struct InlineImageRef: Codable, Equatable, Hashable {
+    let sessionId: String
+    let profile: String
+    let rowId: Int
+    let index: Int
+}
+
+/// The session and profile a page of persisted rows was read from, so the
+/// pictures inside those rows can be fetched again later.
+struct TranscriptImageScope: Equatable {
+    let sessionId: String
+    let profile: String
 }
 
 struct ToolActivity: Codable, Equatable {
@@ -101,6 +123,9 @@ struct ToolActivity: Codable, Equatable {
     var input: String?
     var output: String?
     var status: Status
+    /// How long the call took, in seconds, when Conduit saw it start and
+    /// finish or Hermes' history times both ends. Nil when unknown.
+    var duration: TimeInterval? = nil
 
     enum Status: String, Codable {
         case running
@@ -168,6 +193,9 @@ struct ClarifyQuestion: Codable, Equatable, Identifiable {
 
     /// True when the question offers no choices and expects typed text.
     var isFreeText: Bool { choices.isEmpty }
+
+    /// Whether this question can accept an answer or retry.
+    var isAnswerable: Bool { status == .pending || status == .error }
 
     init(
         id: String,
@@ -319,6 +347,30 @@ struct ClarifyActivity: Codable, Equatable {
         if statuses.contains(.pending) { return .pending }
         if statuses.contains(.error) { return .error }
         return .pending
+    }
+
+    /// Whether any question is currently answerable. Request-level expiry
+    /// suppresses every sibling, while an expired sibling does not suppress
+    /// active questions in the same batch.
+    var needsAnswer: Bool {
+        !isExpired && questions.contains(where: \.isAnswerable)
+    }
+
+    /// Whether the card is unresolved for persistence/pruning. Submitting
+    /// questions are not answerable yet, but must survive until their result
+    /// is known (or resume resets them to pending).
+    var hasPendingDecision: Bool {
+        !isExpired && questions.contains { $0.isAnswerable || $0.status == .submitting }
+    }
+
+    /// The card's user-facing state. A partially active batch can have an
+    /// expired sibling while another question still accepts an answer.
+    var presentationStatus: Status {
+        guard status == .expired, hasPendingDecision else { return status }
+        if questions.contains(where: { $0.status == .submitting }) { return .submitting }
+        if questions.contains(where: { $0.status == .pending }) { return .pending }
+        if questions.contains(where: { $0.status == .error }) { return .error }
+        return .expired
     }
 
     /// Visible question text for the transcript row: the joined question
@@ -522,7 +574,17 @@ struct ChatMessage: Identifiable, Equatable {
     /// …). Nil for ordinary rows. Normalization already reduced the row to its
     /// final display role/content; this only lets the timeline UI style the
     /// notice without re-deriving it from text.
-    let displayKind: String?
+    var displayKind: String?
+    /// Hermes' durable `messages.id` for this row (`row_id` on a resume row,
+    /// the numeric `id` on a REST transcript row). It is how a reaction
+    /// addresses the message. Nil for a live row that hasn't been reloaded
+    /// yet and for rows Conduit split off (reasoning, tool calls).
+    var rowId: Int?
+    /// Tapback reactions persisted on the row, at most one per author.
+    var reactions: [MessageReaction]
+    /// How long a thinking step took, in seconds, when Conduit watched it
+    /// stream (tool calls keep theirs on `tool`). Nil when unknown.
+    var stepDuration: TimeInterval? = nil
 
     // Non-codable because it contains closures in some uses; serialization
     // is handled by the gateway, not by us. We construct these from RPC results.
@@ -542,7 +604,9 @@ struct ChatMessage: Identifiable, Equatable {
         inputPrompt: InputPromptActivity? = nil,
         attachments: [Attachment]? = nil,
         code: String? = nil,
-        displayKind: String? = nil
+        displayKind: String? = nil,
+        rowId: Int? = nil,
+        reactions: [MessageReaction] = []
     ) {
         self.id = id
         self.role = role
@@ -559,6 +623,53 @@ struct ChatMessage: Identifiable, Equatable {
         self.attachments = attachments
         self.code = code
         self.displayKind = displayKind
+        self.rowId = rowId
+        self.reactions = reactions
+    }
+
+    /// Hermes' `display_kind` for a mid-turn steer row, also used for the
+    /// local row Conduit shows the moment a steer is accepted (issue #337).
+    static let steerDisplayKind = "steer"
+
+    /// A user message delivered into a running turn with Steer.
+    var isSteer: Bool {
+        role == .user && displayKind == Self.steerDisplayKind
+    }
+}
+
+// MARK: - Reactions
+
+/// One emoji reaction on a message (Hermes `MessageReaction`, persisted in
+/// the row's `display_metadata.reactions`). Tapback rules: one reaction per
+/// author, the same emoji again retracts it, a different one replaces it.
+struct MessageReaction: Codable, Equatable, Hashable {
+    static let userAuthor = "user"
+    static let agentAuthor = "agent"
+
+    /// The six reactions the picker offers, in order.
+    static let tapbacks = ["👍", "👎", "❤️", "😂", "😮", "😢"]
+
+    let emoji: String
+    let author: String
+    var at: Double?
+
+    var isFromUser: Bool { author == Self.userAuthor }
+
+    /// The reaction list after `author` picks `emoji` (nil clears), applying
+    /// the same Tapback rules as Hermes' `set_message_reaction`, so the
+    /// optimistic paint matches what the server will return.
+    static func applying(
+        _ emoji: String?,
+        author: String,
+        to reactions: [MessageReaction],
+        at time: Double = Date().timeIntervalSince1970
+    ) -> [MessageReaction] {
+        let previous = reactions.first { $0.author == author }
+        var result = reactions.filter { $0.author != author }
+        if let emoji, !emoji.isEmpty, previous?.emoji != emoji {
+            result.append(MessageReaction(emoji: emoji, author: author, at: time))
+        }
+        return result
     }
 }
 
@@ -602,7 +713,15 @@ struct DelegateAgentActivity: Identifiable, Equatable {
     enum Status: String, Equatable {
         case queued, running, completed, failed, interrupted
 
-        var label: String { rawValue.capitalized }
+        var label: String {
+            switch self {
+            case .queued: return AppLocalization.string("Queued")
+            case .running: return AppLocalization.string("Running")
+            case .completed: return AppLocalization.string("Completed")
+            case .failed: return AppLocalization.string("Failed")
+            case .interrupted: return AppLocalization.string("Interrupted")
+            }
+        }
         var isActive: Bool { self == .queued || self == .running }
     }
 
@@ -624,11 +743,61 @@ struct DelegateAgentActivity: Identifiable, Equatable {
     var currentTool: String?
     var summary: String?
     var stream: [StreamLine]
+    /// True when `id` is Hermes' own `subagent_id`, so `subagent.list` can
+    /// confirm whether the agent is still running (#492).
+    var hasGatewayID = false
+    /// The live session whose events reported this agent.
+    var sessionId = ""
+    var updatedAt = Date()
+
+    /// Folds a later event for the same agent into the card: blank fields
+    /// keep what earlier events said, and a finished agent stays finished
+    /// when a late progress event (which carries no status) arrives.
+    func merged(with update: DelegateAgentActivity) -> DelegateAgentActivity {
+        var merged = update
+        if merged.goal.isEmpty { merged.goal = goal }
+        merged.model = update.model ?? model
+        // The first end an agent reports is its end.
+        if !status.isActive { merged.status = status }
+        // A late spawn event doesn't send a running agent back to the queue.
+        if status == .running && update.status == .queued { merged.status = .running }
+        // A finished agent is no longer in any tool.
+        merged.currentTool = merged.status.isActive ? update.currentTool ?? currentTool : nil
+        merged.summary = update.summary ?? summary
+        merged.hasGatewayID = hasGatewayID || update.hasGatewayID
+        if merged.sessionId.isEmpty { merged.sessionId = sessionId }
+        merged.stream = Array((stream + update.stream).suffix(20))
+        return merged
+    }
+
+    /// Agents a gateway roster no longer lists have ended; their
+    /// `subagent.complete` was missed (app suspended, socket reconnect).
+    /// Only running cards from `sessionId` with a gateway id and no event
+    /// since `cutoff` are touched. Hermes lists an agent once it starts,
+    /// so queued cards are left alone.
+    static func reconciled(
+        _ agents: [DelegateAgentActivity],
+        sessionId: String,
+        liveIDs: Set<String>,
+        changedBefore cutoff: Date
+    ) -> [DelegateAgentActivity] {
+        agents.map { agent in
+            guard agent.status == .running,
+                  agent.hasGatewayID,
+                  agent.sessionId == sessionId,
+                  agent.updatedAt < cutoff,
+                  !liveIDs.contains(agent.id) else { return agent }
+            var ended = agent
+            ended.status = .completed
+            ended.currentTool = nil
+            return ended
+        }
+    }
 }
 
 // MARK: - Session
 
-struct SessionSummary: Identifiable, Equatable {
+struct SessionSummary: Identifiable, Equatable, Codable {
     let id: String
     /// The durable database identity used by `session.resume`. Hermes stream
     /// events and notifications may carry the live runtime identity instead.
@@ -648,19 +817,36 @@ struct SessionSummary: Identifiable, Equatable {
     var isActive: Bool
     var isArchived: Bool
     var messageCount: Int? = nil
+    /// Hermes' shared read flag (`unread` on dashboard rows, #454): activity
+    /// postdates the `last_read_at` watermark. Nil when the listing didn't
+    /// carry it (the `session.list` RPC, older gateways).
+    var isUnread: Bool? = nil
+    /// Hermes' `last_read_at` watermark (epoch seconds). 0 means someone
+    /// explicitly marked the chat unread; nil means never tracked.
+    var readWatermark: Double? = nil
+    /// Hermes' shared pin flag (`pinned` on dashboard rows, #555), which
+    /// Desktop pins with too. Nil when the listing didn't carry it (the
+    /// `session.list` RPC, hosts older than the flag).
+    var isPinned: Bool? = nil
     var lineageRootId: String?
+    /// The listing's one-line `preview` (the opening message), when the row
+    /// carried one apart from its title. The V2 session list's second line.
+    var preview: String? = nil
 }
 
 /// A server-owned workspace from Hermes' `projects.*` capability. Projects are
 /// profile-scoped and define session membership by their folders; Conduit only
 /// presents that authoritative grouping and never tries to infer it locally.
-struct ProjectSummary: Identifiable, Equatable {
+struct ProjectSummary: Identifiable, Equatable, Codable {
     let id: String
     var title: String
     var primaryPath: String?
     var icon: String?
     var colorHex: String?
     var isHome: Bool
+    /// A repo Hermes discovered on its own rather than a project someone
+    /// created; it has no projects.db row, so it cannot be renamed or deleted.
+    var isAuto: Bool = false
     var sessionCount: Int
     var previewSessions: [SessionSummary]
 }
@@ -669,6 +855,9 @@ struct ProjectSessionLane: Identifiable, Equatable {
     let id: String
     var title: String
     var sessions: [SessionSummary]
+    /// The folder the lane's sessions ran in (a worktree or the repo), when
+    /// Hermes names one apart from the label.
+    var path: String? = nil
 }
 
 struct ProjectSessionDetail: Identifiable, Equatable {
@@ -705,6 +894,27 @@ struct CronJob: Codable, Identifiable {
     }
 
     var displayName: String { name ?? id }
+
+    /// The `state` Hermes gives a one-shot job once it has run.
+    static let completedState = "completed"
+
+    /// A finished one-shot job will not run again on its own, even if the
+    /// record still reads enabled.
+    var isFinished: Bool { state?.lowercased() == Self.completedState }
+
+    /// Whether the job will run on its own: enabled and not finished.
+    var isActive: Bool { enabled && !isFinished }
+
+    /// The Cron row's badge: Finished, Active or Paused.
+    var statusLabel: String {
+        if isFinished { return AppLocalization.string("Finished") }
+        return isActive ? AppLocalization.string("Active") : AppLocalization.string("Paused")
+    }
+}
+
+/// A Cron job action; the raw value is the dashboard API path segment.
+enum CronJobAction: String {
+    case pause, resume, trigger
 }
 
 struct CronSchedule: Codable {
@@ -799,6 +1009,16 @@ enum BusyInputMode: String, CaseIterable, Codable, Identifiable {
         }
     }
 
+    /// The composer button and settings glyph for this mode (issue #337).
+    /// Steer avoids the branching arrow, which reads as "fork"/"branch
+    /// session"; Interrupt avoids the U-turn arrow, which reads as "undo".
+    var symbol: String {
+        switch self {
+        case .steer: return "steeringwheel"
+        case .interrupt: return "hand.raised.fill"
+        }
+    }
+
     static func fromGatewayValue(_ value: String?) -> BusyInputMode {
         value?.lowercased() == BusyInputMode.interrupt.rawValue ? .interrupt : .steer
     }
@@ -828,6 +1048,8 @@ enum ProfileSettingValue: Equatable {
     case bool(Bool)
     case text(String)
     case number(Double)
+    /// A list of plain strings, such as `command_allowlist`.
+    case list([String])
 
     var boolValue: Bool? {
         if case .bool(let value) = self { return value }
@@ -837,9 +1059,110 @@ enum ProfileSettingValue: Equatable {
     var textValue: String? {
         switch self {
         case .text(let value): return value
-        case .number(let value): return String(value)
+        case .number(let value): return Self.numberText(value)
         case .bool(let value): return value ? "true" : "false"
+        case .list(let value): return value.joined(separator: "\n")
         }
+    }
+
+    var listValue: [String]? {
+        if case .list(let value) = self { return value }
+        return nil
+    }
+
+    /// Whole numbers read "300", not "300.0": most Hermes number settings
+    /// are counts, seconds, or characters.
+    static func numberText(_ value: Double) -> String {
+        value.rounded() == value && abs(value) < 1e15 ? String(Int64(value)) : String(value)
+    }
+}
+
+/// The gateway's `GET /api/config/schema`: every config key it knows, by dot
+/// path, with its type and any fixed choices. Hermes Desktop builds its
+/// settings pages from it; Conduit uses it to hide settings an older Hermes
+/// doesn't have and to fill in choices Hermes discovers at runtime.
+struct ProfileConfigSchema: Equatable {
+    struct Field: Equatable {
+        /// "boolean", "number", "string", "list", "object" or "select".
+        var type: String
+        var options: [String] = []
+    }
+
+    var fields: [String: Field] = [:]
+
+    var isEmpty: Bool { fields.isEmpty }
+
+    init(fields: [String: Field] = [:]) {
+        self.fields = fields
+    }
+
+    init(json: [String: Any]) {
+        let raw = json["fields"] as? [String: Any] ?? [:]
+        var fields: [String: Field] = [:]
+        for (key, value) in raw {
+            guard let entry = value as? [String: Any] else { continue }
+            let options = (entry["options"] as? [Any] ?? []).compactMap { $0 as? String }
+            fields[key] = Field(type: entry["type"] as? String ?? "string", options: options)
+        }
+        self.fields = fields
+    }
+
+    subscript(key: String) -> Field? { fields[key] }
+}
+
+/// One `fallback_providers` entry: the model Hermes tries when the default
+/// fails. Entries can carry hand-written routing (`base_url`, `key_env`,
+/// `api_mode`…); `extras` keeps it so a save never drops it.
+struct ProfileFallbackModel: Equatable, Identifiable {
+    let id = UUID()
+    var provider: String
+    var model: String
+    var extras: [String: AnyCodable] = [:]
+
+    static func == (lhs: ProfileFallbackModel, rhs: ProfileFallbackModel) -> Bool {
+        lhs.provider == rhs.provider && lhs.model == rhs.model && lhs.extras == rhs.extras
+    }
+
+    /// Reads the raw config value: a list of `{provider, model, …}` objects,
+    /// or legacy "provider/model" strings.
+    static func list(from value: Any?) -> [ProfileFallbackModel] {
+        guard let items = value as? [Any] else { return [] }
+        return items.compactMap { item in
+            if let object = item as? [String: Any] {
+                var extras = object.mapValues(AnyCodable.init(jsonObject:))
+                extras["provider"] = nil
+                extras["model"] = nil
+                return ProfileFallbackModel(
+                    provider: object["provider"] as? String ?? "",
+                    model: object["model"] as? String ?? "",
+                    extras: extras
+                )
+            }
+            if let text = item as? String {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                guard let slash = trimmed.firstIndex(of: "/"), slash != trimmed.startIndex else {
+                    return ProfileFallbackModel(provider: "", model: trimmed)
+                }
+                return ProfileFallbackModel(
+                    provider: String(trimmed[..<slash]),
+                    model: String(trimmed[trimmed.index(after: slash)...])
+                )
+            }
+            return nil
+        }
+    }
+
+    var jsonObject: [String: Any] {
+        var object = extras.mapValues(\.anyValue)
+        object["provider"] = provider
+        object["model"] = model
+        return object
+    }
+
+    var isComplete: Bool {
+        !provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -848,6 +1171,42 @@ struct ProfileModelDefaults: Equatable {
     var model: String
     var provider: String
     var reasoning: String
+
+    /// The picker selection for the saved default. The saved provider can be
+    /// spelled differently from the row slug (display name, `custom:<key>`,
+    /// or `auto`), so match like Hermes Desktop and then fall back to the row
+    /// Hermes marks current or the only row listing the saved model. A saved
+    /// default no row vouches for is shown as saved, never swapped for the
+    /// first row: Desktop keeps it the same way, and Save would otherwise pin
+    /// the first provider's first model. The first row is used only when
+    /// nothing is saved. A saved model missing from its row's list is kept.
+    var selection: (provider: String, model: String) {
+        if let row = providers.first(where: { $0.matches(provider) })
+            ?? providers.first(where: \.isCurrent)
+            ?? uniqueRow(listing: model) {
+            return (row.name, model.isEmpty ? row.models.first?.id ?? "" : model)
+        }
+        guard ProviderInfo.normalized(provider).isEmpty, ProviderInfo.normalized(model).isEmpty, let row = providers.first else { return (provider, model) }
+        return (row.name, row.models.first?.id ?? "")
+    }
+
+    /// The delegate picker selection for saved `delegation.provider` and
+    /// `delegation.model`. Empty values mean "inherit from the chat" and stay
+    /// empty; Hermes accepts a model with an inherited provider, so the model
+    /// is kept even then. A saved provider resolves to its row like
+    /// `selection`, and an unknown provider or unlisted model is kept as
+    /// saved rather than replaced by the first catalog entry.
+    func delegateSelection(provider savedProvider: String, model savedModel: String) -> (provider: String, model: String) {
+        guard !ProviderInfo.normalized(savedProvider).isEmpty else { return ("", savedModel) }
+        let row = providers.first(where: { $0.matches(savedProvider) })
+        return (row?.name ?? savedProvider, savedModel)
+    }
+
+    private func uniqueRow(listing model: String) -> ProviderInfo? {
+        guard !model.isEmpty else { return nil }
+        let rows = providers.filter { $0.models.contains(where: { $0.id == model }) }
+        return rows.count == 1 ? rows[0] : nil
+    }
 }
 
 /// Device-local model picker filtering. It mirrors the React client's

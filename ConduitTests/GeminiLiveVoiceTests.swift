@@ -5,10 +5,13 @@
 //  Gemini Live voice mode: wire format, Hermes-hosted token client, the
 //  resumable session, the background-job tool bridge, and the controller's
 //  "never talk over the user" rules. Written as extensions of existing
-//  Voice suites: the CI test planner is at capacity for new XCTestCase
+//  Voice suites: the CI test planner was at capacity for new XCTestCase
 //  classes.
 //
 
+import AVFAudio
+import Combine
+import UIKit
 import XCTest
 @testable import Conduit
 
@@ -111,8 +114,10 @@ final class FakeGeminiLiveSessionControl: GeminiLiveSessionControlling {
     var onEvent: (@MainActor (GeminiLiveProtocol.ServerEvent) -> Void)?
     var onStateChange: (@MainActor (GeminiLiveSession.State) -> Void)?
     var onConnectionReplaced: (@MainActor () -> Void)?
+    var onFreshSession: (@MainActor (_ heardDropout: Bool) -> Void)?
     var isReady = false
     var connectionGeneration = 0
+    var transcribesWholeUtterances = false
     private(set) var started = 0
     private(set) var stopped = 0
     private(set) var sent: [[String: Any]] = []
@@ -122,9 +127,25 @@ final class FakeGeminiLiveSessionControl: GeminiLiveSessionControlling {
     /// When set, sends are recorded but reported as failed.
     var failSends = false
 
-    func send(_ message: [String: Any], onSent: (@MainActor () -> Void)?, onFailure: (@MainActor () -> Void)?) {
-        sent.append(message)
-        if failSends { onFailure?() } else { onSent?() }
+    /// When set too, a failure is held until `deliverHeldFailures()`
+    /// (one that lands after a reconnect).
+    var holdFailures = false
+    private var heldFailures: [@MainActor () -> Void] = []
+
+    func deliverHeldFailures() {
+        let held = heldFailures
+        heldFailures = []
+        held.forEach { $0() }
+    }
+
+    func send(_ message: LiveVoiceClientMessage, onSent: (@MainActor () -> Void)?, onFailure: (@MainActor () -> Void)?) {
+        // Recorded as Gemini frames, so assertions read the wire shape.
+        sent.append(GeminiLiveProtocol.message(for: message))
+        if failSends {
+            if holdFailures { onFailure.map { heldFailures.append($0) } } else { onFailure?() }
+        } else {
+            onSent?()
+        }
     }
 
     func becomeReady() {
@@ -143,11 +164,17 @@ final class FakeGeminiLiveSessionControl: GeminiLiveSessionControlling {
 final class FakeGeminiLiveInput: GeminiLiveAudioInput {
     var onChunk: (@MainActor (Data) -> Void)?
     var onInterrupted: (@MainActor () -> Void)?
+    var cancelsEcho = false
     private(set) var starts = 0
     var permission = true
+    var startError: Error?
     private(set) var running = false
     func requestPermission() async -> Bool { permission }
-    func start() throws { running = true; starts += 1 }
+    func start() throws {
+        if let startError { throw startError }
+        running = true
+        starts += 1
+    }
     func stop() { running = false }
 }
 
@@ -156,14 +183,33 @@ final class FakeGeminiLiveOutput: GeminiLiveAudioOutput {
     var isPlaying = false
     private(set) var played = 0
     private(set) var interrupts = 0
+    private(set) var isMuted = false
     func play(_ pcm: Data, sampleRate: Double) throws { played += 1; isPlaying = true }
     func interrupt() { interrupts += 1; isPlaying = false }
     func stop() { isPlaying = false }
+    func setMuted(_ muted: Bool) { isMuted = muted }
 }
 
 @MainActor
 private func settle(_ iterations: Int = 20) async {
     for _ in 0..<iterations { await Task.yield() }
+}
+
+/// Yields until `done` holds, capped at 10 s of wall clock. A fixed number
+/// of yields can run out on a busy hosted runner before the session's own
+/// tasks have had their turns.
+@MainActor
+private func settle(until done: () -> Bool, limit: Duration = .seconds(10)) async {
+    let deadline = ContinuousClock.now.advanced(by: limit)
+    while !done(), ContinuousClock.now < deadline { await Task.yield() }
+}
+
+extension GeminiLiveSession.State {
+    /// Failed for any reason, for waits that end when a session gives up.
+    var isFailed: Bool {
+        if case .failed = self { return true }
+        return false
+    }
 }
 
 // MARK: - Wire format and token client
@@ -187,7 +233,7 @@ extension HermesVoiceGatewayTimeoutTests {
         let behaviors = Dictionary(uniqueKeysWithValues: declarations.map { ($0["name"] as! String, $0["behavior"] as! String) })
         // Quick web lookups (weather, news) go to Gemini's own Search, not a Hermes job.
         XCTAssertTrue((body["tools"] as? [[String: Any]])?.contains { $0["googleSearch"] != nil } == true)
-        XCTAssertEqual(behaviors, ["start_job": "NON_BLOCKING", "list_jobs": "BLOCKING", "cancel_job": "BLOCKING", "end_conversation": "BLOCKING"])
+        XCTAssertEqual(behaviors, ["start_job": "NON_BLOCKING", "list_jobs": "BLOCKING", "cancel_job": "BLOCKING", "interrupt_job": "NON_BLOCKING", "send_request": "NON_BLOCKING", "set_ask_first": "BLOCKING", "read_last_reply": "NON_BLOCKING", "show_on_screen": "BLOCKING", "end_conversation": "BLOCKING"])
 
         // A first connection opts in to resumption without a handle.
         let fresh = GeminiLiveProtocol.setupMessage(systemInstruction: "", functions: [], resumptionHandle: nil)["setup"] as? [String: Any]
@@ -212,6 +258,14 @@ extension HermesVoiceGatewayTimeoutTests {
 
         let audio = GeminiLiveProtocol.audioMessage(pcm16: Data([1, 2]))
         XCTAssertEqual(((audio["realtimeInput"] as? [String: Any])?["audio"] as? [String: Any])?["mimeType"] as? String, "audio/pcm;rate=16000")
+    }
+
+    func testGeminiLiveContextNoteAddsContextWithoutEndingTheTurn() {
+        let note = GeminiLiveProtocol.message(for: .contextNote("typed"))
+        let content = note["clientContent"] as? [String: Any]
+        XCTAssertEqual(content?["turnComplete"] as? Bool, false, "the model keeps it without answering")
+        XCTAssertEqual(((content?["turns"] as? [[String: Any]])?.first?["parts"] as? [[String: Any]])?.first?["text"] as? String, "typed")
+        XCTAssertEqual((GeminiLiveProtocol.message(for: .textTurn("x"))["clientContent"] as? [String: Any])?["turnComplete"] as? Bool, true)
     }
 
     func testGeminiLiveDecodesEveryServerEventItActsOn() throws {
@@ -297,7 +351,7 @@ extension HermesVoiceGatewayTimeoutTests {
     func testGeminiLiveNoAPIKeyStatusHasActionablePresentationWhilePreservingOtherHostReasons() {
         let defaults = UserDefaults.standard
         let previousLanguage = defaults.string(forKey: AppLanguageStore.defaultsKey)
-        defaults.set(AppLanguage.english.rawValue, forKey: AppLanguageStore.defaultsKey)
+        defaults.set(AppLanguage.source.rawValue, forKey: AppLanguageStore.defaultsKey)
         defer {
             if let previousLanguage {
                 defaults.set(previousLanguage, forKey: AppLanguageStore.defaultsKey)
@@ -324,7 +378,7 @@ extension HermesVoiceGatewayTimeoutTests {
     func testGeminiLiveMissingEndpointHasActionableNotifierSetupMessage() async throws {
         let defaults = UserDefaults.standard
         let previousLanguage = defaults.string(forKey: AppLanguageStore.defaultsKey)
-        defaults.set(AppLanguage.english.rawValue, forKey: AppLanguageStore.defaultsKey)
+        defaults.set(AppLanguage.source.rawValue, forKey: AppLanguageStore.defaultsKey)
         defer {
             if let previousLanguage {
                 defaults.set(previousLanguage, forKey: AppLanguageStore.defaultsKey)
@@ -377,14 +431,14 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(URLComponents(url: socket.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "access_token" }?.value, "tok-1")
         XCTAssertNotNil(socket.sent.first?["setup"])
 
-        session.send(GeminiLiveProtocol.audioMessage(pcm16: Data([1, 2])))
+        session.send(.audio(Data([1, 2])))
         await settle()
         XCTAssertEqual(socket.sent.count, 1, "Audio before setupComplete is dropped")
 
         socket.deliver(["setupComplete": [String: Any]()])
         await settle()
         XCTAssertEqual(session.state, .ready)
-        session.send(GeminiLiveProtocol.audioMessage(pcm16: Data([1, 2])))
+        session.send(.audio(Data([1, 2])))
         await settle()
         XCTAssertEqual(socket.sent.count, 2)
         session.stop()
@@ -417,7 +471,7 @@ extension VoiceConversationControllerTests {
         var heard: [GeminiLiveProtocol.ServerEvent] = []
         session.onEvent = { heard.append($0) }
         let sentBefore = first.sent.count
-        session.send(GeminiLiveProtocol.audioMessage(pcm16: Data([1, 2])))
+        session.send(.audio(Data([1, 2])))
         await settle()
         XCTAssertEqual(first.sent.count, sentBefore + 1)
         XCTAssertEqual(second.sent.count, 1, "Only the setup goes to the connection still setting up")
@@ -431,7 +485,7 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(session.state, .ready)
         XCTAssertEqual(replaced, 1)
         XCTAssertEqual(session.connectionGeneration, 1)
-        session.send(GeminiLiveProtocol.audioMessage(pcm16: Data([3, 4])))
+        session.send(.audio(Data([3, 4])))
         await settle()
         XCTAssertEqual(second.sent.count, 2, "The new connection carries the conversation once set up")
         session.stop()
@@ -446,19 +500,19 @@ extension VoiceConversationControllerTests {
         first.deliver(["setupComplete": [String: Any]()])
         first.deliver(["sessionResumptionUpdate": ["newHandle": "h-1", "resumable": true]])
         first.deliver(["goAway": ["timeLeft": "1s"]])
-        await settle(40)
+        await settle(until: { sockets().count == 2 })
         XCTAssertEqual(sockets().count, 2)
 
         // timeLeft runs out before the new connection is set up.
         first.serverClose(nil)
-        await settle(80)
+        await settle(until: { session.state == .reconnecting })
         XCTAssertEqual(session.state, .reconnecting)
         XCTAssertEqual(sockets().count, 2, "The handoff connection already under way takes over; no third one")
 
         sockets()[1].deliver(["setupComplete": [String: Any]()])
-        await settle()
+        await settle(until: { session.state == .ready })
         XCTAssertEqual(session.state, .ready)
-        session.send(GeminiLiveProtocol.audioMessage(pcm16: Data([1])))
+        session.send(.audio(Data([1])))
         await settle()
         XCTAssertEqual(sockets()[1].sent.count, 2)
         session.stop()
@@ -472,15 +526,16 @@ extension VoiceConversationControllerTests {
         let first = try XCTUnwrap(sockets().first)
         first.deliver(["setupComplete": [String: Any]()])
         first.deliver(["goAway": ["timeLeft": "5s"]])
-        await settle(40)
-        sockets()[1].serverClose(nil)
-        await settle(80)
+        await settle(until: { sockets().dropFirst().first?.sent.first != nil })
+        try XCTUnwrap(sockets().dropFirst().first).serverClose(nil)
+        // The failed attempt first waits out its close frame, then retries.
+        await settle(until: { sockets().count == 3 })
 
         XCTAssertEqual(sockets().count, 3, "A failed handoff attempt is retried")
         XCTAssertEqual(session.state, .ready, "The old connection still serves")
         XCTAssertFalse(first.closed)
-        sockets()[2].deliver(["setupComplete": [String: Any]()])
-        await settle()
+        try XCTUnwrap(sockets().dropFirst(2).first).deliver(["setupComplete": [String: Any]()])
+        await settle(until: { first.closed })
         XCTAssertTrue(first.closed)
         XCTAssertEqual(session.state, .ready)
         session.stop()
@@ -492,11 +547,184 @@ extension VoiceConversationControllerTests {
         session.start()
         await settle()
         try XCTUnwrap(sockets().first).serverClose(.init(code: 1008, reason: "models/gemini-3.8-live is not found"))
-        await settle(80)
+        await settle(until: { session.state.isFailed })
 
         XCTAssertEqual(session.state, .failed(AppLocalization.string("Gemini Live refused the connection: \("models/gemini-3.8-live is not found")")))
         XCTAssertEqual(sockets().count, 1, "a refused setup is not retried")
         XCTAssertEqual(tokens.issued, 1)
+    }
+
+    private var resumptionLost: GeminiLiveServerClose {
+        GeminiLiveServerClose(code: 1008, reason: "BidiGenerateContent session not found or expired")
+    }
+
+    private func resumptionHandle(_ socket: FakeGeminiLiveSocket) -> String? {
+        ((socket.attempted.first?["setup"] as? [String: Any])?["sessionResumption"] as? [String: Any])?["handle"] as? String
+    }
+
+    /// Build 208: a dropped call came back with its handle and Google
+    /// answered "session not found or expired". The call goes on as a new
+    /// session instead of failing.
+    func testGeminiLiveRefusedResumptionStartsAFreshSessionOnce() async throws {
+        let tokens = FakeGeminiLiveTokens()
+        let (session, sockets) = makeGeminiSession(tokens: tokens)
+        var fresh: [Bool] = []
+        session.onFreshSession = { fresh.append($0) }
+        session.start()
+        await settle()
+        let first = try XCTUnwrap(sockets().first)
+        first.deliver(["setupComplete": [String: Any]()])
+        first.deliver(["sessionResumptionUpdate": ["newHandle": "h-1", "resumable": true]])
+        await settle()
+        first.serverClose(nil)
+        await settle(until: { sockets().count == 2 })
+        XCTAssertEqual(resumptionHandle(sockets()[1]), "h-1")
+
+        sockets()[1].serverClose(resumptionLost)
+        await settle(until: { sockets().count == 3 })
+        XCTAssertEqual(sockets().count, 3, "a lost session is started again, not failed")
+        XCTAssertNil(resumptionHandle(sockets()[2]), "the new session carries no handle")
+        XCTAssertTrue(fresh.isEmpty, "reported once the new session is ready")
+
+        sockets()[2].deliver(["setupComplete": [String: Any]()])
+        await settle()
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertEqual(fresh, [true])
+        session.stop()
+    }
+
+    func testGeminiLiveRefusedFreshSessionAfterALostResumptionFails() async throws {
+        let tokens = FakeGeminiLiveTokens()
+        let (session, sockets) = makeGeminiSession(tokens: tokens)
+        session.onFreshSession = { _ in }
+        session.start()
+        await settle()
+        let first = try XCTUnwrap(sockets().first)
+        first.deliver(["setupComplete": [String: Any]()])
+        first.deliver(["sessionResumptionUpdate": ["newHandle": "h-1", "resumable": true]])
+        await settle()
+        first.serverClose(nil)
+        await settle(until: { sockets().count == 2 })
+        sockets()[1].serverClose(resumptionLost)
+        await settle(until: { sockets().count == 3 })
+        sockets()[2].serverClose(resumptionLost)
+        await settle(until: { session.state.isFailed })
+
+        XCTAssertEqual(sockets().count, 3, "only one fresh start per lost session")
+        XCTAssertEqual(session.state, .failed(AppLocalization.string("Gemini Live lost this conversation on its side. Tap Try again to start a new one.")))
+    }
+
+    /// A GoAway handoff whose setup Google won't resume: the old connection
+    /// keeps serving while a fresh session sets up, and the user heard no
+    /// break.
+    func testGeminiLiveRefusedHandoffResumptionStartsFreshWhileTheOldConnectionServes() async throws {
+        let tokens = FakeGeminiLiveTokens()
+        let (session, sockets) = makeGeminiSession(tokens: tokens)
+        var fresh: [Bool] = []
+        session.onFreshSession = { fresh.append($0) }
+        session.start()
+        await settle()
+        let first = try XCTUnwrap(sockets().first)
+        first.deliver(["setupComplete": [String: Any]()])
+        first.deliver(["sessionResumptionUpdate": ["newHandle": "h-1", "resumable": true]])
+        first.deliver(["goAway": ["timeLeft": "5s"]])
+        await settle(until: { sockets().dropFirst().first?.sent.first != nil })
+        XCTAssertEqual(resumptionHandle(sockets()[1]), "h-1")
+
+        sockets()[1].serverClose(resumptionLost)
+        await settle(until: { sockets().count == 3 })
+        XCTAssertNil(resumptionHandle(sockets()[2]))
+        XCTAssertEqual(session.state, .ready, "the old connection still serves")
+        XCTAssertFalse(first.closed)
+
+        sockets()[2].deliver(["setupComplete": [String: Any]()])
+        await settle(until: { first.closed })
+        XCTAssertTrue(first.closed)
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertEqual(fresh, [false])
+        session.stop()
+    }
+
+    func testGeminiLiveFreshSessionAfterAHandoffDoesNotMentionAReconnection() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, _, _) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.inputTranscription("what's the weather"))
+        session.onEvent?(.outputTranscription("Sunny all day."))
+        session.onEvent?(.turnComplete)
+
+        session.onFreshSession?(false)
+        session.becomeReady()
+        current += GeminiLiveConversationController.userQuietInterval + GeminiLiveConversationController.modelQuietInterval + 1
+        controller.flushPendingTextIfIdle()
+        let recap = session.textTurns.last ?? ""
+        XCTAssertTrue(recap.contains("User: what's the weather"), recap)
+        XCTAssertTrue(recap.contains("don't mention a reconnection"), recap)
+        controller.stop()
+    }
+
+    /// The lost session was mid-answer during a handoff: its turn never
+    /// completes, so the fresh start closes it and the recap still goes out.
+    func testGeminiLiveFreshSessionMidTurnClosesTheDeadTurnAndSendsTheRecap() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, _, _) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.inputTranscription("what's the weather"))
+        session.onEvent?(.outputTranscription("Sunny all"))
+
+        session.onFreshSession?(false)
+        session.becomeReady()
+        XCTAssertEqual(controller.phase, .listening)
+        current += GeminiLiveConversationController.userQuietInterval + GeminiLiveConversationController.modelQuietInterval + 1
+        controller.flushPendingTextIfIdle()
+        let recap = session.textTurns.last ?? ""
+        XCTAssertTrue(recap.contains("You: Sunny all"), recap)
+
+        // The new session's answer is a line of its own.
+        session.onEvent?(.outputTranscription("Sunny all day."))
+        XCTAssertEqual(controller.transcript.filter { $0.speaker == .assistant }.map(\.text), ["Sunny all", "Sunny all day."])
+        controller.stop()
+    }
+
+    func testGeminiLiveOtherRefusalOfAResumptionFailsWithoutAFreshStart() async throws {
+        let tokens = FakeGeminiLiveTokens()
+        let (session, sockets) = makeGeminiSession(tokens: tokens)
+        session.onFreshSession = { _ in XCTFail("only a lost session starts fresh") }
+        session.start()
+        await settle()
+        let first = try XCTUnwrap(sockets().first)
+        first.deliver(["setupComplete": [String: Any]()])
+        first.deliver(["sessionResumptionUpdate": ["newHandle": "h-1", "resumable": true]])
+        await settle()
+        first.serverClose(nil)
+        await settle(until: { sockets().count == 2 })
+        sockets()[1].serverClose(.init(code: 1008, reason: "API key expired. Please renew the API key."))
+        await settle(until: { session.state.isFailed })
+
+        XCTAssertEqual(sockets().count, 2)
+        XCTAssertEqual(session.state, .failed(AppLocalization.string("Gemini Live refused the connection: \("API key expired. Please renew the API key.")")))
+    }
+
+    func testGeminiLiveFreshSessionTellsTheModelWhatWasSaid() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, _, _) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.inputTranscription("what's the weather"))
+        session.onEvent?(.outputTranscription("Sunny all day."))
+        session.onEvent?(.turnComplete)
+
+        session.onFreshSession?(true)
+        session.becomeReady()
+        current += GeminiLiveConversationController.userQuietInterval + GeminiLiveConversationController.modelQuietInterval + 1
+        controller.flushPendingTextIfIdle()
+        let recap = session.textTurns.last ?? ""
+        XCTAssertTrue(recap.contains("User: what's the weather"), recap)
+        XCTAssertTrue(recap.contains("You: Sunny all day."), recap)
+        XCTAssertTrue(recap.contains("you're back"), recap)
+        controller.stop()
     }
 
     private func searches(_ socket: FakeGeminiLiveSocket) -> Bool {
@@ -531,7 +759,7 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(session.state, .ready)
 
         try XCTUnwrap(sockets().first).serverClose(spentQuota)
-        await settle(80)
+        await settle(until: { sockets().count == 2 })
         XCTAssertEqual(sockets().count, 2)
         XCTAssertFalse(searches(try XCTUnwrap(sockets().last)))
         try XCTUnwrap(sockets().last).deliver(["setupComplete": [String: Any]()])
@@ -545,7 +773,7 @@ extension VoiceConversationControllerTests {
         session.start()
         await settle()
         try XCTUnwrap(sockets().first).serverClose(spentQuota)
-        await settle(80)
+        await settle(until: { sockets().count == 2 })
         XCTAssertEqual(sockets().count, 2)
         try XCTUnwrap(sockets().last).deliver(["setupComplete": [String: Any]()])
         await settle()
@@ -561,7 +789,7 @@ extension VoiceConversationControllerTests {
         await settle()
 
         try XCTUnwrap(sockets().first).serverClose(.init(code: 1007, reason: "Invalid frame"))
-        await settle(80)
+        await settle(until: { sockets().count == 2 })
         XCTAssertEqual(sockets().count, 2, "a live connection reconnects with resumption")
         XCTAssertTrue(searches(try XCTUnwrap(sockets().last)), "only a spent quota drops Search")
         try XCTUnwrap(sockets().last).deliver(["setupComplete": [String: Any]()])
@@ -578,13 +806,13 @@ extension VoiceConversationControllerTests {
         XCTAssertTrue(searches(try XCTUnwrap(sockets().first)))
 
         try XCTUnwrap(sockets().first).serverClose(quota)
-        await settle(80)
+        await settle(until: { sockets().count == 2 })
         XCTAssertEqual(sockets().count, 2, "Search's own quota doesn't end the conversation")
         XCTAssertFalse(searches(try XCTUnwrap(sockets().last)))
         if case .failed = session.state { XCTFail("the retry without Search should still be connecting") }
 
         try XCTUnwrap(sockets().last).serverClose(quota)
-        await settle(80)
+        await settle(until: { session.state.isFailed })
         XCTAssertEqual(session.state, .failed(AppLocalization.string("Gemini Live refused the connection: \(quota.summary)")))
         XCTAssertEqual(sockets().count, 2, "without Search a quota refusal is final")
     }
@@ -593,7 +821,7 @@ extension VoiceConversationControllerTests {
         let tokens = FakeGeminiLiveTokens()
         let (session, sockets) = makeGeminiSession(tokens: tokens)
         session.start()
-        await driveUntilFailed(session) { sockets().last?.serverClose(.init(code: 1001, reason: "going away")) }
+        await driveUntilFailed(session, sockets: sockets) { $0.serverClose(.init(code: 1001, reason: "going away")) }
 
         XCTAssertEqual(session.state, .failed(AppLocalization.string("Couldn't connect to Gemini Live: \("going away")")))
         XCTAssertEqual(sockets().count, 1 + GeminiLiveSession.maximumReconnectAttempts)
@@ -603,7 +831,7 @@ extension VoiceConversationControllerTests {
         let tokens = FakeGeminiLiveTokens()
         let (session, sockets) = makeGeminiSession(tokens: tokens)
         session.start()
-        await driveUntilFailed(session) { sockets().last?.serverClose(nil) }
+        await driveUntilFailed(session, sockets: sockets) { $0.serverClose(nil) }
 
         XCTAssertEqual(session.state, .failed(AppLocalization.string("Couldn't connect to Gemini Live.")))
         XCTAssertEqual(sockets().count, 1 + GeminiLiveSession.maximumReconnectAttempts)
@@ -638,11 +866,18 @@ extension VoiceConversationControllerTests {
     }
 
     /// Closes each new connection before setup until the session gives up.
-    private func driveUntilFailed(_ session: GeminiLiveSession, close: () -> Void) async {
+    /// Each round waits for the session to open its next connection or
+    /// fail: a dropped close only reaches it after the fake socket's own
+    /// yields, which a fixed count could outrun.
+    private func driveUntilFailed(
+        _ session: GeminiLiveSession,
+        sockets: () -> [FakeGeminiLiveSocket],
+        close: (FakeGeminiLiveSocket) -> Void
+    ) async {
         for _ in 0..<10 {
-            await settle(80)
-            if case .failed = session.state { return }
-            close()
+            await settle(until: { session.state.isFailed || sockets().last?.closed == false })
+            guard !session.state.isFailed, let open = sockets().last, !open.closed else { return }
+            close(open)
         }
     }
 
@@ -714,6 +949,36 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(settledScheduling, .silent, "The user just heard the cancel confirmed")
     }
 
+    func testGeminiLiveShowOnScreenPutsTheMarkdownOnTheCallScreen() async {
+        let (supervisor, _, bridge) = makeJobs()
+        XCTAssertTrue(GeminiLiveToolBridge.functionDeclarations.contains { $0.name == "show_on_screen" })
+
+        let offCall = await bridge.handle(.init(id: "c1", name: "show_on_screen", arguments: ["title": "Weather", "markdown": "| Day | High |"]))
+        guard case .toolResponse(_, _, let refused, _)? = offCall.first else { return XCTFail("\(offCall)") }
+        XCTAssertNotNil(refused["error"], "Without a live call there is no screen to show it on")
+        XCTAssertTrue(supervisor.screenCards.isEmpty)
+
+        supervisor.liveCallTranscript = { [] }
+        supervisor.beginLiveCall()
+        let empty = await bridge.handle(.init(id: "c2", name: "show_on_screen", arguments: ["title": "Weather", "markdown": "  "]))
+        guard case .toolResponse(_, _, let missing, _)? = empty.first else { return XCTFail("\(empty)") }
+        XCTAssertEqual(missing["error"], "markdown is required")
+
+        let shown = await bridge.handle(.init(id: "c3", name: "show_on_screen", arguments: ["title": "Weather", "markdown": "| Day | High |"]))
+        guard case .toolResponse(let id, _, let result, let scheduling)? = shown.first, shown.count == 1 else { return XCTFail("\(shown)") }
+        XCTAssertEqual(id, "c3")
+        XCTAssertEqual(result["status"], "shown")
+        XCTAssertNil(scheduling, "show_on_screen is a BLOCKING answer")
+        XCTAssertEqual(supervisor.callScreenCards(supervisor.liveCallID).map(\.title), ["Weather"])
+        XCTAssertEqual(supervisor.callScreenCards(supervisor.liveCallID).first?.markdown, "| Day | High |")
+
+        let long = String(repeating: "row\n", count: VoiceBackgroundJobSupervisor.maximumScreenCardCharacters)
+        let clipped = await bridge.handle(.init(id: "c4", name: "show_on_screen", arguments: ["title": "Rows", "markdown": long]))
+        guard case .toolResponse(_, _, let partial, _)? = clipped.first else { return XCTFail("\(clipped)") }
+        XCTAssertEqual(partial["status"], "shown")
+        XCTAssertTrue(partial["message"]?.contains("Only the start") == true, "The model hears that the card was cut")
+    }
+
     func testGeminiLiveResultOfAJobWhoseCallWasLostArrivesAsAnIdleTextUpdate() async {
         let (supervisor, _, bridge) = makeJobs()
         _ = await bridge.handle(.init(id: "c1", name: "start_job", arguments: ["instructions": "check the server"]))
@@ -729,6 +994,9 @@ extension VoiceConversationControllerTests {
         route: VoiceBargeInRoutePolicy = .fullDuplex,
         endPhrases: [String] = [],
         webSearch: GeminiLiveWebSearching? = nil,
+        openingPrompt: String? = nil,
+        headsetMute: HeadsetMicrophoneMute? = nil,
+        notificationCenter: NotificationCenter = NotificationCenter(),
         clock: @escaping () -> Date
     ) -> (GeminiLiveConversationController, FakeGeminiLiveSessionControl, FakeGeminiLiveInput, FakeGeminiLiveOutput, VoiceBackgroundJobSupervisor) {
         let tokens = providedTokens ?? FakeGeminiLiveTokens()
@@ -744,9 +1012,223 @@ extension VoiceConversationControllerTests {
             output: output,
             now: clock,
             routePolicy: { route },
-            endConversationPhrases: { endPhrases }
+            endConversationPhrases: { endPhrases },
+            openingPrompt: { openingPrompt },
+            headsetMute: headsetMute ?? HeadsetMicrophoneMute(system: FakeSystemInputMute()),
+            notificationCenter: notificationCenter
         )
         return (controller, session, input, output, supervisor)
+    }
+
+    func testLiveCallSpeakerMuteSilencesTheOutputAndHoldsItsNewsUntilUnmuted() async {
+        let (controller, session, _, output, _) = makeGeminiController(clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        XCTAssertTrue(controller.isConversationIdle)
+
+        controller.setSpeakerMuted(true)
+        XCTAssertTrue(controller.isSpeakerMuted)
+        XCTAssertTrue(output.isMuted)
+        XCTAssertFalse(controller.isConversationIdle, "Nothing Conduit would have it say goes out unheard")
+        XCTAssertEqual(controller.phase, .listening, "The call carries on")
+
+        controller.setSpeakerMuted(false)
+        XCTAssertFalse(output.isMuted)
+        XCTAssertTrue(controller.isConversationIdle)
+
+        // A speaker mute belongs to the call it was set in.
+        controller.setSpeakerMuted(true)
+        controller.stop()
+        await controller.start()
+        XCTAssertFalse(controller.isSpeakerMuted)
+        XCTAssertFalse(output.isMuted)
+        controller.stop()
+    }
+
+    func testLiveVoiceAudioGivesTheSpeakerMuteToTheAudioTheCallChooses() throws {
+        let standardOutput = FakeGeminiLiveOutput()
+        let selector = LiveVoiceAudioSelector(
+            wantsEchoCancellation: { false },
+            makeStandard: { (FakeGeminiLiveInput(), standardOutput) },
+            makeEchoCancelling: { (FakeGeminiLiveInput(), FakeGeminiLiveOutput()) }
+        )
+        let output = selector.output
+        // Muted before the call has any audio: the chosen audio starts silent.
+        output.setMuted(true)
+        try output.play(Data([0, 0]), sampleRate: 24_000)
+        XCTAssertTrue(standardOutput.isMuted)
+        output.setMuted(false)
+        XCTAssertFalse(standardOutput.isMuted)
+        output.stop()
+    }
+
+    func testLiveCallGreetsOnceWhenItFirstConnectsAndNeverOnAReconnect() async {
+        let (controller, session, _, _, _) = makeGeminiController(openingPrompt: "[greet]", clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]"])
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]"], "A reconnect doesn't greet again")
+        controller.stop()
+
+        let (quiet, quietSession, _, _, _) = makeGeminiController(clock: Date.init)
+        await quiet.start()
+        quietSession.becomeReady()
+        XCTAssertTrue(quietSession.textTurns.isEmpty, "No greeting unless the user asked for one")
+        quiet.stop()
+    }
+
+    func testLiveCallGreetingThatFailedToSendIsTriedAgainOnTheNextReady() async {
+        let (controller, session, _, _, _) = makeGeminiController(openingPrompt: "[greet]", clock: Date.init)
+        await controller.start()
+        session.failSends = true
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]"], "The greeting was attempted")
+        session.failSends = false
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]", "[greet]"], "A greeting that never went out is sent again")
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]", "[greet]"], "Once it's sent, a reconnect doesn't greet again")
+        controller.stop()
+    }
+
+    func testLiveCallGreetingWhoseFailureLandsAfterAReconnectGreetsOnTheNewConnection() async {
+        let (controller, session, _, _, _) = makeGeminiController(openingPrompt: "[greet]", clock: Date.init)
+        await controller.start()
+        session.failSends = true
+        session.holdFailures = true
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]"])
+        // Reconnected before the failure came back: the ready doesn't greet.
+        session.failSends = false
+        session.connectionGeneration += 1
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]"])
+        session.deliverHeldFailures()
+        XCTAssertEqual(session.textTurns, ["[greet]", "[greet]"], "Greets on the connection that's up")
+        session.becomeReady()
+        XCTAssertEqual(session.textTurns, ["[greet]", "[greet]"], "Once sent, never again")
+        controller.stop()
+    }
+
+    func testLiveVoiceStyleAddsNothingUntilTheUserChoosesSomething() {
+        XCTAssertEqual(LiveVoiceStyle().instructions, "")
+        XCTAssertNil(LiveVoiceStyle().openingPrompt)
+
+        let style = LiveVoiceStyle(tone: .professional, backchannels: false, greeting: "Hey Neal, I'm here.")
+        XCTAssertTrue(style.instructions.contains("replaces any tone"))
+        XCTAssertTrue(style.instructions.contains("Tone: professional"))
+        XCTAssertTrue(style.instructions.contains("Backchannels: none"))
+        XCTAssertEqual(style.openingPrompt?.contains("Say: \"Hey Neal, I'm here.\""), true)
+
+        let ownWords = LiveVoiceStyle(greeting: "")
+        XCTAssertEqual(ownWords.instructions, "")
+        XCTAssertEqual(ownWords.openingPrompt?.contains("Say:"), false)
+    }
+
+    func testLiveVoiceGreetingIsKeptToOneQuotableLine() {
+        XCTAssertEqual(LiveVoiceStyle.cleanedGreeting("  Hey \"Neal\",\n  what's up? "), "Hey 'Neal', what's up?")
+        XCTAssertEqual(LiveVoiceStyle.cleanedGreeting(String(repeating: "a", count: 500)).count, LiveVoiceStyle.maxGreetingCharacters)
+    }
+
+    func testLiveModelsAreAskedForSubstantiveAnswersNotOneLiners() throws {
+        let gpt = GPTLiveConversationController.briefing(personality: "Judge Hermes")
+        // Grok Live is built from Gemini Live's instructions (AppState.grokLiveController).
+        let gemini: [GeminiLiveSearchSource] = [.google, .hermes, .grok, .none]
+        var engines: [(String, String)] = gemini.map { search in
+            ("Gemini and Grok (\(search))", GeminiLiveConversationController.instructions(search: search, personality: "Judge Hermes"))
+        }
+        engines.append(("GPT-Live", gpt))
+        for (engine, text) in engines {
+            XCTAssertTrue(text.contains(LiveVoiceAnswerLength.standard.instructions(readsBack: true)), "\(engine) gets the answer-length rule")
+            XCTAssertFalse(text.localizedCaseInsensitiveContains("keep replies short"), "\(engine) is no longer told to keep it short")
+            XCTAssertFalse(text.contains("a few spoken sentences"), engine)
+            XCTAssertTrue(text.contains("not how much you say"), "\(engine): a text persona can't make spoken answers terse")
+        }
+        XCTAssertFalse(LiveVoiceStyle(tone: .professional).instructions.contains("concise"), "professional cuts filler, not substance")
+        XCTAssertFalse(GeminiLiveToolBridge.webSearchDeclaration.description.contains("sentence or two"))
+        XCTAssertFalse(GeminiLiveToolBridge.threadDeclarations.contains { $0.description.contains("summarize it") })
+        // Built once for every call, so they defer to the call's answer length.
+        XCTAssertTrue(GeminiLiveToolBridge.webSearchDeclaration.description.contains("answer length your instructions set"))
+        XCTAssertTrue(GeminiLiveToolBridge.threadDeclarations.contains { $0.description.contains("answer length your instructions set") })
+        let lookup = try XCTUnwrap(GeminiLiveConversationController.lookupFallbackText(for: ["results": "1. Sunny, 21°C"]))
+        XCTAssertFalse(lookup.contains("briefly"), "a lookup's answer isn't cut short either")
+
+        let job = VoiceBackgroundJobSupervisor.completionPrompt(title: "Weather", result: "Sunny, 21°C.")
+        let reply = VoiceBackgroundJobSupervisor.threadReplyPrompt(result: "Done.")
+        for prompt in [job, reply] {
+            XCTAssertFalse(prompt.contains("a few spoken sentences"), "Hermes' results are passed on with their details, not as a one-line gist")
+            XCTAssertFalse(prompt.contains("the gist"))
+            XCTAssertTrue(prompt.contains("the details that matter"))
+        }
+        XCTAssertFalse(VoiceBackgroundJobSupervisor.jobPrompt(for: "Check the weather").contains("short plain-language summary"))
+        XCTAssertTrue(VoiceBackgroundJobSupervisor.jobPrompt(for: "Check the weather").contains("with the key details"))
+        XCTAssertFalse(GPTLiveConversationController.resultAfterUserNote.contains("briefly"), "what the user asked meanwhile gets a full answer too")
+
+        // A call attached to a chat gets its own block on top of the instructions.
+        let suite = "LiveVoiceAnswerDepth.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false, clearSessionPresentationCache: {})
+        appState.voiceBackgroundJobSupervisor.liveThread = VoiceThreadTarget(runtimeSessionID: "rt-chat", storedSessionID: nil, title: "Build")
+        for delegation in [false, true] {
+            let block = appState.liveVoiceThreadInstructions(delegation: delegation)
+            XCTAssertFalse(block.contains("keep your own replies short"), "delegation \(delegation)")
+            XCTAssertTrue(block.contains("with the details that matter"), "delegation \(delegation)")
+        }
+    }
+
+    func testLiveAnswerLengthPicksTheOneRuleEveryEngineGets() throws {
+        for length in LiveVoiceAnswerLength.allCases {
+            let gemini = GeminiLiveConversationController.instructions(search: .google, answerLength: length)
+            let gpt = GPTLiveConversationController.briefing(answerLength: length)
+            XCTAssertTrue(gemini.contains(length.instructions(readsBack: true)), "\(length)")
+            XCTAssertTrue(gpt.contains(length.instructions(readsBack: true)), "\(length)")
+            for other in LiveVoiceAnswerLength.allCases where other != length {
+                XCTAssertFalse(gemini.contains(other.instructions(readsBack: true)), "\(length): one length rule per call")
+                XCTAssertFalse(gpt.contains(other.instructions(readsBack: true)), "\(length): one length rule per call")
+            }
+        }
+        XCTAssertFalse(LiveVoiceAnswerLength.concise.instructions(readsBack: true).contains("Keep it short only"), "Concise doesn't contradict itself")
+        XCTAssertTrue(LiveVoiceAnswerLength.detailed.instructions(readsBack: true).contains("in depth"))
+        XCTAssertEqual(LiveVoiceStyle(answerLength: .detailed).instructions, "", "the length goes in the rules, not the style block")
+
+        let suite = "LiveVoiceAnswerLength.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false, clearSessionPresentationCache: {})
+        XCTAssertEqual(appState.liveVoiceStyle.answerLength, .standard, "Default until the user picks another")
+        appState.setLiveVoiceStyle(LiveVoiceStyle(answerLength: .concise))
+        XCTAssertEqual(appState.liveVoiceStyle.answerLength, .concise)
+        XCTAssertEqual(appState.activeProfileVoicePreferences.liveVoiceAnswerLength, .concise)
+
+        // What the next call gets, through the same builders the sessions use.
+        let detailed = LiveVoiceAnswerLength.detailed.instructions(readsBack: true)
+        appState.setLiveVoiceStyle(LiveVoiceStyle(answerLength: .detailed))
+        appState.setGeminiLiveEnabled(true)
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(detailed), true, "Gemini Live")
+        appState.setGrokLiveEnabled(true)
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.mode, "Grok Live")
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(detailed), true, "Grok Live")
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(GrokLiveProtocol.delegationInstructions), true, "Grok Live's own delegation rules")
+        appState.setGPTLiveEnabled(true)
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.mode, "GPT-Live")
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(detailed), true, "GPT-Live")
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(GrokLiveProtocol.delegationInstructions), false, "only Grok gets them")
+
+        appState.setLiveVoiceStyle(LiveVoiceStyle())
+        XCTAssertNil(appState.activeProfileVoicePreferences.liveVoiceAnswerLength, "Default is stored as nothing")
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(LiveVoiceAnswerLength.standard.instructions(readsBack: true)), true)
+
+        // Asking first (#451): off is stored as nothing; the preview says
+        // how the next call starts.
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(LiveVoiceStyle.askFirstInstructions(on: false)), true)
+        appState.setLiveVoiceStyle(LiveVoiceStyle(asksBeforeSending: true))
+        XCTAssertEqual(appState.activeProfileVoicePreferences.liveVoiceAskBeforeSending, true)
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains(LiveVoiceStyle.askFirstInstructions(on: true)), true)
+        XCTAssertEqual(appState.liveVoiceInstructionsPreview()?.instructions.contains("\"Send:\""), true, "GPT-Live's rules say how to send a waiting request")
+        appState.setLiveVoiceStyle(LiveVoiceStyle())
+        XCTAssertNil(appState.activeProfileVoicePreferences.liveVoiceAskBeforeSending)
     }
 
     func testGeminiLiveUnavailableHostFailsWithTheReasonAndNeverConnects() async {
@@ -757,6 +1239,21 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(controller.phase, .failed(GeminiLiveAvailability.pluginMissing.userFacingReason!))
         XCTAssertEqual(session.started, 0)
         XCTAssertFalse(input.running)
+    }
+
+    func testGeminiLivePublishesSpeakingOncePerTurnNotOnEveryAudioChunk() async {
+        let (controller, session, _, _, _) = makeGeminiController(clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        var published: [GeminiLiveConversationController.Phase] = []
+        let watch = controller.$phase.dropFirst().sink { published.append($0) }
+        for _ in 0..<20 {
+            session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        }
+        session.onEvent?(.turnComplete)
+        XCTAssertEqual(published, [.speaking, .listening], "each chunk would otherwise redraw the call sheet")
+        watch.cancel()
+        controller.stop()
     }
 
     func testGeminiLiveNeverTalksOverTheUser() async {
@@ -798,6 +1295,142 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(session.stopped, 1)
     }
 
+    func testGeminiLiveJobResultWaitsWhileTheModelAnswersSomethingElseAndIsResentIfUnsaid() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, output, supervisor) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        session.onEvent?(.toolCall([.init(id: "c1", name: "start_job", arguments: ["instructions": "check the server"])]))
+        await settle(40)
+        session.onEvent?(.turnComplete)
+        output.isPlaying = false
+        func answeredC1() -> Bool {
+            session.sent.contains { message in
+                ((message["toolResponse"] as? [String: Any])?["functionResponses"] as? [[String: Any]])?
+                    .contains { $0["id"] as? String == "c1" } == true
+            }
+        }
+
+        // The user asks something else; the job finishes while the model answers it.
+        current += 5
+        session.onEvent?(.inputTranscription("what's the weather"))
+        current += GeminiLiveConversationController.userQuietInterval + 0.5
+        session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        supervisor.observe(.messageComplete(sessionId: "rt-1", messageId: nil, content: "All green.", reasoning: nil))
+        controller.deliverPendingJobUpdates()
+        XCTAssertFalse(answeredC1(), "Not sent into another answer")
+        XCTAssertEqual(controller.heldOutcomeCountForTesting, 1)
+
+        // The answer ends and the conversation goes quiet: the result goes out on its call.
+        session.onEvent?(.turnComplete)
+        output.isPlaying = false
+        current += GeminiLiveConversationController.modelQuietInterval + 0.5
+        controller.flushPendingTextIfIdle()
+        XCTAssertTrue(answeredC1())
+        XCTAssertEqual(controller.heldOutcomeCountForTesting, 0)
+
+        // The model let it pass without a word: it is said again as a text turn.
+        let sentAt = current
+        current += GeminiLiveConversationController.outcomeSpeechGrace
+        controller.respeakOutcomeIfSilent(jobID: supervisor.jobs.first?.id, since: sentAt)
+        XCTAssertTrue(session.textTurns.contains { $0.contains("All green.") })
+
+        // One the model did speak is not repeated.
+        let turns = session.textTurns.count
+        session.onEvent?(.turnComplete)
+        current += 5
+        session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        controller.respeakOutcomeIfSilent(jobID: supervisor.jobs.first?.id, since: current - 1)
+        XCTAssertEqual(session.textTurns.count, turns)
+
+        // Nor one it answered only as text, with no audio.
+        session.onEvent?(.turnComplete)
+        current += 5
+        session.onEvent?(.outputTranscription("All green on the server."))
+        controller.respeakOutcomeIfSilent(jobID: supervisor.jobs.first?.id, since: current - 1)
+        XCTAssertEqual(session.textTurns.count, turns)
+        controller.stop()
+    }
+
+    func testGeminiLiveHeldJobResultGoesBackWhenTheCallEnds() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, _, supervisor) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.toolCall([.init(id: "c1", name: "start_job", arguments: ["instructions": "check the server"])]))
+        await settle(40)
+        current += 5
+        session.onEvent?(.inputTranscription("and another thing"))
+        supervisor.observe(.messageComplete(sessionId: "rt-1", messageId: nil, content: "All green.", reasoning: nil))
+        controller.deliverPendingJobUpdates()
+        XCTAssertEqual(controller.heldOutcomeCountForTesting, 1)
+        XCTAssertTrue(supervisor.jobs[0].outcomeDelivered)
+
+        controller.stop()
+        XCTAssertEqual(controller.heldOutcomeCountForTesting, 0)
+        XCTAssertFalse(supervisor.jobs[0].outcomeDelivered, "An unsaid result is reported again later")
+    }
+
+    func testGeminiLiveHeldJobResultGoesBackWhenTheConversationFails() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, _, supervisor) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.toolCall([.init(id: "c1", name: "start_job", arguments: ["instructions": "check the server"])]))
+        await settle(40)
+        current += 5
+        session.onEvent?(.inputTranscription("and another thing"))
+        supervisor.observe(.messageComplete(sessionId: "rt-1", messageId: nil, content: "All green.", reasoning: nil))
+        controller.deliverPendingJobUpdates()
+        XCTAssertEqual(controller.heldOutcomeCountForTesting, 1)
+
+        session.onStateChange?(.failed("Connection lost"))
+        XCTAssertFalse(controller.isActive)
+        XCTAssertEqual(controller.heldOutcomeCountForTesting, 0)
+        XCTAssertFalse(supervisor.jobs[0].outcomeDelivered, "An unsaid result is reported again later")
+    }
+
+    func testGeminiLiveHeldJobResultWhoseCallIsWithdrawnIsSaidAsText() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, _, supervisor) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.toolCall([.init(id: "c1", name: "start_job", arguments: ["instructions": "check the server"])]))
+        await settle(40)
+        current += 5
+        session.onEvent?(.inputTranscription("and another thing"))
+        supervisor.observe(.messageComplete(sessionId: "rt-1", messageId: nil, content: "All green.", reasoning: nil))
+        controller.deliverPendingJobUpdates()
+        session.onEvent?(.toolCallCancellation(["c1"]))
+        XCTAssertEqual(controller.heldOutcomeCountForTesting, 0)
+        XCTAssertEqual(controller.pendingTextTurnCountForTesting, 1)
+        XCTAssertTrue(supervisor.jobs[0].outcomeDelivered, "Spoken for while it waits")
+
+        // The call ends before it is said: the job reports it again later.
+        controller.stop()
+        XCTAssertFalse(supervisor.jobs[0].outcomeDelivered)
+    }
+
+    func testGeminiLiveTypedChatTurnGoesOutAsContextWithoutStartingATurn() async {
+        let (controller, session, _, _, supervisor) = makeGeminiController(clock: { Date(timeIntervalSince1970: 1_000) })
+        supervisor.liveThread = VoiceThreadTarget(runtimeSessionID: "rt-chat", storedSessionID: nil, title: "Build")
+        await controller.start()
+        session.becomeReady()
+
+        supervisor.observe(.messageComplete(sessionId: "rt-chat", messageId: nil, content: "Typed reply.", reasoning: nil))
+        controller.deliverPendingJobUpdates()
+        controller.flushPendingTextIfIdle()
+
+        let notes = session.sent.compactMap { $0["clientContent"] as? [String: Any] }
+        XCTAssertEqual(notes.count, 1)
+        XCTAssertEqual(notes.first?["turnComplete"] as? Bool, false)
+        XCTAssertTrue(session.textTurns.first?.contains("Typed reply.") == true)
+        XCTAssertEqual(controller.phase, .listening, "the model wasn't asked to speak")
+        XCTAssertEqual(controller.pendingTextTurnCountForTesting, 0)
+        controller.stop()
+    }
+
     func testGeminiLiveNewConversationStartsWithTheMicrophoneOpen() async {
         let (controller, session, input, _, _) = makeGeminiController(clock: Date.init)
         await controller.start()
@@ -826,6 +1459,52 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(session.sent.count, 2, "Muted audio is never sent")
         controller.stop()
     }
+
+    func testGeminiLiveHeadsetMuteGestureTogglesTheMicrophone() async {
+        let system = FakeSystemInputMute()
+        let (controller, session, input, _, _) = makeGeminiController(headsetMute: HeadsetMicrophoneMute(system: system), clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        XCTAssertTrue(input.running)
+
+        system.press(muted: true)
+        XCTAssertTrue(controller.isMicrophoneMuted)
+        XCTAssertFalse(input.running)
+        system.press(muted: false)
+        XCTAssertFalse(controller.isMicrophoneMuted)
+        XCTAssertTrue(input.running)
+
+        // A failed call lets go of the headset mute as well as a stopped one.
+        controller.setMicrophoneMuted(true)
+        session.onStateChange?(.failed("Connection lost"))
+        XCTAssertFalse(controller.isActive)
+        XCTAssertNil(system.handler)
+        XCTAssertEqual(system.muted, false)
+        controller.stop()
+    }
+
+    func testHeadsetMuteOnlyFollowsTheCallThatOwnsIt() {
+        let system = FakeSystemInputMute()
+        let headsetMute = HeadsetMicrophoneMute(system: system)
+        let first = NSObject(), second = NSObject()
+        var firstChanges: [Bool] = [], secondChanges: [Bool] = []
+        headsetMute.claim(by: first, muted: false) { firstChanges.append($0) }
+        headsetMute.claim(by: second, muted: true) { secondChanges.append($0) }
+        XCTAssertEqual(system.muted, true)
+
+        // The older call going idle can't take the newer call's handler.
+        headsetMute.release(by: first)
+        XCTAssertNotNil(system.handler)
+        XCTAssertEqual(system.muted, true)
+
+        system.press(muted: false)
+        XCTAssertEqual(firstChanges, [])
+        XCTAssertEqual(secondChanges, [false])
+
+        headsetMute.release(by: second)
+        XCTAssertNil(system.handler)
+        XCTAssertEqual(system.muted, false)
+    }
 }
 
 // MARK: - Preference
@@ -840,6 +1519,80 @@ extension ContinuousConversationPreferenceTests {
         enabled.geminiLiveEnabled = true
         let roundTrip = try JSONDecoder().decode(VoiceProfilePreferences.self, from: JSONEncoder().encode(enabled))
         XCTAssertTrue(roundTrip.geminiLiveEnabled)
+    }
+
+    func testSpeakerBargeInIsOffByDefaultAndRoundTrips() throws {
+        XCTAssertNil(VoiceProfilePreferences().liveVoiceSpeakerBargeIn)
+        let legacy = try JSONDecoder().decode(VoiceProfilePreferences.self, from: Data(#"{"geminiLiveEnabled":true}"#.utf8))
+        XCTAssertNil(legacy.liveVoiceSpeakerBargeIn)
+        var enabled = VoiceProfilePreferences()
+        enabled.liveVoiceSpeakerBargeIn = true
+        let roundTrip = try JSONDecoder().decode(VoiceProfilePreferences.self, from: JSONEncoder().encode(enabled))
+        XCTAssertEqual(roundTrip.liveVoiceSpeakerBargeIn, true)
+    }
+
+    func testLiveVoiceStyleRoundTripsAndAnUnknownToneKeepsTheModelsOwn() throws {
+        XCTAssertEqual(VoiceProfilePreferences().liveVoiceStyle, LiveVoiceStyle())
+        var chosen = VoiceProfilePreferences()
+        chosen.liveVoiceTone = .relaxed
+        chosen.liveVoiceBackchannels = false
+        chosen.liveVoiceGreeting = ""
+        chosen.liveVoiceAnswerLength = .detailed
+        chosen.liveVoiceAskBeforeSending = true
+        let roundTrip = try JSONDecoder().decode(VoiceProfilePreferences.self, from: JSONEncoder().encode(chosen))
+        XCTAssertEqual(roundTrip.liveVoiceStyle, LiveVoiceStyle(tone: .relaxed, backchannels: false, greeting: "", answerLength: .detailed, asksBeforeSending: true))
+        let newer = try JSONDecoder().decode(VoiceProfilePreferences.self, from: Data(#"{"liveVoiceTone":"sarcastic","liveVoiceGreeting":"Hi","liveVoiceAnswerLength":"rambling"}"#.utf8))
+        XCTAssertNil(newer.liveVoiceTone)
+        XCTAssertEqual(newer.liveVoiceGreeting, "Hi")
+        XCTAssertEqual(newer.liveVoiceStyle.answerLength, .standard, "an unknown length is Default")
+    }
+}
+
+// MARK: - Asking first (#451)
+
+@MainActor
+extension VoiceConversationControllerTests {
+    func testGeminiLiveAsksFirstUntilTheUsersYesAndSendItToHermesSkipsIt() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, _, supervisor) = makeGeminiController(clock: { current })
+        supervisor.beginLiveCall(asksBeforeSending: true)
+        await controller.start()
+        session.becomeReady()
+        func answer(_ id: String) -> [String: Any]? {
+            for message in session.sent {
+                let responses = (message["toolResponse"] as? [String: Any])?["functionResponses"] as? [[String: Any]]
+                if let response = responses?.first(where: { $0["id"] as? String == id }) {
+                    return response["response"] as? [String: Any]
+                }
+            }
+            return nil
+        }
+
+        // The request waits for the user's OK.
+        session.onEvent?(.inputTranscription("check the server"))
+        session.onEvent?(.toolCall([.init(id: "c1", name: "start_job", arguments: ["instructions": "check the server"])]))
+        await settle(until: { answer("c1") != nil })
+        XCTAssertEqual(answer("c1")?["status"] as? String, "waiting_for_ok")
+        XCTAssertTrue(supervisor.jobs.isEmpty)
+
+        // The user's yes, said after the question, sends it.
+        session.onEvent?(.turnComplete)
+        current += 4
+        session.onEvent?(.inputTranscription("yes"))
+        session.onEvent?(.toolCall([.init(id: "c2", name: "send_request", arguments: [:])]))
+        await settle(until: { supervisor.jobs.count == 1 })
+        XCTAssertEqual(supervisor.jobs.count, 1)
+
+        // "Send it to Hermes" with a request sends it without asking.
+        session.onEvent?(.turnComplete)
+        current += 4
+        session.onEvent?(.inputTranscription("send it"))
+        session.onEvent?(.inputTranscription(" to Hermes, check the router"))
+        session.onEvent?(.toolCall([.init(id: "c3", name: "start_job", arguments: ["instructions": "check the router"])]))
+        await settle(until: { supervisor.jobs.count == 2 })
+        XCTAssertEqual(supervisor.jobs.count, 2)
+        XCTAssertNil(answer("c3"), "running: its call stays open for the result")
+        controller.stop()
     }
 }
 
@@ -969,6 +1722,125 @@ extension VoiceConversationControllerTests {
         controller.stop()
     }
 
+    func testGeminiLiveKeepsTheMicOpenOnTheSpeakerWhenItsAudioCancelsEcho() async {
+        let (controller, session, input, output, _) = makeGeminiController(route: .speakerSafeHalfDuplex, clock: Date.init)
+        input.cancelsEcho = true
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        XCTAssertTrue(output.isPlaying)
+        XCTAssertFalse(controller.isMicrophoneGatedForSpeaker)
+        input.onChunk?(Data([1]))
+        XCTAssertEqual(session.sent.count, 1, "With echo cancellation the user can barge in on the speaker")
+        controller.stop()
+    }
+
+    func testLiveVoiceAudioChoosesEchoCancellationPerCallAndKeepsItForTheCall() throws {
+        var wantsEchoCancellation = false
+        var built: [String] = []
+        let standardInput = FakeGeminiLiveInput()
+        let standardOutput = FakeGeminiLiveOutput()
+        let echoInput = FakeGeminiLiveInput()
+        echoInput.cancelsEcho = true
+        let echoOutput = FakeGeminiLiveOutput()
+        let selector = LiveVoiceAudioSelector(
+            wantsEchoCancellation: { wantsEchoCancellation },
+            makeStandard: { built.append("standard"); return (standardInput, standardOutput) },
+            makeEchoCancelling: { built.append("echo"); return (echoInput, echoOutput) }
+        )
+        let input = selector.input
+        let output = selector.output
+        var chunks: [Data] = []
+        input.onChunk = { chunks.append($0) }
+        XCTAssertEqual(built, [], "Nothing is built before a call uses audio")
+
+        // A call with the setting off runs on the default audio.
+        try input.start()
+        XCTAssertTrue(standardInput.running)
+        XCTAssertFalse(input.cancelsEcho)
+        standardInput.onChunk?(Data([1]))
+        XCTAssertEqual(chunks, [Data([1])])
+        try output.play(Data([0, 0]), sampleRate: 24_000)
+        XCTAssertEqual(standardOutput.played, 1)
+
+        // Turned on mid-call (a mute and unmute included): the call keeps its audio.
+        wantsEchoCancellation = true
+        input.stop()
+        try input.start()
+        XCTAssertEqual(standardInput.starts, 2)
+        XCTAssertEqual(echoInput.starts, 0)
+        XCTAssertEqual(built, ["standard"])
+
+        // The next call uses echo cancellation.
+        input.stop()
+        output.stop()
+        try input.start()
+        XCTAssertTrue(echoInput.running)
+        XCTAssertTrue(input.cancelsEcho)
+        XCTAssertEqual(built, ["standard", "echo"])
+        echoInput.onChunk?(Data([2]))
+        XCTAssertEqual(chunks, [Data([1]), Data([2])])
+        try output.play(Data([0, 0]), sampleRate: 24_000)
+        XCTAssertTrue(output.isPlaying)
+        output.interrupt()
+        XCTAssertEqual(echoOutput.interrupts, 1)
+        input.stop()
+        output.stop()
+        XCTAssertFalse(input.cancelsEcho, "Between calls nothing is chosen")
+
+        // Turned off again: the default audio is reused, not rebuilt.
+        wantsEchoCancellation = false
+        try input.start()
+        XCTAssertEqual(standardInput.starts, 3)
+        XCTAssertEqual(built, ["standard", "echo"])
+        input.stop()
+        output.stop()
+    }
+
+    func testLiveVoiceAudioKeepsTheCallsChoiceThroughMutesAndInterruptions() throws {
+        var wantsEchoCancellation = false
+        let standardInput = FakeGeminiLiveInput()
+        let echoInput = FakeGeminiLiveInput()
+        let selector = LiveVoiceAudioSelector(
+            wantsEchoCancellation: { wantsEchoCancellation },
+            makeStandard: { (standardInput, FakeGeminiLiveOutput()) },
+            makeEchoCancelling: { (echoInput, FakeGeminiLiveOutput()) }
+        )
+        let input = selector.input
+        let output = selector.output
+        var interruptions = 0
+        input.onInterrupted = { interruptions += 1 }
+
+        // A microphone that never started holds no choice.
+        standardInput.startError = VoiceAudioError.noAudioCaptured
+        XCTAssertThrowsError(try input.start())
+        standardInput.startError = nil
+        wantsEchoCancellation = true
+        try input.start()
+        XCTAssertEqual(echoInput.starts, 1)
+
+        // Muted before the model said anything, then unmuted: same call, same audio.
+        wantsEchoCancellation = false
+        input.stop()
+        try input.start()
+        XCTAssertEqual(echoInput.starts, 2)
+        XCTAssertEqual(standardInput.starts, 0)
+
+        // An interruption reaches the controller; the restart stays on the call's audio.
+        echoInput.onInterrupted?()
+        XCTAssertEqual(interruptions, 1)
+        try input.start()
+        XCTAssertEqual(echoInput.starts, 3)
+
+        // The call ends: the next one chooses again.
+        input.stop()
+        output.stop()
+        try input.start()
+        XCTAssertEqual(standardInput.starts, 1)
+        input.stop()
+        output.stop()
+    }
+
     func testGeminiLivePromptsAnAcknowledgementOnlyWhenTheModelStayedSilent() async {
         var current = Date(timeIntervalSince1970: 1_000)
         let (controller, session, _, _, _) = makeGeminiController(clock: { current })
@@ -1067,8 +1939,10 @@ extension VoiceConversationControllerTests {
         XCTAssertTrue(session.sent.isEmpty, "Nothing can go out while reconnecting")
         XCTAssertFalse(supervisor.jobs[0].outcomeDelivered, "The outcome must not be marked delivered unsent")
 
-        // Back on a (same-connection) ready session: answered on the call.
+        // Back on a (same-connection) ready session: answered on the call,
+        // once the conversation is quiet.
         session.becomeReady()
+        controller.flushPendingTextIfIdle()
         let response = session.sent.compactMap { ($0["toolResponse"] as? [String: Any])?["functionResponses"] as? [[String: Any]] }.first?.first
         XCTAssertEqual(response?["id"] as? String, "c1")
         XCTAssertEqual((response?["response"] as? [String: Any])?["result"] as? String, "All green.")
@@ -1163,6 +2037,144 @@ extension VoiceConversationControllerTests {
         try? await Task.sleep(for: .milliseconds(700))
         XCTAssertTrue(input.running, "Capture comes back after the interruption")
         XCTAssertEqual(input.starts, 2)
+        XCTAssertEqual(controller.phase, .listening)
+        controller.stop()
+    }
+
+    /// #376: an alarm (or a phone call) holds the audio for longer than
+    /// the early retry. The call pauses and carries on when it ends,
+    /// instead of failing the moment the microphone can't come back.
+    func testGeminiLiveAlarmPausesTheCallAndResumesWhenItEnds() async {
+        struct AlarmRinging: Error {}
+        let center = NotificationCenter()
+        let (controller, session, input, output, _) = makeGeminiController(notificationCenter: center, clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        XCTAssertEqual(controller.phase, .speaking)
+
+        input.startError = AlarmRinging()
+        input.stop()
+        input.onInterrupted?()
+        XCTAssertEqual(controller.phase, .paused)
+        XCTAssertGreaterThan(output.interrupts, 0, "Speech nobody can hear stops")
+        XCTAssertEqual((session.sent.last?["realtimeInput"] as? [String: Any])?["audioStreamEnd"] as? Bool, true)
+        try? await Task.sleep(for: .milliseconds(700))
+        XCTAssertEqual(controller.phase, .paused, "A microphone that can't start yet keeps the call paused, not failed")
+        XCTAssertTrue(controller.isActive)
+        XCTAssertEqual(session.stopped, 0, "The connection stays up")
+
+        let played = output.played
+        session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        XCTAssertEqual(output.played, played, "Nothing plays while paused")
+        XCTAssertEqual(controller.phase, .paused)
+
+        input.startError = nil
+        center.post(
+            name: AVAudioSession.interruptionNotification,
+            object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue]
+        )
+        for _ in 0..<50 where controller.phase == .paused { await settle() }
+        XCTAssertEqual(controller.phase, .listening, "The call carries on once the alarm stops")
+        XCTAssertTrue(input.running)
+        XCTAssertFalse(controller.isAudioPausedForTesting)
+        controller.stop()
+    }
+
+    func testGeminiLiveMutedPausedCallWaitsForTheSystemBeforeListeningAgain() async {
+        struct AlarmRinging: Error {}
+        let center = NotificationCenter()
+        let (controller, session, input, _, _) = makeGeminiController(notificationCenter: center, clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        input.startError = AlarmRinging()
+        input.stop()
+        input.onInterrupted?()
+        controller.setMicrophoneMuted(true)
+        let ends = session.sent.filter { ($0["realtimeInput"] as? [String: Any])?["audioStreamEnd"] != nil }.count
+        XCTAssertEqual(ends, 1, "The pause already ended the user's turn")
+
+        // A muted call has no microphone to prove the audio is back.
+        session.becomeReady()
+        XCTAssertEqual(controller.phase, .paused)
+
+        center.post(
+            name: AVAudioSession.interruptionNotification,
+            object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue]
+        )
+        for _ in 0..<50 where controller.phase == .paused { await settle() }
+        XCTAssertEqual(controller.phase, .listening)
+        XCTAssertTrue(controller.isMicrophoneMuted)
+        controller.stop()
+    }
+
+    func testGeminiLiveUnmutingWhileAnAlarmHoldsTheAudioPausesInsteadOfFailing() async {
+        struct AlarmRinging: Error {}
+        let center = NotificationCenter()
+        let (controller, session, input, _, _) = makeGeminiController(notificationCenter: center, clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        controller.setMicrophoneMuted(true)
+        // The alarm rings while muted, then the user unmutes.
+        input.startError = AlarmRinging()
+        controller.setMicrophoneMuted(false)
+        XCTAssertEqual(controller.phase, .paused)
+        XCTAssertTrue(controller.isActive)
+
+        input.startError = nil
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        for _ in 0..<50 where controller.phase == .paused { await settle() }
+        XCTAssertEqual(controller.phase, .listening)
+        XCTAssertTrue(input.running)
+        controller.stop()
+    }
+
+    func testGeminiLiveAlarmRingingWhileConnectingPausesTheNewCall() async {
+        struct AlarmRinging: Error {}
+        let center = NotificationCenter()
+        let (controller, session, input, _, _) = makeGeminiController(notificationCenter: center, clock: Date.init)
+        await controller.start()
+        input.startError = AlarmRinging()
+        session.becomeReady()
+        XCTAssertEqual(controller.phase, .paused, "A microphone held by an alarm pauses the call, it doesn't fail it")
+        XCTAssertEqual(session.stopped, 0)
+
+        input.startError = nil
+        center.post(
+            name: AVAudioSession.interruptionNotification,
+            object: nil,
+            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue]
+        )
+        for _ in 0..<50 where controller.phase == .paused { await settle() }
+        XCTAssertEqual(controller.phase, .listening)
+        XCTAssertTrue(input.running)
+        controller.stop()
+    }
+
+    func testGeminiLivePausedCallSurvivesAReconnectAndResumesWhenTheAppComesBack() async {
+        struct CallInProgress: Error {}
+        let center = NotificationCenter()
+        let (controller, session, input, _, _) = makeGeminiController(notificationCenter: center, clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        input.startError = CallInProgress()
+        input.stop()
+        input.onInterrupted?()
+        XCTAssertEqual(controller.phase, .paused)
+
+        // The connection drops and comes back while the phone call goes on.
+        session.onStateChange?(.reconnecting)
+        session.becomeReady()
+        XCTAssertEqual(controller.phase, .paused, "A reconnect during the pause doesn't fail the call")
+
+        // No interruption end arrives; the user comes back to the app.
+        input.startError = nil
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        for _ in 0..<50 where controller.phase == .paused { await settle() }
+        XCTAssertEqual(controller.phase, .listening)
+        XCTAssertTrue(input.running)
         controller.stop()
     }
 }
@@ -1234,7 +2246,7 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(roundTrip.geminiLiveSearch, .hermes)
     }
 
-    func testGeminiLiveHermesSearchDeclaresABlockingWebSearchInsteadOfGoogleSearch() throws {
+    func testGeminiLiveHermesSearchDeclaresANonBlockingWebSearchInsteadOfGoogleSearch() throws {
         let declarations = GeminiLiveToolBridge.declarations(webSearch: true)
         let setup = try XCTUnwrap(GeminiLiveProtocol.setupMessage(
             systemInstruction: GeminiLiveConversationController.instructions(search: .hermes),
@@ -1245,11 +2257,30 @@ extension HermesVoiceGatewayTimeoutTests {
         let tools = try XCTUnwrap(setup["tools"] as? [[String: Any]])
         XCTAssertFalse(tools.contains { $0["googleSearch"] != nil })
         let functions = try XCTUnwrap(tools.first?["functionDeclarations"] as? [[String: Any]])
-        XCTAssertEqual(functions.first { $0["name"] as? String == "web_search" }?["behavior"] as? String, "BLOCKING")
+        XCTAssertEqual(functions.first { $0["name"] as? String == "web_search" }?["behavior"] as? String, "NON_BLOCKING", "A BLOCKING lookup stalls the user's transcript and the model's filler")
         XCTAssertFalse(GeminiLiveToolBridge.declarations(webSearch: false).contains { $0.name == "web_search" })
         XCTAssertTrue(GeminiLiveConversationController.instructions(search: .hermes).contains("web_search"))
         XCTAssertTrue(GeminiLiveConversationController.instructions(search: .google).contains("Google Search"))
         XCTAssertFalse(GeminiLiveConversationController.instructions(search: .none).contains("Google Search"))
+    }
+
+    func testGeminiLiveLookupRuleAsksForOneVariedHeadsUpAndAnAnswerFirstTurn() throws {
+        // The answer comes back as a turn of its own after the call's turn
+        // ended; told only "first say 'Let me check.'", the model opened
+        // that turn with the same words again.
+        let rules = GeminiLiveConversationController.instructions(search: .hermes)
+        XCTAssertFalse(rules.contains("like \"Let me check.\""), "a single example gets copied word for word every time")
+        XCTAssertTrue(rules.contains("different each time"))
+        XCTAssertTrue(rules.contains("Say that only once per lookup"))
+        XCTAssertTrue(rules.contains("that turn opens straight with the answer, never with another \"let me check\""))
+
+        // The same reminder rides on the result itself, next to the answer,
+        // and on the text update that replaces a lost call.
+        let noRepeat = "don't say again that you're checking or looking it up"
+        XCTAssertTrue(GeminiLiveToolBridge.lookupAnswerNote.contains(noRepeat))
+        XCTAssertFalse(GeminiLiveToolBridge.lookupAnswerNote.contains("what this lookup returned"), "a failed lookup returned no answer to start with")
+        let lost = try XCTUnwrap(GeminiLiveConversationController.lookupFallbackText(for: ["results": "1. Sunny, 21°C"]))
+        XCTAssertTrue(lost.contains(noRepeat))
     }
 
     func testGeminiLiveSessionWithoutGoogleSearchNeverAsksForIt() async throws {
@@ -1274,7 +2305,7 @@ extension HermesVoiceGatewayTimeoutTests {
 
         // With no Search to drop, a spent quota is final.
         try XCTUnwrap(sockets.first).serverClose(.init(code: 1011, reason: "You exceeded your current quota, please check your plan and billing details."))
-        await settle(80)
+        await settle(until: { session.state.isFailed })
         XCTAssertEqual(sockets.count, 1)
         guard case .failed = session.state else { return XCTFail("Expected failed, got \(session.state)") }
     }
@@ -1295,8 +2326,11 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(answer, [.toolResponse(
             id: "s1",
             name: "web_search",
-            result: ["results": "1. Toronto weather: Sunny, 21°C (https://example.com/w)\n2. Forecast: Rain tomorrow (https://example.com/f)"],
-            scheduling: nil
+            result: [
+                "results": "1. Toronto weather: Sunny, 21°C (https://example.com/w)\n2. Forecast: Rain tomorrow (https://example.com/f)",
+                "note": GeminiLiveToolBridge.lookupAnswerNote,
+            ],
+            scheduling: .whenIdle
         )])
     }
 
@@ -1310,14 +2344,15 @@ extension HermesVoiceGatewayTimeoutTests {
         let failed = await bridge.handle(.init(id: "s1", name: "web_search", arguments: ["query": "news"]))
         guard case .toolResponse(_, _, let result, let scheduling) = failed.first else { return XCTFail("Expected a response") }
         XCTAssertNotNil(result["error"])
-        XCTAssertNil(scheduling)
+        XCTAssertEqual(result["note"], GeminiLiveToolBridge.lookupAnswerNote)
+        XCTAssertEqual(scheduling, .whenIdle)
 
         let empty = await bridge.handle(.init(id: "s2", name: "web_search", arguments: [:]))
-        XCTAssertEqual(empty, [.toolResponse(id: "s2", name: "web_search", result: ["error": "query is required"], scheduling: nil)])
+        XCTAssertEqual(empty, [.toolResponse(id: "s2", name: "web_search", result: ["error": "query is required", "note": GeminiLiveToolBridge.lookupAnswerNote], scheduling: .whenIdle)])
         XCTAssertEqual(search.queries, ["news"])
 
         let unwired = await GeminiLiveToolBridge(supervisor: supervisor).handle(.init(id: "s3", name: "web_search", arguments: ["query": "news"]))
-        XCTAssertEqual(unwired, [.toolResponse(id: "s3", name: "web_search", result: ["error": "web search is not available"], scheduling: nil)])
+        XCTAssertEqual(unwired, [.toolResponse(id: "s3", name: "web_search", result: ["error": "web search is not available", "note": GeminiLiveToolBridge.lookupAnswerNote], scheduling: .whenIdle)])
     }
 
     func testGeminiLiveWebSearchClientParsesResultsAndRequestsTheProfilesBackend() async throws {
@@ -1358,18 +2393,18 @@ extension HermesVoiceGatewayTimeoutTests {
 
         let answer = await bridge.handle(.init(id: "m1", name: "recall_memory", arguments: ["query": " marathon "]))
         XCTAssertEqual(memory.queries, ["marathon"])
-        XCTAssertEqual(answer, [.toolResponse(id: "m1", name: "recall_memory", result: ["results": "The user is training for a marathon in May."], scheduling: nil)])
+        XCTAssertEqual(answer, [.toolResponse(id: "m1", name: "recall_memory", result: ["results": "The user is training for a marathon in May."], scheduling: .whenIdle)])
 
         memory.results = ""
         let nothing = await bridge.handle(.init(id: "m2", name: "recall_memory", arguments: ["query": "cats"]))
-        XCTAssertEqual(nothing, [.toolResponse(id: "m2", name: "recall_memory", result: ["results": "Nothing in memory about that."], scheduling: nil)])
+        XCTAssertEqual(nothing, [.toolResponse(id: "m2", name: "recall_memory", result: ["results": "Nothing in memory about that."], scheduling: .whenIdle)])
 
         memory.error = GeminiLiveMemoryError(reason: "The memory backend failed")
         let failed = await bridge.handle(.init(id: "m3", name: "recall_memory", arguments: ["query": "cats"]))
-        XCTAssertEqual(failed, [.toolResponse(id: "m3", name: "recall_memory", result: ["error": "The memory backend failed"], scheduling: nil)])
+        XCTAssertEqual(failed, [.toolResponse(id: "m3", name: "recall_memory", result: ["error": "The memory backend failed"], scheduling: .whenIdle)])
 
         let unwired = await GeminiLiveToolBridge(supervisor: supervisor).handle(.init(id: "m4", name: "recall_memory", arguments: ["query": "cats"]))
-        XCTAssertEqual(unwired, [.toolResponse(id: "m4", name: "recall_memory", result: ["error": "Hermes memory is not available"], scheduling: nil)])
+        XCTAssertEqual(unwired, [.toolResponse(id: "m4", name: "recall_memory", result: ["error": "Hermes memory is not available"], scheduling: .whenIdle)])
     }
 
     func testGeminiLiveMemoryClientReadsTheProfilesContextAndRecall() async throws {
@@ -1655,6 +2690,29 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(closed.count, 1)
     }
 
+    func testGeminiLivePublishesEachLineOnceItFinishes() async {
+        let (controller, session, _, _, _) = makeGeminiController(endPhrases: [], clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+
+        session.onEvent?(.inputTranscription("What's the"))
+        session.onEvent?(.inputTranscription(" weather?"))
+        XCTAssertNil(controller.finishedTurn, "the user may still be talking")
+        session.onEvent?(.outputTranscription("Sunny"))
+        XCTAssertEqual(controller.finishedTurn?.speaker, .user, "the reply starting finishes the question")
+        XCTAssertEqual(controller.finishedTurn?.text, "What's the weather?")
+        session.onEvent?(.outputTranscription(" all day."))
+        XCTAssertEqual(controller.finishedTurn?.speaker, .user, "the reply is still streaming")
+        session.onEvent?(.turnComplete)
+        XCTAssertEqual(controller.finishedTurn?.speaker, .assistant, "the last reply of a call is read too")
+        XCTAssertEqual(controller.finishedTurn?.text, "Sunny all day.")
+        controller.stop()
+
+        await controller.start()
+        XCTAssertNil(controller.finishedTurn, "a new call starts with nothing to announce")
+        controller.stop()
+    }
+
     func testGeminiLiveGoodbyeTranscriptThatArrivesAfterTheReplyStillEnds() async {
         let (controller, session, input, output, _) = makeGeminiController(endPhrases: ["goodbye"], clock: Date.init)
         let closed = EndCounter()
@@ -1692,6 +2750,122 @@ extension VoiceConversationControllerTests {
         session.onEvent?(.inputTranscription("By"))
         try? await Task.sleep(for: .milliseconds(200))
         XCTAssertFalse(controller.isEnding, "an unfinished utterance is never an end")
+        controller.stop()
+    }
+
+    /// Grok spoke "<tool_call>…" aloud instead of calling the tool: the
+    /// speech stops, the markup never reaches the transcript, and the model
+    /// is told nothing ran once its turn is over.
+    func testLiveCallCutsOffToolMarkupSpokenAsText() async {
+        var current = Date(timeIntervalSince1970: 1_000)
+        let (controller, session, _, output, _) = makeGeminiController(clock: { current })
+        await controller.start()
+        session.becomeReady()
+
+        session.onEvent?(.inputTranscription("Check the server."))
+        session.onEvent?(.audio(Data([0, 0]), sampleRate: 24_000))
+        session.onEvent?(.outputTranscription("Sure, I'll queue that. <tool"))
+        XCTAssertEqual(output.interrupts, 0, "not markup yet")
+        session.onEvent?(.outputTranscription(#"_call>{"name":"start_job","arguments":{"instructions":"dummy task"}}"#))
+        XCTAssertEqual(output.interrupts, 1, "the speech stops at the markup")
+        session.onEvent?(.outputTranscription("</tool_call> Done!"))
+        let reply = controller.transcript.last(where: { $0.speaker == .assistant })?.text
+        XCTAssertEqual(reply, "Sure, I'll queue that.")
+        XCTAssertFalse(controller.transcript.contains { $0.text.contains("dummy task") || $0.text.contains("Done!") })
+        XCTAssertTrue(session.textTurns.isEmpty, "nothing is sent mid-turn")
+
+        session.onEvent?(.turnComplete)
+        current += 5
+        controller.flushPendingTextIfIdle()
+        XCTAssertEqual(session.textTurns, [GeminiLiveConversationController.spokenToolMarkupPrompt])
+        controller.stop()
+    }
+
+    func testLiveCallLineThatIsOnlyToolMarkupLeavesNoBlankLine() async {
+        let (controller, session, _, output, _) = makeGeminiController(clock: { Date(timeIntervalSince1970: 1_000) })
+        await controller.start()
+        session.becomeReady()
+
+        session.onEvent?(.inputTranscription("Check the server."))
+        session.onEvent?(.outputTranscription(#"<tool_call>{"name":"list_jobs"}"#))
+        XCTAssertEqual(output.interrupts, 1)
+        XCTAssertFalse(controller.transcript.contains { $0.speaker == .assistant }, "no empty assistant line")
+        session.onEvent?(.turnComplete)
+        XCTAssertFalse(controller.transcript.contains { $0.speaker == .assistant })
+        controller.stop()
+    }
+
+    func testSpokenToolMarkupIsFoundAnywhereInALine() {
+        XCTAssertNotNil(GeminiLiveConversationController.spokenToolMarkupStart(in: "ok <TOOL_CALL>list_jobs"))
+        XCTAssertNotNil(GeminiLiveConversationController.spokenToolMarkupStart(in: "<function_call name=start_job>"))
+        XCTAssertNil(GeminiLiveConversationController.spokenToolMarkupStart(in: "I'll call the tool shop for you."))
+        XCTAssertNil(GeminiLiveConversationController.spokenToolMarkupStart(in: "Use a < b, then tool calls."))
+    }
+
+    func testToolCallWithUnreadableArgumentsStartsNothingAndSaysWhy() async {
+        let fake = FakeVoiceJobBackend()
+        let supervisor = VoiceBackgroundJobSupervisor(backend: fake.backend, pollInterval: .seconds(3_600))
+        let bridge = GeminiLiveToolBridge(supervisor: supervisor, holdsJobCalls: false)
+        let call = GeminiLiveProtocol.FunctionCall(id: "c1", name: "start_job", arguments: [GeminiLiveProtocol.FunctionCall.invalidArgumentsKey: "true"])
+        let outgoing = await bridge.handle(call)
+        XCTAssertTrue(fake.submissions.isEmpty)
+        XCTAssertEqual(outgoing, [.toolResponse(id: "c1", name: "start_job", result: ["error": GeminiLiveToolBridge.invalidArgumentsError("start_job")], scheduling: .whenIdle)])
+        XCTAssertEqual(GeminiLiveConversationController.traceStatus(of: outgoing, answering: "c1"), "error")
+    }
+
+    func testLiveCallTraceKeepsStepsWithoutContent() {
+        let trace = LiveCallTrace()
+        XCTAssertNil(trace.report)
+        trace.note("before any call")
+        XCTAssertNil(trace.report, "nothing is kept before a call starts")
+        let start = Date(timeIntervalSince1970: 1_000)
+        trace.begin("Grok Live", at: start)
+        trace.note("Function call start_job", at: start + 2.5)
+        XCTAssertEqual(trace.report, "Last Grok Live call: tool steps\n+0.0s Starting call\n+2.5s Function call start_job")
+        for index in 0..<LiveCallTrace.maximumSteps { trace.note("step \(index)", at: start + 3) }
+        XCTAssertEqual(trace.steps.count, LiveCallTrace.maximumSteps)
+        XCTAssertTrue(trace.report?.hasSuffix("… 2 more steps not kept") == true)
+    }
+
+    func testGeminiLiveAskingToHangUpEndsTheCall() async {
+        let (controller, session, _, _, _) = makeGeminiController(endPhrases: ["goodbye"], clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+
+        // Not in the end phrases, but asking to hang up all the same.
+        session.onEvent?(.inputTranscription("Okay, end call."))
+        session.onEvent?(.outputTranscription("Talk soon!"))
+        session.onEvent?(.turnComplete)
+        XCTAssertTrue(controller.isEnding)
+        controller.stop()
+    }
+
+    func testGeminiLiveEmptiedEndPhrasesKeepHangUpRequestsFromEnding() async {
+        let (controller, session, _, _, _) = makeGeminiController(endPhrases: [], clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+
+        session.onEvent?(.inputTranscription("End call."))
+        session.onEvent?(.outputTranscription("Sure."))
+        session.onEvent?(.turnComplete)
+        XCTAssertFalse(controller.isEnding, "an emptied list turns ending by voice off")
+        controller.stop()
+    }
+
+    func testGrokLiveUnpunctuatedLateGoodbyeStillEnds() async {
+        let (controller, session, _, _, _) = makeGeminiController(endPhrases: ["bye"], clock: Date.init)
+        session.transcribesWholeUtterances = true
+        controller.lateEndPhraseDelay = 0.01
+        await controller.start()
+        session.becomeReady()
+
+        // xAI's transcript of the whole utterance lands after the reply,
+        // with no punctuation.
+        session.onEvent?(.outputTranscription("Bye!"))
+        session.onEvent?(.turnComplete)
+        session.onEvent?(.inputTranscription("bye"))
+        try? await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(controller.isEnding)
         controller.stop()
     }
 
@@ -1890,6 +3064,40 @@ extension VoiceConversationControllerTests {
         controller.stop()
     }
 
+    func testGeminiLiveWithdrawnLookupIsNotAnswered() async {
+        let search = ParkedGeminiLiveWebSearch()
+        let (controller, session, _, _, _) = makeGeminiController(webSearch: search, clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.toolCall([.init(id: "s1", name: "web_search", arguments: ["query": "weather"])]))
+        await settle(40)
+        // The user spoke over the lookup and the model withdrew the call.
+        session.onEvent?(.toolCallCancellation(["s1"]))
+        search.finish([GeminiLiveWebResult(title: "Toronto", url: "https://example.com", snippet: "Sunny")])
+        await settle(40)
+
+        XCTAssertTrue(session.sent.allSatisfy { $0["toolResponse"] == nil }, "A withdrawn call gets no answer")
+        XCTAssertEqual(controller.pendingTextTurnCountForTesting, 0)
+        controller.stop()
+    }
+
+    func testGeminiLiveWithdrawalOfAFinishedCallDoesNotSilenceLaterCalls() async {
+        let search = ParkedGeminiLiveWebSearch()
+        let (controller, session, _, _, _) = makeGeminiController(webSearch: search, clock: Date.init)
+        await controller.start()
+        session.becomeReady()
+        // A late withdrawal of a call that was already answered is ignored.
+        session.onEvent?(.toolCallCancellation(["s1"]))
+        session.onEvent?(.toolCall([.init(id: "s1", name: "web_search", arguments: ["query": "weather"])]))
+        await settle(40)
+        search.finish([GeminiLiveWebResult(title: "Toronto", url: "https://example.com", snippet: "Sunny")])
+        await settle(40)
+
+        let response = session.sent.compactMap { ($0["toolResponse"] as? [String: Any])?["functionResponses"] as? [[String: Any]] }.first?.first
+        XCTAssertEqual(response?["id"] as? String, "s1")
+        controller.stop()
+    }
+
     func testGeminiLiveLookupOnTheSameConnectionIsAnsweredOnItsCall() async {
         let search = ParkedGeminiLiveWebSearch()
         let (controller, session, _, _, _) = makeGeminiController(webSearch: search, clock: Date.init)
@@ -1902,6 +3110,8 @@ extension VoiceConversationControllerTests {
 
         let response = session.sent.compactMap { ($0["toolResponse"] as? [String: Any])?["functionResponses"] as? [[String: Any]] }.first?.first
         XCTAssertEqual(response?["id"] as? String, "s1")
+        let answer = response?["response"] as? [String: Any]
+        XCTAssertEqual(answer?["note"] as? String, GeminiLiveToolBridge.lookupAnswerNote, "the answer turn is told not to say it's checking again")
         XCTAssertEqual(controller.pendingTextTurnCountForTesting, 0)
         controller.stop()
     }

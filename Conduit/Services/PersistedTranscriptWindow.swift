@@ -15,9 +15,13 @@ enum PersistedTranscriptPagination {
     /// from the NEWEST persisted row and still returns the selected page in
     /// chronological order. `include_compacted=true` keeps compaction-
     /// preserved display rows reachable; without them the transcript
-    /// silently ends at the compaction boundary.
+    /// silently ends at the compaction boundary. `inline_images=false`
+    /// leaves out the copy of every picture Hermes stores inside a message
+    /// (#652: 16 MB for one chat), writing an `[image]` stand-in instead;
+    /// a picture is fetched on its own when its bubble shows. A Hermes
+    /// without the flag ignores it.
     static func tailQuery(offset: Int) -> String {
-        "?limit=\(pageSize)&offset=\(offset)&order=latest&include_compacted=true"
+        "?limit=\(pageSize)&offset=\(offset)&order=latest&include_compacted=true&inline_images=false"
     }
 
     /// Legacy one-shot request: no paging parameters. Older Hermes builds
@@ -138,7 +142,7 @@ struct LegacyTranscriptOversizedError: LocalizedError {
     let limit: Int
 
     var errorDescription: String? {
-        "This conversation is too large to load safely with this Hermes version. Update Hermes to enable paginated conversation history."
+        AppLocalization.string("This conversation is too large to load safely with this Hermes version. Update Hermes to enable paginated conversation history.")
     }
 }
 

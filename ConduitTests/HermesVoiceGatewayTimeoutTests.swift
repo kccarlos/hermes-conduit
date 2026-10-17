@@ -19,6 +19,27 @@ final class HermesVoiceGatewayTimeoutTests: XCTestCase {
         XCTAssertEqual(HermesVoiceGateway.transcriptionTimeoutMillisecondsPerDataURLCharacter, 0.1)
     }
 
+    /// Hermes's own Edge TTS error, as build 208 showed it on the call screen.
+    private static let edgeRefusal = "TTS chunk 1 failed (edge): TTS generation failed (edge): 403, message='Invalid response status', url='wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId=a597e9a3&Sec-MS-GEC=65458096&Sec-MS-GEC-Version=1-143.0.3650.75'"
+
+    func testEdgeRefusalSaysToUpdateEdgeTTSWithoutTheURL() {
+        let message = HermesSpeechFailure.message(Self.edgeRefusal)
+        XCTAssertTrue(message.contains("pip install -U edge-tts"), message)
+        XCTAssertFalse(message.contains("TrustedClientToken"))
+        XCTAssertFalse(message.contains("bing.com"))
+    }
+
+    func testOtherSpeechErrorsLoseLinksAndTokens() {
+        let message = HermesSpeechFailure.message("TTS generation failed (openai): 500, message='Server error', url='https://api.example.com/v1/audio?key=secret'")
+        XCTAssertEqual(message, "TTS generation failed (openai): 500, message='Server error'")
+        XCTAssertEqual(HermesSpeechFailure.message("Fetch https://host/x?token=abc failed"), "Fetch failed")
+        XCTAssertEqual(HermesSpeechFailure.message("No voice configured"), "No voice configured")
+        XCTAssertEqual(HermesSpeechFailure.message("bad data_url='x'"), "bad data_url='x'")
+        XCTAssertEqual(HermesSpeechFailure.message("TTS generation failed (edge): timeout after 4030 ms"), "TTS generation failed (edge): timeout after 4030 ms")
+        XCTAssertEqual(HermesSpeechFailure.message("TTS generation failed (edge): timeout after 403 ms"), "TTS generation failed (edge): timeout after 403 ms")
+        XCTAssertNotEqual(HermesSpeechFailure.message("TTS failed (edge): HTTP 401 Unauthorized"), "TTS failed (edge): HTTP 401 Unauthorized")
+    }
+
     func testShortRecordingsGetAtLeastTheNewMinimum() {
         // A typical 10s clip (16kHz mono 16-bit ≈ 320KB → ~427k base64
         // characters) would budget ~43s from the payload alone, but the 180s
@@ -167,6 +188,53 @@ final class HermesVoiceGatewayTimeoutTests: XCTestCase {
         XCTAssertEqual(socket.sendCount, 0)
         XCTAssertNil(recorder.fallbackText)
     }
+
+    // MARK: - Finish idle timeout (#303)
+    //
+    // Read Aloud sends a whole reply and finishes at once, so a long reply is
+    // synthesized entirely after finish(). The timeout is an idle window that
+    // every frame re-arms, never a total deadline.
+
+    func testLongStreamPastTheIdleWindowCompletes() async throws {
+        let socket = ScriptedSpeechSocket()
+        let recorder = SpeechStreamRecorder()
+        let stream = recorder.makeStream(socket: socket, finishIdleTimeout: .seconds(2))
+
+        try await stream.append("A long reply")
+        let feeder = Task {
+            // ~2.5s of frames, each gap a fortieth of the 2s window, so a
+            // shared runner stalling for most of a second still re-arms it.
+            for _ in 0..<50 {
+                try? await Task.sleep(for: .milliseconds(50))
+                socket.deliver(.data(Data(count: 4)))
+            }
+            socket.deliver(.string(#"{"type":"end"}"#))
+        }
+        let streamed = try await stream.finish()
+        await feeder.value
+
+        XCTAssertTrue(streamed)
+        XCTAssertEqual(recorder.pcmChunks, 50)
+    }
+
+    func testStreamSilentForTheIdleWindowTimesOut() async throws {
+        let socket = ScriptedSpeechSocket()
+        let recorder = SpeechStreamRecorder()
+        let stream = recorder.makeStream(socket: socket, finishIdleTimeout: .milliseconds(200))
+
+        try await stream.append("Hello")
+        socket.deliver(.data(Data(count: 4)))
+        for _ in 0..<1_000 where !recorder.receivedPCM { await Task.yield() }
+        XCTAssertTrue(recorder.receivedPCM)
+
+        do {
+            _ = try await stream.finish()
+            XCTFail("a stream that goes silent after audio must time out")
+        } catch {
+            XCTAssertFalse(error is CancellationError)
+        }
+        stream.cancel()
+    }
 }
 
 // MARK: - Speech stream test doubles
@@ -220,21 +288,81 @@ private final class FakeSpeechSocket: HermesSpeechSocket, @unchecked Sendable {
     }
 }
 
+private enum ScriptedReceive {
+    case message(URLSessionWebSocketTask.Message)
+    case cancelled
+    case park
+}
+
+/// A healthy speak-stream socket: sends succeed, and receive hands out
+/// whatever the test delivers, in order, parking until the next delivery.
+private final class ScriptedSpeechSocket: HermesSpeechSocket, @unchecked Sendable {
+    private let lock = NSLock()
+    private var queued: [URLSessionWebSocketTask.Message] = []
+    private var cancelled = false
+    private var parked: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+
+    func deliver(_ message: URLSessionWebSocketTask.Message) {
+        let waiting: CheckedContinuation<URLSessionWebSocketTask.Message, Error>? = lock.withLock {
+            if let parked {
+                self.parked = nil
+                return parked
+            }
+            queued.append(message)
+            return nil
+        }
+        waiting?.resume(returning: message)
+    }
+
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {}
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        try await withCheckedThrowingContinuation { continuation in
+            let next: ScriptedReceive = lock.withLock {
+                if !queued.isEmpty { return .message(queued.removeFirst()) }
+                if cancelled { return .cancelled }
+                parked = continuation
+                return .park
+            }
+            switch next {
+            case .message(let message): continuation.resume(returning: message)
+            case .cancelled: continuation.resume(throwing: URLError(.cancelled))
+            case .park: break
+            }
+        }
+    }
+
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        let waiting: CheckedContinuation<URLSessionWebSocketTask.Message, Error>? = lock.withLock {
+            cancelled = true
+            let waiting = parked
+            parked = nil
+            return waiting
+        }
+        waiting?.resume(throwing: URLError(.cancelled))
+    }
+}
+
 @MainActor
 private final class SpeechStreamRecorder {
     var fallbackText: String?
     var encodedAudio: Data?
     var receivedPCM = false
+    var pcmChunks = 0
 
-    func makeStream(socket: FakeSpeechSocket) -> HermesSpeechStream {
+    func makeStream(socket: any HermesSpeechSocket, finishIdleTimeout: Duration = .seconds(20)) -> HermesSpeechStream {
         HermesSpeechStream(
             task: socket,
+            finishIdleTimeout: finishIdleTimeout,
             fallback: { [weak self] text in
                 self?.fallbackText = text
                 return Data([1, 2, 3])
             },
             onStart: { _ in },
-            onPCM16: { [weak self] _, _ in self?.receivedPCM = true },
+            onPCM16: { [weak self] _, _ in
+                self?.receivedPCM = true
+                self?.pcmChunks += 1
+            },
             onEncodedAudio: { [weak self] data in self?.encodedAudio = data }
         )
     }

@@ -35,7 +35,7 @@ final class HermesVoiceConfigurationServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.sttProviders.map(\.descriptor.id), ["stepfun", "xiaomi_mimo"])
     }
 
-    func testCredentialMetadataDoesNotCarryRedactedOrSecretValue() {
+    func testCredentialMetadataDropsAValueThatIsNotMasked() {
         let snapshot = VoiceConfigurationParser.parse(
             profile: "default", schema: nil,
             config: ["stt": [String: Any](), "tts": [String: Any]()],
@@ -51,6 +51,20 @@ final class HermesVoiceConfigurationServiceTests: XCTestCase {
         XCTAssertTrue(snapshot.capability.supportsTranscription)
         XCTAssertFalse(snapshot.capability.supportsSpeech)
         XCTAssertEqual(snapshot.capability.unavailableReason, "The selected text-to-speech provider is not ready for this profile.")
+    }
+
+    /// The Private voice row only treats the OpenAI voice as private when its
+    /// Base URL points somewhere other than OpenAI's own API.
+    func testOwnVoiceServerExcludesOpenAIHost() {
+        XCTAssertFalse(VoiceSettingsView.isOwnVoiceServer(""))
+        XCTAssertFalse(VoiceSettingsView.isOwnVoiceServer("   "))
+        XCTAssertFalse(VoiceSettingsView.isOwnVoiceServer("http://"))
+        XCTAssertFalse(VoiceSettingsView.isOwnVoiceServer("https://api.openai.com/v1"))
+        XCTAssertFalse(VoiceSettingsView.isOwnVoiceServer("api.openai.com/v1"))
+        XCTAssertFalse(VoiceSettingsView.isOwnVoiceServer("https://API.OpenAI.com./v1"))
+        XCTAssertTrue(VoiceSettingsView.isOwnVoiceServer("http://192.168.1.20:4123/v1"))
+        XCTAssertTrue(VoiceSettingsView.isOwnVoiceServer("chatterbox.local:4123"))
+        XCTAssertTrue(VoiceSettingsView.isOwnVoiceServer("https://openai.example.com/v1"))
     }
 
     /// Toolset readiness metadata is picker/diagnostic surface only: when
@@ -231,6 +245,49 @@ final class HermesVoiceConfigurationServiceTests: XCTestCase {
 
         XCTAssertEqual(snapshot.sttProviders.first { $0.descriptor.id == "openai" }?.readiness?.status, "needs_keys")
         XCTAssertTrue(snapshot.capability.supportsTranscription)
+    }
+
+    /// Hermes 0.16–0.18 send TTS rows without `status` or `tts_provider`
+    /// (rows shaped as 0.16.0 sends them). A row is ready once every key it
+    /// lists is set, so Voice starts on those hosts instead of saying no
+    /// assistant voice is ready.
+    func testHermesWithoutReadinessStatusJudgesRowsByTheirKeys() {
+        let ttsRows: [[String: Any]] = [
+            ["name": "Microsoft Edge TTS", "badge": "★ recommended · free", "tag": "Good quality, no API key needed",
+             "env_vars": [[String: Any]](), "post_setup": NSNull(), "requires_nous_auth": false, "is_active": true],
+            ["name": "OpenAI TTS", "badge": "paid", "tag": "",
+             "env_vars": [["key": "VOICE_TOOLS_OPENAI_KEY", "prompt": "OpenAI API key", "is_set": false]],
+             "post_setup": NSNull(), "requires_nous_auth": false, "is_active": false],
+            ["name": "xAI TTS", "badge": "paid", "tag": "", "env_vars": [[String: Any]](), "post_setup": "xai_grok",
+             "requires_nous_auth": false, "is_active": false],
+        ]
+        let snapshot = VoiceConfigurationParser.parse(
+            profile: "default",
+            schema: nil,
+            config: ["stt": ["provider": "local"], "tts": ["provider": "edge"]],
+            sttReadiness: nil,
+            ttsReadiness: ["name": "tts", "has_category": true, "providers": ttsRows, "active_provider": "Microsoft Edge TTS"],
+            environment: [:],
+            ttsToolsetConfigAvailable: true
+        )
+
+        XCTAssertTrue(snapshot.capability.supportsSpeech)
+        XCTAssertNil(snapshot.capability.unavailableReason)
+        let status = { (id: String) in snapshot.ttsProviders.first { $0.descriptor.id == id }?.readiness?.status }
+        XCTAssertEqual(status("edge"), "ready")
+        XCTAssertEqual(status("openai"), "needs_keys")
+        XCTAssertEqual(status("xai"), "ready")
+
+        let openAI = VoiceConfigurationParser.parse(
+            profile: "default",
+            schema: nil,
+            config: ["stt": ["provider": "local"], "tts": ["provider": "openai"]],
+            sttReadiness: nil,
+            ttsReadiness: ["providers": [ttsRows[1].merging(["is_active": true]) { $1 }]],
+            environment: [:],
+            ttsToolsetConfigAvailable: true
+        )
+        XCTAssertFalse(openAI.capability.supportsSpeech)
     }
 
     func testDisabledSTTConfigStillDisablesHermesTranscription() {
@@ -946,6 +1003,70 @@ final class HermesVoiceConfigurationServiceTests: XCTestCase {
         XCTAssertEqual(VoiceConfigurationParser.catalogDescriptor(id: "elevenlabs", kind: .stt)?.supportsStreaming, false)
     }
 
+    /// `stt.streaming` is Hermes' live speech-to-text switch; off unless set.
+    func testLiveTranscriptionReadsSTTStreaming() {
+        func snapshot(_ stt: [String: Any]) -> VoiceConfigurationSnapshot {
+            VoiceConfigurationParser.parse(
+                profile: "default", schema: nil,
+                config: ["stt": stt, "tts": [String: Any]()],
+                sttReadiness: nil, ttsReadiness: nil, environment: nil,
+                ttsToolsetConfigAvailable: false
+            )
+        }
+        XCTAssertFalse(snapshot([:]).liveTranscription)
+        XCTAssertTrue(snapshot(["streaming": true]).liveTranscription)
+        XCTAssertFalse(snapshot(["streaming": false]).liveTranscription)
+    }
+
+    /// The voice reply model is Hermes' `auxiliary.voice_chat` row; a Hermes
+    /// without it hides the setting.
+    func testVoiceReplyModelReadsAndWritesTheVoiceChatSlot() {
+        let response: [String: Any] = ["tasks": [
+            ["task": "vision", "provider": "auto", "model": ""],
+            ["task": "voice_chat", "provider": "openrouter", "model": "fast/model", "reasoning_effort": "none"]
+        ]]
+        XCTAssertEqual(
+            VoiceReplyModelSetting(auxiliaryResponse: response),
+            VoiceReplyModelSetting(provider: "openrouter", model: "fast/model", reasoningEffort: "none")
+        )
+        XCTAssertNil(VoiceReplyModelSetting(auxiliaryResponse: ["tasks": [["task": "vision"]]]))
+        let inherited = VoiceReplyModelSetting(auxiliaryResponse: ["tasks": [
+            ["task": "voice_chat", "provider": "auto", "model": "", "reasoning_effort": NSNull()]
+        ]])
+        XCTAssertNotNil(inherited)
+        XCTAssertNil(inherited?.reasoningEffort)
+
+        let body = VoiceReplyModelSetting(provider: "auto", model: "", reasoningEffort: nil).assignmentBody(profile: "work")
+        XCTAssertEqual(body["scope"] as? String, "auxiliary")
+        XCTAssertEqual(body["task"] as? String, "voice_chat")
+        XCTAssertEqual(body["provider"] as? String, "auto")
+        XCTAssertEqual(body["model"] as? String, "")
+        XCTAssertTrue(body["reasoning_effort"] is NSNull)
+        XCTAssertEqual(body["profile"] as? String, "work")
+        XCTAssertEqual(
+            VoiceReplyModelSetting(provider: "openrouter", model: "fast/model", reasoningEffort: "low")
+                .assignmentBody(profile: "default")["reasoning_effort"] as? String,
+            "low"
+        )
+    }
+
+    /// STT suggestions mirror upstream `STT_MODEL_CATALOG`: local `turbo`
+    /// is offered, Groq's retired distil model is gone, and Mistral, xAI
+    /// and ElevenLabs list their models.
+    func testSTTModelSuggestionsMatchHermesCatalog() {
+        let expected: [String: [String]] = [
+            "local": ["base", "tiny", "small", "medium", "large-v3", "turbo"],
+            "groq": ["whisper-large-v3-turbo", "whisper-large-v3"],
+            "openai": ["whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"],
+            "mistral": ["voxtral-mini-latest", "voxtral-mini-2602"],
+            "xai": ["grok-voice-transcribe-2.0", "grok-voice-transcribe-1.0"],
+            "elevenlabs": ["scribe_v2", "scribe_v1"]
+        ]
+        for (id, models) in expected {
+            XCTAssertEqual(VoiceConfigurationParser.catalogDescriptor(id: id, kind: .stt)?.models, models, id)
+        }
+    }
+
     /// Profiles configured before the ElevenLabs key fix may still carry the
     /// legacy `voice`/`model`/`language` values. They stay visible in the
     /// parsed values (so nothing is silently dropped), but no editor is
@@ -972,6 +1093,140 @@ final class HermesVoiceConfigurationServiceTests: XCTestCase {
         XCTAssertFalse(elevenlabs?.fields.contains { $0.key == "tts.elevenlabs.voice" } ?? true)
         XCTAssertFalse(elevenlabs?.fields.contains { $0.key == "tts.elevenlabs.model" } ?? true)
         XCTAssertTrue(elevenlabs?.fields.contains { $0.key == "tts.elevenlabs.voice_id" } ?? false)
+    }
+}
+
+// MARK: - API keys shown where a voice provider is turned on
+
+extension HermesVoiceConfigurationServiceTests {
+    func testEveryEnvironmentRowKeepsOnlyItsMaskedValue() {
+        let snapshot = VoiceConfigurationParser.parse(
+            profile: "default", schema: nil,
+            config: ["stt": [String: Any](), "tts": [String: Any]()],
+            sttReadiness: nil, ttsReadiness: nil,
+            environment: [
+                "GEMINI_API_KEY": ["is_set": true, "redacted_value": "AIza...wxyz", "description": "Google key"],
+                "XAI_API_KEY": ["is_set": false, "redacted_value": NSNull()],
+                "MIMO_API_KEY": ["is_set": true, "redacted_value": "mi…123"],
+                "STEPFUN_API_KEY": ["is_set": true, "redacted_value": "short1"]
+            ],
+            ttsToolsetConfigAvailable: false
+        )
+
+        XCTAssertTrue(snapshot.environmentLoaded)
+        XCTAssertEqual(snapshot.environment["GEMINI_API_KEY"]?.redactedValue, "AIza...wxyz")
+        XCTAssertEqual(snapshot.environment["XAI_API_KEY"]?.isSet, false)
+        XCTAssertNil(snapshot.environment["XAI_API_KEY"]?.redactedValue)
+        XCTAssertEqual(snapshot.credentials.first { $0.key == "MIMO_API_KEY" }?.redactedValue, "mi…123")
+        // A short value with no mask could be the whole key.
+        XCTAssertNil(snapshot.environment["STEPFUN_API_KEY"]?.redactedValue)
+    }
+
+    func testMissingEnvironmentIsNotReadAsUnset() {
+        let snapshot = VoiceConfigurationParser.parse(
+            profile: "default", schema: nil,
+            config: ["stt": [String: Any](), "tts": [String: Any]()],
+            sttReadiness: nil, ttsReadiness: nil, environment: nil,
+            ttsToolsetConfigAvailable: false
+        )
+
+        XCTAssertFalse(snapshot.environmentLoaded)
+        XCTAssertTrue(snapshot.environment.isEmpty)
+    }
+
+    func testConfiguredCredentialFollowsTheHostOrder() async {
+        let requester = MockVoiceConfigurationRequester()
+        requester.routes = [
+            "/api/config": ["stt": ["provider": "openai"], "tts": ["provider": "openai"]],
+            "/api/env": [
+                "GEMINI_API_KEY": ["is_set": false],
+                "GOOGLE_API_KEY": ["is_set": true, "redacted_value": "AIza...abcd"]
+            ]
+        ]
+        let service = HermesVoiceConfigurationService(requester: requester, profile: "default")
+
+        await service.reload()
+
+        XCTAssertEqual(service.configuredCredential(among: ["GEMINI_API_KEY", "GOOGLE_API_KEY"])?.key, "GOOGLE_API_KEY")
+        XCTAssertEqual(service.configuredCredential(among: ["GEMINI_API_KEY", "GOOGLE_API_KEY"])?.redactedValue, "AIza...abcd")
+        XCTAssertNil(service.configuredCredential(among: ["XAI_API_KEY"]))
+    }
+
+    func testReadinessKnowsAKeyTheEnvironmentDoesNot() async {
+        let requester = MockVoiceConfigurationRequester()
+        requester.routes = [
+            "/api/config": ["stt": ["provider": "openai"], "tts": ["provider": "openai"]],
+            "/api/tools/toolsets/tts/config": ["providers": [[
+                "tts_provider": "openai", "status": "ready", "is_active": true,
+                "env_vars": [["key": "VOICE_TOOLS_OPENAI_KEY", "is_set": true, "prompt": "OpenAI key"]]
+            ]]],
+            "/api/env": ["VOICE_TOOLS_OPENAI_KEY": ["is_set": false]]
+        ]
+        let service = HermesVoiceConfigurationService(requester: requester, profile: "default")
+
+        await service.reload()
+
+        XCTAssertEqual(service.credential("VOICE_TOOLS_OPENAI_KEY")?.isSet, true)
+    }
+
+    func testAddingAKeyWritesItToTheProfileEnvironment() async throws {
+        let requester = MockVoiceConfigurationRequester()
+        requester.routes = [
+            "/api/config": ["stt": ["provider": "openai"], "tts": ["provider": "openai"]],
+            "/api/env": ["XAI_API_KEY": ["is_set": false]]
+        ]
+        let service = HermesVoiceConfigurationService(requester: requester, profile: "default")
+        await service.reload()
+
+        let saved = await service.saveCredential("  xai-secret  ", key: "XAI_API_KEY")
+
+        XCTAssertTrue(saved)
+        let put = try XCTUnwrap(requester.recorded.first { $0.method == "PUT" })
+        XCTAssertEqual(put.path, "/api/env")
+        XCTAssertEqual(put.body?["key"] as? String, "XAI_API_KEY")
+        XCTAssertEqual(put.body?["value"] as? String, "xai-secret")
+        XCTAssertFalse(requester.recorded.contains { $0.path.contains("reveal") })
+    }
+}
+
+extension HermesVoiceConfigurationServiceTests {
+    func testKeySaveFailsWhenHermesAnswersWithAnError() async {
+        let requester = MockVoiceConfigurationRequester()
+        requester.routes = [
+            "/api/config": ["stt": ["provider": "openai"], "tts": ["provider": "openai"]],
+            "/api/env": ["error": "Unknown key", "XAI_API_KEY": ["is_set": false]]
+        ]
+        let service = HermesVoiceConfigurationService(requester: requester, profile: "default")
+        await service.reload()
+
+        let saved = await service.saveCredential("xai-secret", key: "XAI_API_KEY")
+
+        XCTAssertFalse(saved)
+        XCTAssertNotEqual(service.credential("XAI_API_KEY")?.isSet, true)
+        XCTAssertNotNil(service.errorMessage)
+    }
+}
+
+extension HermesVoiceConfigurationServiceTests {
+    func testProviderKeysThatShareAFallbackBecomeOneRowWritingTheFirst() {
+        let groups = VoiceSettingsView.keyGroups([
+            .init(key: "OPENAI_API_KEY", isSet: true, description: "OpenAI key"),
+            .init(key: "VOICE_TOOLS_OPENAI_KEY", isSet: false, description: "VOICE_TOOLS_OPENAI_KEY"),
+            .init(key: "STEPFUN_API_KEY", isSet: false, description: "STEPFUN_API_KEY")
+        ])
+
+        XCTAssertEqual(groups.map(\.keys), [["VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY"], ["STEPFUN_API_KEY"]])
+        XCTAssertEqual(groups.first?.note, "OpenAI key")
+        XCTAssertNil(groups.last?.note)
+    }
+
+    func testAGroupKeepsTheFirstUsefulNote() {
+        let groups = VoiceSettingsView.keyGroups([
+            .init(key: "VOICE_TOOLS_OPENAI_KEY", isSet: false, description: "VOICE_TOOLS_OPENAI_KEY"),
+            .init(key: "OPENAI_API_KEY", isSet: true, description: "OpenAI API key")
+        ])
+
+        XCTAssertEqual(groups, [.init(keys: ["VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY"], note: "OpenAI API key")])
     }
 }
 

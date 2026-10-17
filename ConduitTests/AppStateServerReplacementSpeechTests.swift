@@ -44,7 +44,7 @@ final class AppStateServerReplacementSpeechTests: XCTestCase {
         await harness.voiceController.startListening()
         XCTAssertEqual(
             harness.voiceController.state,
-            .failed("Voice is unavailable for this gateway.")
+            .failed("Voice isn't set up yet. Check Settings > Voice.")
         )
         harness.voiceController.stop()
     }
@@ -101,8 +101,10 @@ final class AppStateServerReplacementSpeechTests: XCTestCase {
 
     func testServerReplacementMakesParkedBargeInContinuationInert() async {
         let harness = makeHarness()
-        _ = await harness.startVoiceWithAssistantResponseStarted()
-        XCTAssertEqual(harness.voiceController.state, .thinking)
+        // Talk-over needs an audible reply: speech while Hermes only
+        // thinks never reaches the interrupt seam.
+        _ = await harness.startVoiceWithAssistantDeltaParkedInDrain()
+        XCTAssertEqual(harness.voiceController.state, .speaking)
 
         // Acoustic barge-in begins and parks inside the injected interrupt
         // seam (the stand-in for Hermes cancellation/recovery work).
@@ -535,14 +537,6 @@ final class AppStateServerReplacementSpeechTests: XCTestCase {
             return voiceGateway.streams[0]
         }
 
-        /// Drives a turn to `.thinking` with the assistant response started,
-        /// so barge-in monitoring is armed and playback-suspension is not.
-        func startVoiceWithAssistantResponseStarted() async {
-            _ = await startVoiceListening()
-            await finishUtteranceToThinking()
-            voiceController.receiveAssistantEvent(.started(sessionID: "a-session"))
-        }
-
         /// Utterance finish is date-driven: one speech sample followed by a
         /// later silent sample deterministically schedules `finishUtterance`,
         /// and the mock transcriber + submit closure land the turn in
@@ -599,6 +593,8 @@ private final class GatedCapture: AudioCaptureService {
     func startListening(includePreRoll: Bool) throws { startListeningCount += 1 }
     func beginBargeInMonitoring() throws {}
     func pause() {}
+    func holdForPlayback() {}
+    var isHeldForPlayback: Bool { false }
     func resume() throws {}
     func finishUtterance() throws -> VoiceCapturedAudio {
         VoiceCapturedAudio(wavData: Data(), pcm16Data: Data(), sampleRate: 16_000, duration: 0)

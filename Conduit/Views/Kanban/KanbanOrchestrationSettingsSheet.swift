@@ -235,13 +235,13 @@ struct KanbanOrchestrationSettingsSheet: View {
                 orchestratorProfile: orchestratorProfile,
                 defaultAssignee: defaultAssignee
             )
-            notice = "Orchestration settings saved."
+            notice = AppLocalization.string("Orchestration settings saved.")
         } catch {
             if liveness.owns(operationID) { isSaving = false }
             guard store.isCurrentConfiguration(generation) else { return }
             // The store owns the current-generation error presentation too;
             // the inline copy keeps the sheet self-contained.
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingError.message(for: error)
         }
     }
 }

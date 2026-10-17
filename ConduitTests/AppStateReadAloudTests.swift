@@ -143,6 +143,20 @@ final class AppStateReadAloudTests: XCTestCase {
         )
     }
 
+    func testChoosingASpeechOutputGivesReadAloudAFreshGateway() {
+        let harness = makeHarness(snapshot: ttsOnlySnapshot)
+        XCTAssertTrue(harness.appState.setVoiceSpeechOutput(.hermes))
+        let first = harness.appState.messageReadAloudController.gateway
+        XCTAssertNotNil(first)
+
+        // A kept gateway may have given up on Hermes speech; choosing Hermes
+        // again must not keep that one.
+        XCTAssertTrue(harness.appState.setVoiceSpeechOutput(.hermes))
+        let second = harness.appState.messageReadAloudController.gateway
+        XCTAssertNotNil(second)
+        XCTAssertFalse(first === second)
+    }
+
     func testTTSOnlyAvailabilityIsIndependentOfTranscription() {
         let harness = makeHarness(snapshot: ttsOnlySnapshot)
 
@@ -159,11 +173,12 @@ final class AppStateReadAloudTests: XCTestCase {
         harness.appState.installVoiceCapabilityStateForTesting(
             bridge: harness.bridge,
             snapshot: sttOnly,
-            isVoiceEnabled: true
+            isVoiceEnabled: true,
+            speechOutput: .hermes
         )
         XCTAssertEqual(
             harness.appState.readAloudUnavailableReason,
-            "This Hermes profile has no ready text-to-speech provider."
+            "This Hermes profile has no ready text-to-speech provider. Set one up in Settings > Voice."
         )
 
         harness.appState.installVoiceCapabilityStateForTesting(
@@ -173,7 +188,7 @@ final class AppStateReadAloudTests: XCTestCase {
         )
         XCTAssertEqual(
             harness.appState.readAloudUnavailableReason,
-            "Enable voice for this profile in Settings."
+            "Voice is off for this profile. Turn on \"Enable voice on this device\" in Settings > Voice."
         )
 
         harness.appState.installVoiceCapabilityStateForTesting(
@@ -319,6 +334,8 @@ private final class MockVoiceCapture: AudioCaptureService {
     func startListening(includePreRoll: Bool) throws {}
     func beginBargeInMonitoring() throws {}
     func pause() {}
+    func holdForPlayback() {}
+    var isHeldForPlayback: Bool { false }
     func resume() throws {}
     func finishUtterance() throws -> VoiceCapturedAudio {
         VoiceCapturedAudio(wavData: Data(), pcm16Data: Data(), sampleRate: 16_000, duration: 0)

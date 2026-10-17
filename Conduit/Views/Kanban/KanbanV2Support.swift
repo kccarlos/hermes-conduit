@@ -182,9 +182,9 @@ enum KanbanWorkspaceKind: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .scratch: return "Scratch"
-        case .worktree: return "Worktree"
-        case .dir: return "Directory"
+        case .scratch: return AppLocalization.string("Scratch")
+        case .worktree: return AppLocalization.string("Worktree")
+        case .dir: return AppLocalization.string("Directory")
         }
     }
 
@@ -270,17 +270,20 @@ enum KanbanDraftValidationError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .emptyTitle:
-            return "A title is required."
-        case .invalidWorkspacePath(let kind):
-            return "A workspace path can only be set for \(kind.displayName) tasks. Hermes scratch tasks resolve their own directory."
+            return AppLocalization.string("A title is required.")
+        case .invalidWorkspacePath:
+            // Only scratch tasks refuse a path (allowsPathOverride), so the
+            // sentence names the kinds that take one instead of inserting a
+            // translated kind name. The payload stays for Equatable.
+            return AppLocalization.string("A workspace path can only be set for Worktree and Directory tasks. Hermes scratch tasks resolve their own directory.")
         case .invalidReasoningEffort(let value):
-            return "\"\(value)\" is not a valid reasoning effort for a Hermes worker."
+            return AppLocalization.string("\"\(value)\" is not a valid reasoning effort for a Hermes worker.")
         case .invalidSkill(let skill):
-            return "\"\(skill)\" is not a usable skill name."
+            return AppLocalization.string("\"\(skill)\" is not a usable skill name.")
         case .duplicateParent(let id):
-            return "Task \(id) is already listed as a parent."
+            return AppLocalization.string("Task \(id) is already listed as a parent.")
         case .invalidGoalMaxTurns(let turns):
-            return "Goal Mode max turns must be at least 1 (got \(turns))."
+            return AppLocalization.string("Goal Mode max turns must be at least 1 (got \(String(turns))).")
         }
     }
 }
@@ -487,6 +490,60 @@ enum KanbanActivityFormatter {
     }
 }
 
+// MARK: - Blocked question
+
+/// What a blocked task is waiting on: the reason the worker gave when it
+/// blocked (upstream `kanban_block(reason)`), so the operator can answer it
+/// from the detail screen.
+///
+/// The newest `blocked` event carries the question; a backend that records
+/// the block only on the run falls back to the newest run that ended
+/// `blocked` (its summary only, never its error). Only the CURRENT block
+/// counts: a strictly newer transition - a `status` move (a dependency block
+/// such as parent_reopened), `unblocked`, claim or completion - makes the
+/// question stale and yields nil. A manual or dependency block yields nil.
+///
+/// Events arrive newest-first, so array order breaks ties between blocked
+/// events, and an event without a timestamp is taken as the newest.
+enum KanbanBlockedQuestion {
+    static let transitionKinds: Set<String> = [
+        "blocked", "unblocked", "status", "claimed", "completed", "reclaimed", "scheduled", "promoted", "archived",
+    ]
+
+    static func reason(in detail: KanbanTaskDetail) -> String? {
+        let transitions = detail.events.enumerated().filter { transitionKinds.contains($0.element.kind) }
+        let question: String?
+        let blockTime: Int
+        if let block = transitions.filter({ $0.element.kind == "blocked" }).max(by: { lhs, rhs in
+            let left = lhs.element.createdAt ?? Int.max
+            let right = rhs.element.createdAt ?? Int.max
+            return left == right ? lhs.offset > rhs.offset : left < right
+        }) {
+            question = nonEmpty(block.element.payload?.objectValue?["reason"]?.stringValue)
+            blockTime = block.element.createdAt ?? Int.max
+        } else {
+            let blockedRuns = detail.runs.filter { ($0.outcome ?? $0.status) == "blocked" }
+            guard let run = blockedRuns.max(by: { ($0.endedAt ?? $0.startedAt ?? 0) < ($1.endedAt ?? $1.startedAt ?? 0) }) else {
+                return nil
+            }
+            question = nonEmpty(run.summary)
+            blockTime = run.endedAt ?? run.startedAt ?? Int.max
+        }
+        // A transition strictly newer than the block supersedes it. One
+        // logged in the same second (a `status` row written alongside the
+        // block) does not.
+        let superseded = transitions.contains { other in
+            other.element.kind != "blocked" && (other.element.createdAt ?? Int.max) > blockTime
+        }
+        return superseded ? nil : question
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+}
+
 // MARK: - Run presentation
 
 /// Shared run-row classification (upstream drawer runs list).
@@ -497,19 +554,9 @@ enum KanbanRunPresentation {
         failedOutcomes.contains(run.outcome ?? run.status)
     }
 
-    static func durationText(start: Int?, end: Int?) -> String? {
+    static func durationText(start: Int?, end: Int?, locale: Locale = AppLocalization.formattingLocale) -> String? {
         guard let start, let end, end >= start, start > 0 else { return nil }
-        let seconds = end - start
-        if seconds >= 86_400 {
-            return "\(seconds / 86_400)d"
-        }
-        if seconds >= 3_600 {
-            return "\(seconds / 3_600)h"
-        }
-        if seconds >= 60 {
-            return "\(seconds / 60)m"
-        }
-        return "\(seconds)s"
+        return KanbanCompactDuration.text(seconds: end - start, locale: locale)
     }
 
     static func outcomeLabel(_ run: KanbanRun) -> String {
@@ -549,10 +596,37 @@ enum KanbanCardLiveness {
 
     static func elapsedText(startedAt: Int?, now: Date = Date()) -> String? {
         guard let startedAt, startedAt > 0 else { return nil }
-        let seconds = max(0, Int(now.timeIntervalSince1970) - startedAt)
-        if seconds >= 86_400 { return "\(seconds / 86_400)d" }
-        if seconds >= 3_600 { return "\(seconds / 3_600)h" }
-        if seconds >= 60 { return "\(seconds / 60)m" }
-        return "\(seconds)s"
+        return KanbanCompactDuration.text(seconds: max(0, Int(now.timeIntervalSince1970) - startedAt))
+    }
+}
+
+/// A run or worker age in its largest whole unit ("30s", "2m", "1h", "3d"
+/// in English), abbreviated the way the UI's language writes units.
+enum KanbanCompactDuration {
+    static func text(seconds: Int, locale: Locale = AppLocalization.formattingLocale) -> String {
+        let steps: [(size: Int, unit: NSCalendar.Unit)] = [
+            (86_400, .day), (3_600, .hour), (60, .minute), (1, .second),
+        ]
+        let step = steps.first { seconds >= $0.size } ?? steps[steps.count - 1]
+        // Whole units only: the formatter would round 1h 59m up to "2h".
+        let whole = seconds / step.size * step.size
+        return formatter(locale: locale, unit: step.unit).string(from: TimeInterval(whole)) ?? "\(whole / step.size)"
+    }
+
+    /// Card and run rows ask on every render, so each locale and unit
+    /// keeps its formatter. NSCache is safe from any thread.
+    private static let formatters = NSCache<NSString, DateComponentsFormatter>()
+
+    private static func formatter(locale: Locale, unit: NSCalendar.Unit) -> DateComponentsFormatter {
+        let key = "\(locale.identifier)|\(unit.rawValue)" as NSString
+        if let cached = formatters.object(forKey: key) { return cached }
+        let formatter = DateComponentsFormatter()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = locale
+        formatter.calendar = calendar
+        formatter.unitsStyle = .abbreviated
+        formatter.allowedUnits = unit
+        formatters.setObject(formatter, forKey: key)
+        return formatter
     }
 }

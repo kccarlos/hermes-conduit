@@ -26,9 +26,10 @@
 //  read-aloud buttons, navigation, Settings, composer controls, selection
 //  chrome, tool/status cards — keeps its existing typography.
 //
-//  Mermaid and KaTeX previews render inside WKWebView with their own HTML/CSS
-//  and intentionally keep their internal size; the surrounding source cards
-//  DO use this typography (see RenderCard/MarkupPreviewSheet/GuardedSourceCard).
+//  Mermaid diagrams render inside WKWebView with their own HTML/CSS and scale
+//  to their width; formulas drawn in a message follow the chat body size.
+//  The surrounding source cards DO use this typography (see
+//  MarkupBlock/MarkupPreviewSheet/GuardedSourceCard).
 //
 
 import SwiftUI
@@ -58,11 +59,11 @@ enum ChatTextSize: Int, CaseIterable, Equatable {
     /// Human-readable name, used by the Settings slider's accessibility value.
     var displayName: String {
         switch self {
-        case .smallest: "Smallest"
-        case .smaller: "Smaller"
-        case .default: "Default"
-        case .larger: "Larger"
-        case .largest: "Largest"
+        case .smallest: AppLocalization.string("Smallest")
+        case .smaller: AppLocalization.string("Smaller")
+        case .default: AppLocalization.string("Default")
+        case .larger: AppLocalization.string("Larger")
+        case .largest: AppLocalization.string("Largest")
         }
     }
 

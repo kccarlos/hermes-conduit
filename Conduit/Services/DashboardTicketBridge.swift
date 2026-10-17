@@ -62,6 +62,14 @@ enum DashboardCookiePersistence {
     }
 
     static func restore(into cookieStore: WKHTTPCookieStore, dashboardID: UUID? = nil) async {
+        for cookie in mirroredCookies(dashboardID: dashboardID) {
+            await cookieStore.setCookie(cookie)
+        }
+    }
+
+    /// The dashboard's cookies as last mirrored to the Keychain. Readable
+    /// with the phone locked, unlike the saved password.
+    static func mirroredCookies(dashboardID: UUID?) -> [HTTPCookie] {
         // Dashboard-scoped mirror first (#148); the legacy global record is
         // only consulted when the caller has no dashboard identity (tests).
         let data: Data?
@@ -71,10 +79,8 @@ enum DashboardCookiePersistence {
             data = KeychainHelper.loadDashboardCookies()
         }
         guard let data,
-              let saved = try? JSONDecoder().decode([StoredCookie].self, from: data) else { return }
-        for cookie in saved.compactMap(\.cookie) {
-            await cookieStore.setCookie(cookie)
-        }
+              let saved = try? JSONDecoder().decode([StoredCookie].self, from: data) else { return [] }
+        return saved.compactMap(\.cookie)
     }
 
     /// The dashboard-owned WebKit session store. `WKWebsiteDataStore` caches
@@ -248,13 +254,13 @@ enum DashboardTicketBridgeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notReady:
-            return "The dashboard session is still loading."
+            return AppLocalization.string("Conduit is still connecting to your dashboard. Try again in a moment.")
         case .signInRequired:
-            return "Dashboard sign-in has expired."
+            return AppLocalization.string("Dashboard sign-in has expired. Sign in again to continue.")
         case .requestFailed(let message):
             return message
-        case .http(_, let detail):
-            return detail
+        case .http(let status, let detail):
+            return Self.describe(status: status, detail: detail)
         case .oversizedResponse:
             // Generic bridge-level copy: this error is raised for ANY
             // dashboard response that exceeds the safe bound (workspace-file
@@ -262,9 +268,77 @@ enum DashboardTicketBridgeError: LocalizedError {
             // Transcript-specific messaging is mapped in the transcript
             // layer, which knows whether the request was a legacy one-shot
             // or a bounded current-Hermes page.
-            return "This response is too large to load safely."
+            return AppLocalization.string("This response is too large to load safely.")
         }
     }
+
+    /// The dashboard answered but handed back no session ticket.
+    static var noSessionTicketDetail: String {
+        AppLocalization.string("The dashboard didn't let Conduit start a session. Try again.")
+    }
+
+    /// Conduit's own 401 after it refreshed the sign-in for a request it
+    /// won't replay: the fix is to try again, not to sign in.
+    static var signInRefreshedDetail: String {
+        AppLocalization.string("Your dashboard sign-in was refreshed. Try that again.")
+    }
+
+    /// What a failed dashboard request means for the person using Conduit.
+    /// The server's own explanation is kept when it says something (a
+    /// FastAPI `detail` like "Session not found"); bare status phrases and
+    /// browser fetch errors become what happened and what to do.
+    static func describe(status: Int, detail: String) -> String {
+        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isMeaningful = !trimmed.isEmpty
+            && !genericDetails.contains(trimmed.lowercased())
+            && trimmed != AppLocalization.string("Dashboard request failed (\(String(status))).")
+        switch status {
+        case 0:
+            let lowered = trimmed.lowercased()
+            if lowered.contains("abort") || lowered.contains("timeout") || lowered.contains("timed out") {
+                return HermesError.timeoutMessage
+            }
+            return AppLocalization.string("Conduit couldn't reach your Hermes dashboard. Check this device's network connection and that the dashboard is running.")
+        case 403 where trimmed.range(of: "profile_mismatch", options: .caseInsensitive) != nil:
+            return AppLocalization.string("Hermes says this chat belongs to another profile. Switch to that profile, then try again.")
+        case 403 where SessionMutationIdentity.isRefusalDetail(trimmed):
+            return AppLocalization.string("Hermes only lets the computer it runs on change this older chat. Change it there instead.")
+        case 401, 403:
+            if trimmed == signInRefreshedDetail { return trimmed }
+            return AppLocalization.string("Hermes turned this down because the dashboard sign-in expired or doesn't allow it. Sign in again, then try once more.")
+        case 404, 405, 501:
+            if isMeaningful, status == 404 { return trimmed }
+            return AppLocalization.string("Your Hermes server doesn't support this yet. Update Hermes, then try again.")
+        case 408, 504, 524:
+            return HermesError.timeoutMessage
+        case 409 where (SessionMutationIdentity.retryableConflicts + ["session_busy"]).contains(where: { trimmed.localizedCaseInsensitiveContains($0) }):
+            // A session write that still conflicted after its one retry.
+            return AppLocalization.string("Hermes is busy right now. Wait a moment, then try again.")
+        case 429:
+            if isMeaningful { return trimmed }
+            return AppLocalization.string("Hermes is busy right now. Wait a moment, then try again.")
+        case 502, 503, 520...523:
+            return AppLocalization.string("Your dashboard couldn't reach Hermes. Hermes may be restarting, so try again in a moment.")
+        case 500...599:
+            if isMeaningful {
+                return AppLocalization.string("Hermes ran into a problem: \(trimmed). Check the Hermes logs, then try again.")
+            }
+            return AppLocalization.string("Hermes ran into a problem on the server. Check the Hermes logs, then try again.")
+        default:
+            if isMeaningful { return trimmed }
+            return AppLocalization.string("Hermes didn't accept this request. Updating Hermes and Conduit usually fixes this.")
+        }
+    }
+
+    /// Default HTTP reason phrases and browser fetch errors, which say
+    /// nothing a person can act on.
+    private static let genericDetails: Set<String> = [
+        "not found", "method not allowed", "bad request", "internal server error",
+        "internal error", "service unavailable", "bad gateway", "gateway timeout",
+        "request timeout", "too many requests", "forbidden", "unauthorized",
+        "failed to fetch", "load failed", "typeerror: load failed",
+        "typeerror: failed to fetch", "networkerror when attempting to fetch resource.",
+    ]
 }
 
 /// WKUserContentController retains its script message handlers strongly, so
@@ -318,13 +392,16 @@ final class DashboardTicketBridge: NSObject {
     let baseURL: String
     let webView: WKWebView
     let cloudflareAccess: CloudflareAccessCredentials?
+    /// The extra proxy headers baked into this bridge's page script at
+    /// construction. AppState rebuilds the bridge when the saved set changes.
+    let extraHeaders: [CustomHeader]
     /// The saved dashboard this bridge authenticates against, when one
     /// exists — decides which dashboard's scoped cookie mirror is restored
     /// into the WebKit store on load.
     let dashboardID: UUID?
     /// Bearer-backed session for Hermes' native PKCE flow. The bridge keeps
     /// one interface for callers while cookie/password mode stays intact.
-    private var nativeOAuthSession: NativeOAuthSession?
+    private(set) var nativeOAuthSession: NativeOAuthSession?
     /// AppState includes the authentication transport in its bridge-reuse
     /// identity. A same-URL login that changes cookie ↔ bearer mode must
     /// replace this bridge rather than retaining its in-memory session.
@@ -359,7 +436,7 @@ final class DashboardTicketBridge: NSObject {
         case loginPage
         case loadFailure
     }
-    private var isInvalidated = false
+    private(set) var isInvalidated = false
     private var requestID = 0
     /// Identity of the current dashboard navigation, used to ignore failure
     /// callbacks for loads a reload has already replaced. `staleNavigations`
@@ -381,6 +458,18 @@ final class DashboardTicketBridge: NSObject {
     /// any caller (mint retries and AppState's sign-in recovery alike).
     /// Diagnostic/test counter for the cold-bridge recovery path.
     private(set) var reloadCount = 0
+    /// Whether the hidden dashboard page can run requests. WebKit suspends
+    /// a page whose window is off screen, so while the phone app is in the
+    /// background (driving with CarPlay, a locked phone) requests go out
+    /// natively with the page's cookies instead (#378). Test seam.
+    var webViewCanRun: @MainActor () -> Bool = { PhoneScenePresence.isInForeground }
+    /// Cookies the dashboard set on requests sent without the page, newest
+    /// last, so a rotated session cookie is the one sent next.
+    var backgroundIssuedCookies: [HTTPCookie] = []
+    /// Observes the hidden page's load lifecycle for AppState's connection
+    /// timeline (#417). Every request waits on this page, so when it becomes
+    /// ready is the first thing a slow launch needs to show.
+    var onPageEvent: (@MainActor (String) -> Void)?
 
     init(
         baseURL: String,
@@ -394,6 +483,7 @@ final class DashboardTicketBridge: NSObject {
         let normalizedBaseURL = (try? ConnectionURLPolicy.normalizedBaseURL(baseURL)) ?? ""
         self.baseURL = normalizedBaseURL
         self.cloudflareAccess = cloudflareAccess
+        self.extraHeaders = CustomHeaderPolicy.sendable(CustomHeaderStore.shared.headers(forServerURL: normalizedBaseURL))
         let resolvedDashboardID = dashboardID ?? SavedDashboardRegistryStore.load()?.dashboardID(atNormalizedURL: normalizedBaseURL)
         self.dashboardID = resolvedDashboardID
         self.nativeOAuthSession = resolvedDashboardID.flatMap {
@@ -414,6 +504,12 @@ final class DashboardTicketBridge: NSObject {
         if let script = cloudflareAccess?.fetchInjectionUserScript(expectedBaseURL: normalizedBaseURL), !script.isEmpty {
             configuration.userContentController.addUserScript(
                 WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+            )
+        }
+        let extraHeaderScript = CustomHeaderStore.shared.fetchInjectionUserScript(expectedBaseURL: normalizedBaseURL)
+        if !extraHeaderScript.isEmpty {
+            configuration.userContentController.addUserScript(
+                WKUserScript(source: extraHeaderScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)
             )
         }
         self.webView = WKWebView(frame: .zero, configuration: configuration)
@@ -529,6 +625,13 @@ final class DashboardTicketBridge: NSObject {
             guard !isInvalidated else { throw DashboardTicketBridgeError.notReady }
             return try await nativeOAuthSession.mintTicket()
         }
+        if !webViewCanRun() {
+            let response = try await requestJSONWithoutPage(path: "/api/auth/ws-ticket", method: "POST")
+            guard let ticket = response["ticket"] as? String, !ticket.isEmpty else {
+                throw DashboardTicketBridgeError.requestFailed(DashboardTicketBridgeError.noSessionTicketDetail)
+            }
+            return ticket
+        }
         // Retry twice on the two recoverable failures, then let the final
         // attempt's error propagate to the caller unchanged:
         //  - signInRequired: a freshly restored session cookie can reach
@@ -546,7 +649,7 @@ final class DashboardTicketBridge: NSObject {
                 try await waitUntilReady()
                 let response = try await requestJSON(path: "/api/auth/ws-ticket", method: "POST")
                 guard let ticket = response["ticket"] as? String, !ticket.isEmpty else {
-                    throw DashboardTicketBridgeError.requestFailed("Dashboard did not return a WebSocket ticket.")
+                    throw DashboardTicketBridgeError.requestFailed(DashboardTicketBridgeError.noSessionTicketDetail)
                 }
                 return ticket
             } catch DashboardTicketBridgeError.signInRequired where attempt < 2 {
@@ -607,6 +710,15 @@ final class DashboardTicketBridge: NSObject {
         if let nativeOAuthSession {
             guard !isInvalidated else { throw DashboardTicketBridgeError.notReady }
             return try await nativeOAuthSession.requestJSON(
+                path: path,
+                method: method,
+                body: body,
+                timeoutMilliseconds: timeoutMilliseconds,
+                maxResponseBytes: maxResponseBytes
+            )
+        }
+        if !webViewCanRun() {
+            return try await requestJSONWithoutPage(
                 path: path,
                 method: method,
                 body: body,
@@ -828,7 +940,7 @@ final class DashboardTicketBridge: NSObject {
         guard let normalized = try? ConnectionURLPolicy.normalizedBaseURL(baseURL),
               let url = URL(string: "\(normalized)/api/status") else { return }
         var request = URLRequest(url: url)
-        request = cloudflareAccess?.applying(to: request) ?? request
+        request = request.applyingProxyHeaders(cloudflare: cloudflareAccess)
         // The fresh load's landing is unknown until its navigation callback;
         // a stale verdict must not leak into its poll window. Reset the
         // verdicts explicitly (nil simulatedLanding in production), then
@@ -840,6 +952,7 @@ final class DashboardTicketBridge: NSObject {
         didLandOnLogin = false
         applySimulatedLanding()
         currentNavigation = webView.load(request)
+        onPageEvent?("Dashboard page loading")
     }
 
     private func rejectPending(with error: Error) {
@@ -910,6 +1023,7 @@ extension DashboardTicketBridge: WKNavigationDelegate {
             // untouched: only an origin-matching landing can change it.
             isLoadFailed = true
             rejectPending(with: DashboardTicketBridgeError.notReady)
+            onPageEvent?("Dashboard page landed off the dashboard")
             return
         }
         isLoadFailed = false
@@ -918,6 +1032,7 @@ extension DashboardTicketBridge: WKNavigationDelegate {
         let landedOnLogin = landedURL.path.contains("/login")
         isReady = !landedOnLogin
         didLandOnLogin = landedOnLogin
+        onPageEvent?(landedOnLogin ? "Dashboard page landed on sign-in" : "Dashboard page ready")
         if landedOnLogin {
             rejectPending(with: DashboardTicketBridgeError.signInRequired)
         } else if !isInvalidated {
@@ -953,6 +1068,7 @@ extension DashboardTicketBridge: WKNavigationDelegate {
         isReady = false
         isLoadFailed = true
         rejectPending(with: error)
+        onPageEvent?("Dashboard page failed: \(ConnectionTimeline.summary(of: error))")
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -961,6 +1077,7 @@ extension DashboardTicketBridge: WKNavigationDelegate {
         isReady = false
         isLoadFailed = true
         rejectPending(with: error)
+        onPageEvent?("Dashboard page failed: \(ConnectionTimeline.summary(of: error))")
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -977,6 +1094,7 @@ extension DashboardTicketBridge: WKNavigationDelegate {
         didLandOnLogin = false
         currentNavigation = nil
         rejectPending(with: DashboardTicketBridgeError.notReady)
+        onPageEvent?("Dashboard page process ended")
     }
 }
 
@@ -1004,11 +1122,15 @@ extension DashboardTicketBridge: WKScriptMessageHandler {
         }
 
         let status = payload["status"] as? Int ?? 0
-        if status == 401 || status == 403 {
+        let detail = payload["error"] as? String ?? AppLocalization.string("Dashboard request failed (\(String(status))).")
+        // Hermes' session writes answer 403 for a chat this sign-in may not
+        // change (old local history only its own computer may claim). That
+        // is a verdict on the chat, not an expired sign-in: signing in again
+        // can't change it.
+        if status == 401 || (status == 403 && !SessionMutationIdentity.isRefusalDetail(detail)) {
             continuation.resume(throwing: DashboardTicketBridgeError.signInRequired)
             return
         }
-        let detail = payload["error"] as? String ?? AppLocalization.string("Dashboard request failed (\(String(status))).")
         // The injected fetch throws exactly one sentinel for a response that
         // outgrew the safe bound (content-length or streamed bytes). It
         // arrives here as a status-0 failure like every other JS-level

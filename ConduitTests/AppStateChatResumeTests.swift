@@ -4,6 +4,51 @@ import XCTest
 
 @MainActor
 final class AppStateChatResumeTests: XCTestCase {
+    func testPendingClarifyMessageIDIsCachedWhenTranscriptChanges() {
+        let suite = "AppStateChatResumeTests.pendingClarifyCache.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            return XCTFail("Failed to create test UserDefaults suite")
+        }
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {}
+        )
+        let pending = ClarifyActivity(
+            requestId: "request-cache",
+            question: "Continue?",
+            choices: [],
+            status: .pending
+        )
+        appState.messages = [ChatMessage(
+            id: "clarify-cache",
+            role: .clarify,
+            content: "Continue?",
+            timestamp: "2026-01-01T00:00:00Z",
+            clarify: pending
+        )]
+        XCTAssertEqual(appState.pendingClarifyMessageID, "clarify-cache")
+
+        let answered = ClarifyActivity(
+            requestId: pending.requestId,
+            question: "Continue?",
+            choices: [],
+            status: .answered,
+            answer: "yes"
+        )
+        appState.messages = [ChatMessage(
+            id: "clarify-cache",
+            role: .clarify,
+            content: "Continue?",
+            timestamp: "2026-01-01T00:00:00Z",
+            clarify: answered
+        )]
+        XCTAssertNil(appState.pendingClarifyMessageID)
+    }
+
     func testResumeHydratesApprovalsQueuedBehindSnapshotHead() async {
         let pending: (String) -> ApprovalActivity = { requestID in
             ApprovalActivity(
@@ -276,6 +321,71 @@ final class AppStateChatResumeTests: XCTestCase {
             snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
         )))
         XCTAssertEqual(persisted.messages.filter { $0.review == activity }.count, 2)
+    }
+
+    /// A new chat keeps the previous chat's ids in its scroll identity and
+    /// reconciliation, and matching saved reviews through them pinned that
+    /// chat's review cards to the top of every new chat.
+    func testANewChatShowsNoReviewsFromTheChatOpenBeforeIt() throws {
+        let suite = "AppStateChatResumeTests.reviewsNewChat.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("default", forKey: "conduit.activeProfile")
+        let index = ConversationIdentityIndex()
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {},
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults),
+            conversationIdentityIndex: index
+        )
+        index.recordAuthoritative(runtimeID: "rt-old", durableID: "st-old", profile: "default", source: .resume)
+        appState.sessions = [session("rt-old", storedID: "st-old")]
+        appState.activeSessionId = "rt-old"
+        let activity = ReviewActivity(summary: "Memory updated", details: ["➖ Memory: old entry"], fullSessionId: nil)
+        appState.handleStreamEvent(.reviewSummary(sessionId: "rt-old", activity: activity))
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("rt-old").map(\.review), [activity])
+
+        // New chat: the reconciliation and scroll identity still name the old one.
+        let reconciliation = appState.beginReconciliation()
+        appState.activeSessionId = "rt-new"
+        appState.messages = []
+        index.recordAuthoritative(runtimeID: "rt-new", durableID: "st-new", profile: "default", source: .create)
+        appState.sessions = [session("st-new", alternateIDs: ["rt-new"]), session("rt-old", storedID: "st-old")]
+        XCTAssertTrue(appState.activeChatScrollSessionIdentity.contains("rt-old"))
+
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("rt-new"), [])
+        // Stream events wait while the reconciliation is open; settle it so
+        // the new chat's own review below is applied and saved.
+        XCTAssertTrue(appState.settleReconciliationAndPublish(reconciliation))
+        XCTAssertTrue(appState.applyChatResume(SessionResumeResult(
+            sessionId: "rt-new",
+            messages: [],
+            snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+        )))
+        XCTAssertFalse(appState.messages.contains { $0.review != nil }, "the opened new chat shows no review card")
+        // The old chat, reopened under another runtime id, still has its review.
+        index.recordAuthoritative(runtimeID: "rt-old-2", durableID: "st-old", profile: "default", source: .resume)
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("rt-old-2").map(\.review), [activity])
+
+        // A review in the new chat is saved under its durable id, not the old chat's.
+        appState.handleStreamEvent(.reviewSummary(sessionId: "rt-new", activity: activity))
+        index.recordAuthoritative(runtimeID: "rt-new-2", durableID: "st-new", profile: "default", source: .resume)
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("rt-new-2").count, 1)
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("rt-old-2").count, 1)
+
+        // A chat whose row lists its runtime id only as an alternate, with no
+        // confirmed mapping yet, saves under that runtime id; the mapping
+        // Hermes confirms later brings the review back on a reopen.
+        appState.activeSessionId = "rt-alt"
+        appState.messages = []
+        appState.sessions = [session("st-alt", alternateIDs: ["rt-alt"])]
+        appState.handleStreamEvent(.reviewSummary(sessionId: "rt-alt", activity: activity))
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("rt-alt").count, 1)
+        index.recordAuthoritative(runtimeID: "rt-alt", durableID: "st-alt", profile: "default", source: .create)
+        index.recordAuthoritative(runtimeID: "rt-alt-2", durableID: "st-alt", profile: "default", source: .resume)
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("rt-alt-2").count, 1)
+        XCTAssertEqual(appState.cachedReviewRowsForTesting("st-alt").count, 1)
     }
 
     func testFreshResumeRestoresInFlightToolAndReconcilesItsCompletion() {
@@ -1132,6 +1242,35 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertEqual(harness.store.snapshot(for: newerKey), .latest)
     }
 
+    func testNewChatThatFailsKeepsTheOpenChatsTitle() async {
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                openSession: { _, sessionID, _ in
+                    SessionResumeResult(
+                        sessionId: sessionID,
+                        messages: [ChatMessage(id: "m1", role: .assistant, content: "Earlier", timestamp: "1")],
+                        snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+                    )
+                },
+                refreshContext: { _, _ in }
+            )
+        )
+        // A client whose socket never opened: creating a chat fails.
+        let connection = HermesConnection(baseUrl: "https://one.example", ticket: "ticket")
+        harness.appState.connection = connection
+        harness.appState.client = HermesClient(connection: connection, profile: "default")
+        harness.appState.isConnected = true
+        harness.appState.sessions = [session("open-chat", title: "Trip plans")]
+        _ = await harness.appState.openSession("open-chat")
+        XCTAssertEqual(harness.appState.activeSessionTitle, "Trip plans")
+
+        await harness.appState.createNewSession()
+
+        XCTAssertEqual(harness.appState.activeSessionId, "open-chat")
+        XCTAssertEqual(harness.appState.activeSessionTitle, "Trip plans", "The chat still open keeps its own title")
+        XCTAssertNotNil(harness.appState.errorMessage)
+    }
+
     func testRapidExplicitSessionSwitchingSettlesTheLatestSession() async {
         let sessionIDs = (1...8).map { "stored-\($0)" }
         let gates = SessionOpenGates(sessionIDs: sessionIDs)
@@ -1179,6 +1318,168 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertEqual(harness.appState.messages.map(\.content), [sessionIDs.last ?? ""])
         XCTAssertEqual(harness.appState.turnState, .idle)
         XCTAssertFalse(harness.appState.activeChatScrollSessionIdentity.isReconciling)
+    }
+
+    /// #446: the open id is a runtime id Hermes can reap. Refresh resumes
+    /// the chat's stored id, which Hermes always accepts, instead of the
+    /// runtime id it no longer knows ("session not found").
+    func testRefreshResumesStoredIDInsteadOfOpenRuntimeID() async {
+        var requests: [String] = []
+        let row = session("runtime-old", storedID: "stored-a")
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [row] },
+                openSession: { _, sessionID, _ in
+                    requests.append(sessionID)
+                    if sessionID == "runtime-old" {
+                        throw RpcError(code: 4007, message: "session not found")
+                    }
+                    return SessionResumeResult(
+                        sessionId: "runtime-new",
+                        storedSessionId: sessionID,
+                        messages: [],
+                        snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+                    )
+                },
+                refreshContext: { _, _ in }
+            )
+        )
+        installComposerClient(in: harness)
+        harness.appState.sessions = [row]
+        harness.appState.activeSessionId = "runtime-old"
+
+        await harness.appState.refreshActiveSession()
+
+        XCTAssertEqual(requests, ["stored-a"])
+        XCTAssertEqual(harness.appState.activeSessionId, "runtime-new")
+        XCTAssertEqual(harness.appState.turnState, .idle)
+        XCTAssertNil(harness.appState.errorMessage)
+    }
+
+    /// A reopened chat's runtime id may be in neither the list nor the
+    /// scroll identity; the stored id its resume recorded still routes the
+    /// refresh.
+    func testRefreshResumesRecordedStoredIDForUnlistedRuntime() async {
+        var requests: [String] = []
+        let index = ConversationIdentityIndex()
+        _ = index.recordAuthoritative(
+            runtimeID: "runtime-old",
+            durableID: "stored-a",
+            profile: "default",
+            source: .resume
+        )
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [] },
+                openSession: { _, sessionID, _ in
+                    requests.append(sessionID)
+                    if sessionID == "runtime-old" {
+                        throw RpcError(code: 4007, message: "session not found")
+                    }
+                    return SessionResumeResult(
+                        sessionId: "runtime-new",
+                        storedSessionId: sessionID,
+                        messages: [],
+                        snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+                    )
+                },
+                refreshContext: { _, _ in }
+            ),
+            conversationIdentityIndex: index
+        )
+        installComposerClient(in: harness)
+        harness.appState.activeSessionId = "runtime-old"
+
+        await harness.appState.refreshActiveSession()
+
+        XCTAssertEqual(requests, ["stored-a"])
+        XCTAssertEqual(harness.appState.activeSessionId, "runtime-new")
+        XCTAssertEqual(harness.appState.turnState, .idle)
+        XCTAssertNil(harness.appState.errorMessage)
+    }
+
+    /// #446: the chat title's touch-and-hold menu acts on the open chat's
+    /// row even after a reopen gave the chat a runtime id the row doesn't
+    /// name, and carries that id so rename and delete reach the open chat.
+    func testActiveChatSessionSummaryFindsRowForReopenedRuntime() {
+        let index = ConversationIdentityIndex()
+        _ = index.recordAuthoritative(
+            runtimeID: "runtime-new",
+            durableID: "stored-a",
+            profile: "default",
+            source: .resume
+        )
+        let harness = makeHarness(conversationIdentityIndex: index)
+        harness.appState.sessions = [session("stored-a"), session("stored-b")]
+
+        harness.appState.activeSessionId = "runtime-new"
+        let summary = harness.appState.activeChatSessionSummary
+        XCTAssertEqual(summary?.id, "stored-a")
+        XCTAssertEqual(summary?.alternateIds, ["runtime-new"])
+
+        harness.appState.activeSessionId = "stored-b"
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.id, "stored-b")
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.alternateIds, [])
+
+        harness.appState.activeSessionId = "unsaved-new-chat"
+        XCTAssertNil(harness.appState.activeChatSessionSummary)
+
+        // An alternate id two rows share names neither chat: the menu's
+        // rename, archive and delete must not guess.
+        harness.appState.sessions = [
+            session("stored-c", alternateIDs: ["runtime-shared"]),
+            session("stored-d", alternateIDs: ["runtime-shared"])
+        ]
+        harness.appState.activeSessionId = "runtime-shared"
+        XCTAssertNil(harness.appState.activeChatSessionSummary)
+
+        harness.appState.sessions = [session("stored-c", alternateIDs: ["runtime-shared"])]
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.id, "stored-c")
+
+        // Two rows match the chat's own ids (one by the open id, one by its
+        // recorded stored id): the recorded stored id decides, never order.
+        harness.appState.sessions = [session("runtime-new"), session("stored-a")]
+        harness.appState.activeSessionId = "runtime-new"
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.id, "stored-a")
+
+        // With no recorded stored id, two own-id matches name neither chat
+        // (a row without a stored id must not win by nil matching nil).
+        harness.appState.sessions = [
+            session("runtime-r", storedID: "stored-s"),
+            session("stored-s")
+        ]
+        harness.appState.activeSessionId = "runtime-r"
+        XCTAssertNil(harness.appState.activeChatSessionSummary)
+    }
+
+    /// #512: an open cron run gets the title menu too. Its row lives in the
+    /// Cron list, not the chats, and is found under a reopened runtime id.
+    func testActiveChatSessionSummaryFindsCronRunRow() {
+        let index = ConversationIdentityIndex()
+        _ = index.recordAuthoritative(
+            runtimeID: "runtime-cron",
+            durableID: "cron-run-a",
+            profile: "default",
+            source: .resume
+        )
+        let harness = makeHarness(conversationIdentityIndex: index)
+        harness.appState.sessions = [session("stored-a")]
+        harness.appState.cronSessions = [
+            session("cron-run-a", source: .cron),
+            session("cron-run-other", profile: "work", source: .cron)
+        ]
+
+        harness.appState.activeSessionId = "cron-run-a"
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.id, "cron-run-a")
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.source, .cron)
+
+        harness.appState.activeSessionId = "runtime-cron"
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.id, "cron-run-a")
+        XCTAssertEqual(harness.appState.activeChatSessionSummary?.alternateIds, ["runtime-cron"])
+
+        // Another profile's run is not this chat's row.
+        harness.appState.activeSessionId = "cron-run-other"
+        XCTAssertNil(harness.appState.activeChatSessionSummary)
     }
 
     func testResumeDedupNormalizesPersistedBoundaryBeforeReplayingBufferedDelta() async {
@@ -1964,6 +2265,46 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertEqual(clarifyCards.first?.clarify?.requestId, "gateway-rid-1")
     }
 
+    func testLiveClarifyEventSupersedesMixedExpiredPendingPushCard() async {
+        let harness = makeHarness()
+        harness.appState.activeSessionId = "stored-a"
+        let pushed = ClarifyActivity(
+            requestId: "conduit-push-mixed",
+            questions: [
+                ClarifyQuestion(id: "old", question: "Which color?", choices: [], status: .expired),
+                ClarifyQuestion(id: "active", question: "Which region?", choices: [], status: .pending)
+            ]
+        )
+        XCTAssertEqual(pushed.status, .expired)
+        XCTAssertEqual(pushed.presentationStatus, .pending)
+        harness.appState.messages = [
+            ChatMessage(
+                id: "clarify-conduit-push-mixed",
+                role: .clarify,
+                content: pushed.displayQuestion,
+                timestamp: "1",
+                clarify: pushed
+            )
+        ]
+
+        harness.appState.handleStreamEvent(
+            .clarify(
+                sessionId: "stored-a",
+                activity: ClarifyActivity(
+                    requestId: "gateway-rid-mixed",
+                    questions: [
+                        ClarifyQuestion(id: "color", question: "Which color?", choices: []),
+                        ClarifyQuestion(id: "region", question: "Which region?", choices: [])
+                    ]
+                )
+            )
+        )
+
+        let cards = harness.appState.messages.filter { $0.role == .clarify }
+        XCTAssertEqual(cards.count, 1, "An answerable mixed push card must be superseded by the live batch")
+        XCTAssertEqual(cards.first?.clarify?.requestId, "gateway-rid-mixed")
+    }
+
     func testLiveClarifyEventSupersedeMatchesNormalizedQuestion() async {
         // The push question is flattened plugin-side while the live event
         // carries the gateway's text; formatting drift (whitespace, case)
@@ -2155,7 +2496,7 @@ final class AppStateChatResumeTests: XCTestCase {
         XCTAssertEqual(card?.clarify?.status, .error)
         XCTAssertEqual(
             card?.clarify?.questions.first?.error,
-            "This device is not paired with a push relay.",
+            "This iPhone isn't set up to answer from notifications. Set it up again in Settings > Notifications.",
             "The relay path must run before the gateway-client guard and surface relay errors"
         )
     }
@@ -2502,6 +2843,238 @@ final class AppStateChatResumeTests: XCTestCase {
         harness.appState.recordChatViewport(.latest, for: key)
         harness.appState.flushChatResumeViewport()
         XCTAssertEqual(harness.store.snapshot(for: key), .latest)
+    }
+
+    func testNotificationOpenLaidOutDuringItsContextRefreshStillOpened() async {
+        // On screen, the chat lays out the resumed transcript while the open
+        // still waits on its context refresh, which ends the viewport
+        // transition. That is this open finishing, not a newer navigation:
+        // a call from Hermes (#449) opens voice only after an open that says
+        // it opened.
+        let appReference = WeakAppStateReference()
+        let messagesB = [
+            ChatMessage(id: "b", role: .assistant, content: "B", timestamp: "1")
+        ]
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                loadCatalog: { _, _ in [self.session("stored-b")] },
+                openSession: { _, sessionID, _ in
+                    SessionResumeResult(
+                        sessionId: sessionID,
+                        messages: messagesB,
+                        snapshot: SessionRuntimeSnapshot(object: [:])
+                    )
+                },
+                refreshContext: { _, _ in
+                    guard let app = appReference.value,
+                          let key = app.activeChatScrollSessionIdentity.canonicalSessionKey
+                            ?? app.activeSessionId.map({ ChatScrollSessionKey(profile: app.activeProfile, sessionID: $0) })
+                    else { return }
+                    app.chatViewportLayoutDidSettle(
+                        sessionKey: key,
+                        transitionGeneration: app.chatViewportTransitionGeneration,
+                        transcriptRevision: app.chatTranscriptRevision,
+                        renderRevision: 1,
+                        receivedScopedPreference: true
+                    )
+                }
+            )
+        )
+        appReference.value = harness.appState
+        let connection = HermesConnection(baseUrl: "https://one.example", ticket: "ticket")
+        harness.appState.connection = connection
+        harness.appState.client = HermesClient(connection: connection, profile: "default")
+        harness.appState.sessions = [session("stored-a")]
+        harness.appState.activeSessionId = "stored-a"
+
+        let opened = await harness.appState.openNotificationTarget(
+            ConduitNotificationTarget(profile: nil, sessionId: "stored-b", type: nil)
+        )
+
+        XCTAssertTrue(opened, "The chat laying out its own transcript is the open finishing")
+        XCTAssertEqual(harness.appState.activeSessionId, "stored-b")
+        XCTAssertEqual(harness.appState.messages, messagesB)
+    }
+
+    func testCrossProfileCallOpenKeepsItsTransitionUntilTheChatLaysOut() async {
+        // A call can name a profile other than the one on screen (#449). The
+        // open lends its viewport transition to the profile switch, and the
+        // switch leaves it with the open: the chat opens, and its scroll
+        // position is recorded only once it has laid out.
+        let workSession = session("work-session", profile: "work")
+        let workMessages = [
+            ChatMessage(id: "work-message", role: .assistant, content: "Work", timestamp: "2")
+        ]
+        let fixture = makeCrossProfileCallFixture(
+            workCatalog: { return [workSession] },
+            workMessages: workMessages
+        )
+        defer { PushNotificationService.shared.clearPendingTarget(fixture.target) }
+
+        let opened = await fixture.appState.openNotificationTarget(fixture.target)
+
+        XCTAssertTrue(opened, "A call for another profile opens its chat")
+        XCTAssertEqual(fixture.appState.activeProfile, "work")
+        XCTAssertEqual(fixture.appState.activeSessionId, workSession.id)
+        XCTAssertEqual(fixture.appState.messages, workMessages)
+        fixture.appState.recordChatViewport(.latest, for: fixture.workKey)
+        fixture.appState.flushChatResumeViewport()
+        XCTAssertNil(
+            fixture.store.snapshot(for: fixture.workKey),
+            "The viewport stays frozen until the opened chat lays out"
+        )
+
+        fixture.appState.chatViewportLayoutDidSettle(
+            sessionKey: fixture.workKey,
+            transitionGeneration: fixture.appState.chatViewportTransitionGeneration,
+            transcriptRevision: fixture.appState.chatTranscriptRevision,
+            renderRevision: 1,
+            receivedScopedPreference: true
+        )
+        fixture.appState.recordChatViewport(.latest, for: fixture.workKey)
+        fixture.appState.flushChatResumeViewport()
+        XCTAssertEqual(fixture.store.snapshot(for: fixture.workKey), .latest)
+    }
+
+    func testCrossProfileCallOpenThatGivesUpAfterTheSwitchReleasesTheViewport() async {
+        // The switch marks the lent transition as replaced but replaces no
+        // transcript, so an open that stops after it (here the work chat list
+        // fails to load) releases the viewport itself.
+        let fixture = makeCrossProfileCallFixture(
+            workCatalog: { throw ControlledLifecycleError.failed },
+            workMessages: []
+        )
+        defer { PushNotificationService.shared.clearPendingTarget(fixture.target) }
+
+        let opened = await fixture.appState.openNotificationTarget(fixture.target)
+
+        XCTAssertFalse(opened)
+        XCTAssertEqual(fixture.appState.activeProfile, "work")
+        fixture.appState.recordChatViewport(.latest, for: fixture.workKey)
+        fixture.appState.flushChatResumeViewport()
+        XCTAssertEqual(
+            fixture.store.snapshot(for: fixture.workKey),
+            .latest,
+            "An open that gave up must not leave the viewport frozen"
+        )
+    }
+
+    func testChatLinkStopsBeforeTheProfileSwitchWhenACallStartedMeanwhile() async {
+        // A call from Hermes needs no tap, so one can ring while a chat
+        // link's open waits on the gateway: on its bot checks, or on the
+        // switch's own ticket. The link then stops short of the profile
+        // switch, which would end the call.
+        for duringTicket in [false, true] {
+            let defaultSession = session("default-session")
+            let appReference = WeakAppStateReference()
+            let harness = makeHarness(
+                lifecycleOperations: ChatResumeLifecycleOperations(
+                    connectClient: { _ in },
+                    loadCatalog: { _, _ in [defaultSession] },
+                    mintTicket: { _ in
+                        if duringTicket { appReference.value?.isNativeHermesCallActive = true }
+                        return "profile-ticket"
+                    },
+                    refreshContext: { _, _ in },
+                    loadProfiles: {},
+                    loadBusyInputMode: { _ in },
+                    loadProfileDisplayPreferences: {},
+                    loadSlashCommands: {},
+                    botRoster: { _ in
+                        if !duringTicket { appReference.value?.isNativeHermesCallActive = true }
+                        return BotRosterSnapshot(bots: [], supportsBotProtocol: false)
+                    },
+                    findBotChat: { _, _ in [] }
+                )
+            )
+            appReference.value = harness.appState
+            let connection = HermesConnection(baseUrl: "https://127.0.0.1:1", ticket: "saved-ticket")
+            harness.appState.connection = connection
+            harness.appState.client = HermesClient(connection: connection, profile: "default")
+            harness.appState.isConnected = true
+            harness.appState.showLogin = false
+            harness.appState.sessions = [defaultSession]
+            harness.appState.activeSessionId = defaultSession.id
+            let target = ConduitNotificationTarget(
+                profile: "work",
+                sessionId: "work-session",
+                type: nil,
+                isChatLink: true
+            )
+
+            let opened = await harness.appState.openNotificationTarget(target)
+
+            XCTAssertFalse(opened, "call started during the ticket: \(duringTicket)")
+            XCTAssertEqual(harness.appState.activeProfile, "default")
+            XCTAssertEqual(harness.appState.activeSessionId, defaultSession.id)
+            XCTAssertEqual(harness.appState.connection, connection)
+            XCTAssertEqual(
+                harness.appState.errorMessage,
+                AppLocalization.string("End the call to open a chat in another profile.")
+            )
+        }
+    }
+
+    /// Conduit on the default profile with a call answered for a chat on the
+    /// work profile, routed the way an on-screen answer is: the pending
+    /// target keeps the switch's own sync from resuming a chat.
+    private func makeCrossProfileCallFixture(
+        workCatalog: @escaping () throws -> [SessionSummary],
+        workMessages: [ChatMessage]
+    ) -> (
+        appState: AppState,
+        store: ChatResumeStore,
+        target: ConduitNotificationTarget,
+        workKey: ChatScrollSessionKey
+    ) {
+        let defaultSession = session("default-session")
+        let harness = makeHarness(
+            lifecycleOperations: ChatResumeLifecycleOperations(
+                connectClient: { _ in },
+                loadCatalog: { client, _ in
+                    if (client.profile ?? "default") == "work" {
+                        return try workCatalog()
+                    }
+                    return [defaultSession]
+                },
+                mintTicket: { _ in "profile-ticket" },
+                openSession: { client, sessionID, _ in
+                    SessionResumeResult(
+                        sessionId: sessionID,
+                        messages: (client.profile ?? "default") == "work" ? workMessages : [],
+                        snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+                    )
+                },
+                refreshContext: { _, _ in },
+                loadProfiles: {},
+                loadBusyInputMode: { _ in },
+                loadProfileDisplayPreferences: {},
+                loadSlashCommands: {},
+                botRoster: { _ in BotRosterSnapshot(bots: [], supportsBotProtocol: false) },
+                findBotChat: { _, _ in [] }
+            )
+        )
+        let connection = HermesConnection(baseUrl: "https://127.0.0.1:1", ticket: "saved-ticket")
+        harness.appState.connection = connection
+        harness.appState.client = HermesClient(connection: connection, profile: "default")
+        harness.appState.isConnected = true
+        harness.appState.showLogin = false
+        harness.appState.sessions = [defaultSession]
+        harness.appState.activeSessionId = defaultSession.id
+        let call = HermesCallRequest(id: "", kind: .done, title: "Deploy", sessionIDs: ["work-session"])
+        let target = ConduitNotificationTarget(
+            profile: "work",
+            sessionId: "work-session",
+            type: HermesCallRequest.type,
+            call: call
+        )
+        PushNotificationService.shared.routeAnsweredHermesCall(target)
+        return (
+            harness.appState,
+            harness.store,
+            target,
+            ChatScrollSessionKey(profile: "work", sessionID: "work-session")
+        )
     }
 
     func testStaleNotificationContinuationCannotSupersedeNewerSessionTransition() async {
@@ -3131,6 +3704,102 @@ final class AppStateChatResumeTests: XCTestCase {
             "stored-a",
             "Another profile's registry rows cannot reattribute this profile's runtime"
         )
+    }
+
+    func testOpenChatLiveStatusPrecedence() {
+        // #454: the open chat's own turn state outranks a poll once it is
+        // known, except that a question waiting on the user always shows.
+        let harness = makeHarness()
+        let appState = harness.appState
+        let open = self.session("open")
+        let other = self.session("other")
+        appState.sessions = [open, other]
+        appState.activeSessionId = "open"
+        appState.isConnected = true
+        let profile = appState.activeProfile
+
+        appState.handleStreamEvent(.sessionBusy(sessionId: "open", busy: false))
+        XCTAssertEqual(appState.turnState, .idle)
+        appState.recordActiveListEvidence(
+            [
+                LiveSessionStatus(runtimeSessionId: "rt-open", storedSessionId: "open", status: "working"),
+                LiveSessionStatus(runtimeSessionId: "rt-other", storedSessionId: "other", status: "working"),
+            ],
+            profile: profile
+        )
+        XCTAssertNil(appState.sessionLiveStatus(open), "A known idle open chat outranks a poll's working row")
+        XCTAssertEqual(appState.sessionLiveStatus(other), .working)
+
+        appState.handleStreamEvent(.sessionBusy(sessionId: "open", busy: true))
+        XCTAssertEqual(appState.turnState, .running)
+        appState.recordActiveListEvidence([], profile: profile)
+        XCTAssertEqual(appState.sessionLiveStatus(open), .working, "A running open chat shows without a poll row")
+        XCTAssertNil(appState.sessionLiveStatus(other))
+
+        appState.recordActiveListEvidence(
+            [LiveSessionStatus(runtimeSessionId: "rt-open", storedSessionId: "open", status: "waiting")],
+            profile: profile
+        )
+        XCTAssertEqual(appState.sessionLiveStatus(open), .needsInput, "Needs input outranks the local running state")
+
+        appState.isConnected = false
+        XCTAssertEqual(
+            appState.sessionLiveStatus(open), .working,
+            "Disconnected, the poll is ignored and only the open chat's own state shows"
+        )
+        appState.recordActiveListEvidence(
+            [LiveSessionStatus(runtimeSessionId: "rt-other", storedSessionId: "other", status: "waiting")],
+            profile: profile
+        )
+        XCTAssertNil(appState.sessionLiveStatus(other), "A snapshot is not shown while disconnected")
+    }
+
+    func testAnotherProfilesActiveListLeavesTheChatListAlone() {
+        let harness = makeHarness()
+        let appState = harness.appState
+        let other = self.session("other")
+        appState.sessions = [other]
+        appState.isConnected = true
+
+        appState.recordActiveListEvidence(
+            [LiveSessionStatus(runtimeSessionId: "rt-other", storedSessionId: "other", status: "working")],
+            profile: appState.activeProfile + "-elsewhere"
+        )
+        XCTAssertNil(appState.sessionLiveStatus(other))
+    }
+
+    func testLiveStatusChipsHideWhileTheGatewayLacksActiveList() async {
+        // #454: a gateway without session.active_list can't fill the Working
+        // and Needs input chips, so they hide rather than show a 0.
+        let probe = LiveStatusProbeStub()
+        let harness = makeHarness(lifecycleOperations: ChatResumeLifecycleOperations(
+            probeActiveSessions: { _ in
+                probe.calls += 1
+                if let error = probe.error { throw error }
+                return []
+            }
+        ))
+        let appState = harness.appState
+        let connection = HermesConnection(baseUrl: "https://one.example", ticket: "ticket")
+        appState.client = HermesClient(connection: connection, profile: "default")
+        appState.isConnected = true
+        XCTAssertTrue(appState.liveSessionStatusAvailable)
+
+        probe.error = URLError(.timedOut)
+        await appState.refreshLiveSessionStatuses()
+        XCTAssertTrue(appState.liveSessionStatusAvailable, "A transient failure keeps the chips")
+
+        probe.error = RpcError(code: -32601, message: "Method not found")
+        await appState.refreshLiveSessionStatuses()
+        XCTAssertFalse(appState.liveSessionStatusAvailable)
+        await appState.refreshLiveSessionStatuses()
+        XCTAssertEqual(probe.calls, 2, "The same connection isn't asked again")
+
+        probe.error = nil
+        appState.client = HermesClient(connection: connection, profile: "default")
+        await appState.refreshLiveSessionStatuses()
+        XCTAssertEqual(probe.calls, 3, "A new connection asks again")
+        XCTAssertTrue(appState.liveSessionStatusAvailable)
     }
 
     func testConfirmedAliasNotificationDecisionSurvivesRotatedRuntimePromotion() async {
@@ -6464,7 +7133,8 @@ final class AppStateChatResumeTests: XCTestCase {
         title: String? = nil,
         storedID: String? = nil,
         alternateIDs: [String] = [],
-        profile: String = "default"
+        profile: String = "default",
+        source: SessionSource = .chat
     ) -> SessionSummary {
         SessionSummary(
             id: id,
@@ -6474,7 +7144,7 @@ final class AppStateChatResumeTests: XCTestCase {
             model: "Hermes",
             updatedLabel: "now",
             profile: profile,
-            source: .chat,
+            source: source,
             isActive: false,
             isArchived: false,
             lineageRootId: nil
@@ -6494,6 +7164,12 @@ final class AppStateChatResumeTests: XCTestCase {
             )
         )
     }
+}
+
+/// The live status poll's probe: what it throws next and how often it ran.
+private final class LiveStatusProbeStub {
+    var error: Error?
+    var calls = 0
 }
 
 /// Seam call counters for the cold-launch owed-bootstrap fixture: one

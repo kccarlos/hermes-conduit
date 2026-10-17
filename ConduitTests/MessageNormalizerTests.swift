@@ -431,6 +431,88 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertTrue(meta.supportsDecisionCards)
     }
 
+    func testNotificationPairingsShowOnlyTheActiveDashboards() throws {
+        let main = UUID()
+        let review = UUID()
+        let removed = UUID()
+        let json = """
+        {
+          "version": "0.2.0",
+          "capabilities": ["decisions"],
+          "gateways": [
+            { "id": "gw-main", "name": "Mac Hermes", "plugin_version": "0.4.0",
+              "plugin_capabilities": ["approval-decisions", "clarify-loop"], "dashboard_id": "\(main.uuidString.lowercased())" },
+            { "id": "gw-review", "name": "Mac Hermes", "plugin_version": "0.3.0",
+              "plugin_capabilities": ["approval-decisions", "clarify-loop"], "dashboard_id": "\(review.uuidString)" },
+            { "id": "gw-removed", "name": "Old", "plugin_version": "0.4.0",
+              "plugin_capabilities": [], "dashboard_id": "\(removed.uuidString)" },
+            { "id": "gw-malformed", "name": "Bad", "plugin_version": null,
+              "plugin_capabilities": [], "dashboard_id": "not-a-uuid" },
+            { "id": "gw-legacy", "name": "Legacy", "plugin_version": "0.2.0",
+              "plugin_capabilities": [], "dashboard_id": null }
+          ]
+        }
+        """
+        let meta = try JSONDecoder().decode(RelayMetaInfo.self, from: Data(json.utf8))
+
+        // On the review dashboard, the main dashboard's up-to-date pairing
+        // never stands in for the review dashboard's own.
+        let onReview = NotificationDashboardPairings(
+            gateways: meta.gateways, activeDashboardID: review, savedDashboardIDs: [main, review]
+        )
+        XCTAssertEqual(onReview.thisDashboard.map(\.id), ["gw-review"])
+        XCTAssertEqual(onReview.thisDashboard.first?.pluginVersion, "0.3.0")
+        // A pre-dashboard pairing can't be attributed while two are saved.
+        XCTAssertEqual(onReview.unscoped.map(\.id), ["gw-legacy"])
+        XCTAssertEqual(onReview.otherDashboardsCount, 1)
+        // A removed dashboard's pairing, or a malformed binding, is not
+        // "another dashboard": there is nothing to switch to.
+        XCTAssertEqual(onReview.unrecognizedCount, 2)
+
+        let onMain = NotificationDashboardPairings(
+            gateways: meta.gateways, activeDashboardID: main, savedDashboardIDs: [main, review]
+        )
+        XCTAssertEqual(onMain.thisDashboard.map(\.id), ["gw-main"])
+    }
+
+    func testNotificationPairingsWithOneDashboardKeepLegacyPairings() {
+        let only = UUID()
+        let gateway = { (id: String, dashboardID: String?) in
+            RelayMetaInfo.Gateway(
+                id: id, name: id, pluginVersion: nil, pluginCapabilities: [], lastEventAt: nil, dashboardID: dashboardID
+            )
+        }
+        let pairings = NotificationDashboardPairings(
+            gateways: [gateway("legacy", nil), gateway("blank", "  "), gateway("scoped", only.uuidString)],
+            activeDashboardID: only,
+            savedDashboardIDs: [only]
+        )
+        // Same rule as push routing: with one dashboard saved, an unscoped
+        // pairing's pushes route to it, so it is this dashboard's.
+        XCTAssertEqual(pairings.thisDashboard.map(\.id), ["legacy", "blank", "scoped"])
+        XCTAssertTrue(pairings.unscoped.isEmpty)
+        XCTAssertEqual(pairings.otherDashboardsCount, 0)
+
+        // With the selected dashboard removed, nothing is judged: push
+        // routing would send the legacy pairing to the one saved dashboard,
+        // but listing it would present it as the selected dashboard's.
+        let noneActive = NotificationDashboardPairings(
+            gateways: [gateway("legacy", nil), gateway("scoped", only.uuidString)],
+            activeDashboardID: nil,
+            savedDashboardIDs: [only]
+        )
+        XCTAssertEqual(noneActive, NotificationDashboardPairings(gateways: [], activeDashboardID: nil, savedDashboardIDs: []))
+        XCTAssertTrue(noneActive.thisDashboard.isEmpty)
+        XCTAssertEqual(noneActive.otherDashboardsCount, 0)
+
+        // With every dashboard removed, the same: nothing is listed or counted.
+        let noneSaved = NotificationDashboardPairings(
+            gateways: [gateway("scoped", only.uuidString)], activeDashboardID: nil, savedDashboardIDs: []
+        )
+        XCTAssertEqual(noneSaved.unrecognizedCount, 0)
+        XCTAssertTrue(noneSaved.unscoped.isEmpty)
+    }
+
     func testExpiredPromptErrorClassification() {
         // The gateway's one-shot prompt timeout: JSON-RPC 4009.
         XCTAssertTrue(AppState.isExpiredPromptError(RpcError(code: 4009, message: "no pending approval request")))
@@ -730,7 +812,10 @@ final class MessageNormalizerTests: XCTestCase {
 
         let initialAttempt = service.navigationAttempt
         XCTAssertTrue(service.handleFailedNotificationRoute(target))
-        let retryDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        // A cap, not a timing: the loop exits as soon as the retry lands. A
+        // busy simulator can stall the main actor for seconds inside one
+        // yield, and a 1s cap then expired before the retry got its turn.
+        let retryDeadline = ContinuousClock.now.advanced(by: .seconds(10))
         while service.navigationAttempt == initialAttempt,
               ContinuousClock.now < retryDeadline {
             await Task.yield()
@@ -824,6 +909,38 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertEqual(projects[0].previewSessions.map(\.title), ["Plan the trip"])
     }
 
+    func testProjectTreeMarksAutoDiscoveredReposAsNotEditable() {
+        let projects = MessageNormalizer.normalizeProjects(
+            .object([
+                "projects": .array([
+                    .object(["id": .string("p1"), "label": .string("Skunkworks"), "isAuto": .bool(false)]),
+                    .object(["id": .string("auto:repo"), "label": .string("repo"), "isAuto": .bool(true)])
+                ])
+            ]),
+            profile: "default"
+        )
+
+        XCTAssertEqual(projects.map(\.isAuto), [false, true])
+    }
+
+    func testOnlyCreatedProjectIDsAreEditableWhenTheFlagIsMissing() {
+        // Created projects are `p_<hex>`; without the flag, any other id
+        // counts as auto so editability fails closed.
+        let projects = MessageNormalizer.normalizeProjects(
+            .object([
+                "projects": .array([
+                    .object(["id": .string("p_1a2b3c4d"), "label": .string("Skunkworks")]),
+                    .object(["id": .string("/srv/repos/conduit"), "label": .string("conduit")]),
+                    .object(["id": .string("auto:repo"), "label": .string("repo")]),
+                    .object(["id": .string("__no_project__"), "label": .string("Home"), "is_no_project": .bool(true)])
+                ])
+            ]),
+            profile: "default"
+        )
+
+        XCTAssertEqual(projects.map(\.isAuto), [false, true, true, false], "Home is not an auto repo")
+    }
+
     func testProjectWithoutPrimaryPathAnchorsAtFirstRepoRoot() {
         // `projects.tree` emits `path: null` for an explicit project whose
         // primary_path was never set, but still seeds its folders as repos.
@@ -906,6 +1023,44 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertEqual(detail?.title, "App")
         XCTAssertEqual(detail?.lanes.map(\.title), ["main"])
         XCTAssertEqual(detail?.lanes.first?.sessions.map(\.title), ["Fix sidebar"])
+    }
+
+    func testProjectSessionLaneKeepsItsFolderPath() {
+        let detail = MessageNormalizer.normalizeProjectSessions(
+            .object([
+                "project": .object([
+                    "id": .string("p_app"),
+                    "label": .string("App"),
+                    "repos": .array([
+                        .object([
+                            "label": .string("Conduit"),
+                            "groups": .array([
+                                .object([
+                                    "id": .string("voice"),
+                                    "label": .string("voice-v2"),
+                                    "path": .string("/work/app/.worktrees/voice-v2"),
+                                    "sessions": .array([
+                                        .object(["id": .string("s1"), "title": .string("Barge-in")])
+                                    ])
+                                ]),
+                                .object([
+                                    "id": .string("bare"),
+                                    "path": .string("/work/app"),
+                                    "sessions": .array([
+                                        .object(["id": .string("s2"), "title": .string("Release")])
+                                    ])
+                                ])
+                            ])
+                        ])
+                    ])
+                ])
+            ]),
+            profile: "default"
+        )
+
+        XCTAssertEqual(detail?.lanes.map(\.title), ["voice-v2", "/work/app"])
+        // A lane labeled by its path doesn't repeat it.
+        XCTAssertEqual(detail?.lanes.map(\.path), ["/work/app/.worktrees/voice-v2", nil])
     }
 
     func testGeneratedSessionTitleIsNormalizedForDisplay() {
@@ -1072,6 +1227,182 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertEqual(messages[0].rawContent, original)
         XCTAssertEqual(messages[0].attachments?.first?.name, "screenshot.png")
         XCTAssertEqual(messages[0].attachments?.first?.mimeType, "image/png")
+    }
+
+    func testStagedFileReferenceBecomesADocumentAttachment() {
+        let original = """
+        @file:/root/.hermes/attachments/report.pdf
+
+        Summarise this.
+
+        --- Attached Context ---
+
+        📎 @file:/root/.hermes/attachments/report.pdf (application/pdf, 1.2 MB) — binary file, not inlined as text. \
+        It is available on disk at `/root/.hermes/attachments/report.pdf`. Use your tools to work with it.
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(61),
+                "role": .string("user"),
+                "content": .string(original)
+            ])
+        ])
+
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages[0].content, "Summarise this.")
+        XCTAssertEqual(messages[0].rawContent, original)
+        XCTAssertEqual(messages[0].attachments?.count, 1)
+        XCTAssertEqual(messages[0].attachments?.first?.name, "report.pdf")
+        XCTAssertEqual(messages[0].attachments?.first?.uri, "/root/.hermes/attachments/report.pdf")
+        XCTAssertEqual(messages[0].attachments?.first?.mimeType, "application/pdf")
+        XCTAssertEqual(messages[0].attachments?.first?.kind, .document)
+    }
+
+    func testQuotedFileReferenceKeepsTheWholeName() {
+        let original = """
+        @file:`/root/.hermes/attachments/Q3 Report.pdf`
+        @file:/root/.hermes/attachments/notes.txt
+
+        --- Attached Context ---
+
+        📎 @file:`/root/.hermes/attachments/Q3 Report.pdf` (application/pdf, 80 KB) — binary file.
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(62),
+                "role": .string("user"),
+                "content": .string(original)
+            ])
+        ])
+
+        XCTAssertEqual(messages[0].content, "")
+        XCTAssertEqual(messages[0].attachments?.map(\.name), ["Q3 Report.pdf", "notes.txt"])
+        XCTAssertEqual(messages[0].attachments?.map(\.uri), [
+            "/root/.hermes/attachments/Q3 Report.pdf",
+            "/root/.hermes/attachments/notes.txt"
+        ])
+    }
+
+    func testFilesAndImagesFromOneTurnBothBecomeAttachments() {
+        let original = """
+        @file:/root/.hermes/attachments/notes.txt
+
+        Look at both
+
+        --- Attached Context ---
+
+        📌 @file:/root/.hermes/attachments/notes.txt (3 tokens)
+        hello
+        @image:/root/.hermes/images/upload_20261006_1.png
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(63),
+                "role": .string("user"),
+                "content": .string(original)
+            ])
+        ])
+
+        XCTAssertEqual(messages[0].content, "Look at both")
+        XCTAssertEqual(messages[0].attachments?.map(\.name), ["notes.txt", "upload_20261006_1.png"])
+        XCTAssertEqual(messages[0].attachments?.map(\.kind), [Attachment.Kind.document, .image])
+    }
+
+    func testFileReferenceTypedInTheTextStaysInTheText() {
+        let original = """
+        Compare @file:src/main.py with the spec
+
+        --- Context Warnings ---
+        - @file:src/main.py: file not found
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(64),
+                "role": .string("user"),
+                "content": .string(original)
+            ])
+        ])
+
+        XCTAssertEqual(messages[0].content, "Compare @file:src/main.py with the spec")
+        XCTAssertEqual(messages[0].rawContent, original)
+        XCTAssertNil(messages[0].attachments)
+    }
+
+    func testContextHeadingTypedWithoutAReferenceStays() {
+        let original = """
+        Hermes printed this:
+
+        --- Attached Context ---
+
+        and then stopped.
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(65),
+                "role": .string("user"),
+                "content": .string(original)
+            ])
+        ])
+
+        XCTAssertEqual(messages[0].content, original)
+        XCTAssertNil(messages[0].attachments)
+    }
+
+    func testFileAttachReplyWithoutAFileReferenceUsesThePath() {
+        XCTAssertEqual(
+            HermesClient.fileAttachmentReference(from: .object([
+                "ref_path": .string("/root/.hermes/attachments/report.pdf"),
+                "ref_text": .string("report.pdf")
+            ])),
+            "@file:/root/.hermes/attachments/report.pdf",
+            "A ref_text that isn't an @file: reference gives way to the staged path"
+        )
+        XCTAssertEqual(
+            HermesClient.fileAttachmentReference(from: .object([
+                "path": .string("/root/.hermes/attachments/report.pdf")
+            ])),
+            "@file:/root/.hermes/attachments/report.pdf"
+        )
+    }
+
+    func testContextFooterBelowAnyHermesReferenceIsDropped() {
+        for typed in [
+            "Summarise @url:https://example.com/post",
+            "Review @diff please",
+            "Read @file:\"notes/Q3 plan.md\""
+        ] {
+            let original = "\(typed)\n\n--- Attached Context ---\n\n🌐 expanded content"
+            let messages = MessageNormalizer.normalizeMessages([
+                .object([
+                    "id": .number(66),
+                    "role": .string("user"),
+                    "content": .string(original)
+                ])
+            ])
+            XCTAssertEqual(messages[0].content, typed, typed)
+        }
+    }
+
+    func testFileAttachReplyGivesThePromptReference() {
+        XCTAssertEqual(
+            HermesClient.fileAttachmentReference(from: .object([
+                "attached": .bool(true),
+                "path": .string("/root/.hermes/attachments/Q3 Report.pdf"),
+                "ref_text": .string("@file:`/root/.hermes/attachments/Q3 Report.pdf`")
+            ])),
+            "@file:`/root/.hermes/attachments/Q3 Report.pdf`"
+        )
+        XCTAssertEqual(
+            HermesClient.fileAttachmentReference(from: .object([
+                "attached": .bool(true),
+                "path": .string("/root/.hermes/attachments/Q3 Report.pdf")
+            ])),
+            "@file:`/root/.hermes/attachments/Q3 Report.pdf`",
+            "A reply without ref_text still names the staged file"
+        )
+        XCTAssertNil(HermesClient.fileAttachmentReference(from: .object(["attached": .bool(true)])))
+        XCTAssertEqual(HermesClient.formatReferenceValue("/tmp/a.pdf"), "/tmp/a.pdf")
+        XCTAssertEqual(HermesClient.formatReferenceValue("/tmp/it's `odd`.pdf"), "\"/tmp/it's `odd`.pdf\"")
     }
 
     func testModelRuntimeNoticeBecomesACompactSystemActivity() {
@@ -1884,6 +2215,51 @@ final class MessageNormalizerTests: XCTestCase {
     /// how they must actually be presented. Conduit must honor that contract
     /// at the normalization boundary instead of mapping the physical role
     /// straight onto a human user bubble.
+
+    func testSteerRowStaysUserRowWithMarkerRemoved() {
+        // Hermes persists a mid-turn steer as its own user row, wrapped in
+        // the out-of-band marker the model trusts (issue #337).
+        let marker = "\n\n[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]\nUse the staging database instead\n[/OUT-OF-BAND USER MESSAGE]"
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(310),
+                "role": .string("user"),
+                "content": .string(marker),
+                "display_kind": .string("steer")
+            ])
+        ])
+
+        let row = messages.first
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(row?.role, .user)
+        XCTAssertEqual(row?.content, "Use the staging database instead")
+        XCTAssertEqual(row?.isSteer, true)
+    }
+
+    func testVisibleUserTextMovesImageTokensOut() {
+        XCTAssertEqual(
+            MessageNormalizer.visibleUserText("Here is the screenshot.\n@image:/root/x.png")
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "Here is the screenshot."
+        )
+        XCTAssertEqual(MessageNormalizer.visibleUserText("No images"), "No images")
+    }
+
+    func testSteerTextWithoutMarkerIsKept() {
+        XCTAssertEqual(MessageNormalizer.steerText(fromMarker: "  plain steer \n"), "plain steer")
+    }
+
+    func testOrdinaryUserRowIsNotSteer() {
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(311),
+                "role": .string("user"),
+                "content": .string("Hello")
+            ])
+        ])
+
+        XCTAssertEqual(messages.first?.isSteer, false)
+    }
 
     func testHiddenUserRowIsDroppedEntirely() {
         let messages = MessageNormalizer.normalizeMessages([

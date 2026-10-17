@@ -52,6 +52,15 @@ enum StreamEventParser {
             let reasoning = payload?["reasoning"]?.stringValue
             return .messageComplete(sessionId: sessionId, messageId: messageId, content: content, reasoning: reasoning)
 
+        case "message.reaction":
+            guard let rowId = HermesClient.exactIntValue(payload?["row_id"]), rowId > 0 else { return nil }
+            return .messageReaction(
+                sessionId: sessionId,
+                rowId: rowId,
+                reactions: MessageNormalizer.messageReactions(from: payload?["reactions"]),
+                role: payload?["role"]?.stringValue ?? ""
+            )
+
         case "error":
             return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? AppLocalization.string("Hermes reported an error."))
 
@@ -177,7 +186,7 @@ enum StreamEventParser {
 
         case let eventType where eventType.hasPrefix("subagent."):
             guard let payload else { return nil }
-            let activity = Self.delegateAgentActivity(from: payload, eventType: eventType)
+            let activity = Self.delegateAgentActivity(from: payload, eventType: eventType, sessionId: sessionId)
             return .delegateAgent(sessionId: sessionId, activity: activity)
 
         default:
@@ -185,8 +194,22 @@ enum StreamEventParser {
         }
     }
 
-    private static func delegateAgentActivity(from payload: [String: AnyCodable], eventType: String) -> DelegateAgentActivity {
-        let id = payload["id"]?.stringValue ?? payload["agent_id"]?.stringValue ?? UUID().uuidString
+    private static func delegateAgentActivity(from payload: [String: AnyCodable], eventType: String, sessionId: String) -> DelegateAgentActivity {
+        // Hermes names the agent `subagent_id`; every subagent.* event for one
+        // agent carries it. Without it each progress event became its own
+        // "Running" card (#492). Older emitters omit it: their goal and slot
+        // in the batch still name one agent, within this session.
+        func nonEmpty(_ key: String) -> String? {
+            payload[key]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+        }
+        let subagentID = nonEmpty("subagent_id")
+        let goal = payload["goal"]?.stringValue ?? payload["task"]?.stringValue ?? ""
+        let taskIndex = payload["task_index"]?.intValue ?? 0
+        let delegationID = nonEmpty("delegation_id")
+        // A delegation id and slot name the agent alone, so a frame that
+        // omits the goal still lands on its card.
+        let id = subagentID ?? nonEmpty("id") ?? nonEmpty("agent_id")
+            ?? (delegationID.map { "\(sessionId)/\($0)#\(taskIndex)" } ?? "\(sessionId)/#\(taskIndex):\(goal)")
         let statusValue = payload["status"]?.stringValue ?? {
             if eventType.contains("fail") { return "failed" }
             if eventType.contains("interrupt") { return "interrupted" }
@@ -194,20 +217,32 @@ enum StreamEventParser {
             if eventType.contains("spawn") { return "queued" }
             return "running"
         }()
-        let status = DelegateAgentActivity.Status(rawValue: statusValue.lowercased()) ?? .running
+        let status: DelegateAgentActivity.Status
+        switch statusValue.lowercased() {
+        // Hermes' other terminal states.
+        case "error", "timeout": status = .failed
+        // An end event's status always means the agent ended.
+        case let value: status = DelegateAgentActivity.Status(rawValue: value)
+            ?? (eventType.contains("fail") ? .failed
+                : eventType.contains("interrupt") ? .interrupted
+                : eventType.contains("complete") || eventType.contains("finish") ? .completed
+                : .running)
+        }
         let text = payload["text"]?.stringValue ?? payload["message"]?.stringValue ?? payload["summary"]?.stringValue ?? ""
         let kind: DelegateAgentActivity.StreamLine.Kind = eventType.contains("tool") ? .tool : eventType.contains("thinking") ? .thinking : eventType.contains("progress") ? .progress : .summary
         let lines = text.isEmpty ? [] : [DelegateAgentActivity.StreamLine(kind: kind, text: text, isError: status == .failed)]
         return DelegateAgentActivity(
             id: id,
-            goal: payload["goal"]?.stringValue ?? payload["task"]?.stringValue ?? "Delegate agent",
-            model: payload["model"]?.stringValue,
+            // Empty when the event names no goal: the card says "Delegate agent".
+            goal: goal,
+            model: nonEmpty("model"),
             status: status,
             taskCount: payload["task_count"]?.intValue ?? 1,
-            taskIndex: payload["task_index"]?.intValue ?? 0,
-            currentTool: payload["tool"]?.stringValue ?? payload["current_tool"]?.stringValue,
-            summary: payload["summary"]?.stringValue,
-            stream: lines
+            taskIndex: taskIndex,
+            currentTool: nonEmpty("tool_name") ?? nonEmpty("tool") ?? nonEmpty("current_tool"),
+            summary: nonEmpty("summary"),
+            stream: lines,
+            hasGatewayID: subagentID != nil
         )
     }
 }

@@ -137,6 +137,59 @@ final class AppStateReasoningStreamTests: XCTestCase {
         )
     }
 
+    // MARK: - App-wide publishes
+
+    /// Every view that observes AppState, the root of each open sheet
+    /// included, re-renders on any AppState publish. A streaming turn's
+    /// deltas must therefore publish only the live projection: each delta
+    /// used to re-affirm `turnState` (one AppState publish per gateway
+    /// frame), and the live text and thinking card published on AppState
+    /// 20 to 30 times a second, so a sheet opened during a turn lagged.
+    func testStreamedDeltasPublishOnlyTheLiveProjection() async {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+        state.handleStreamEvent(.messageStart(sessionId: "stored-a"))
+        XCTAssertTrue(state.isBusy)
+
+        var appStatePublishes = 0
+        let appStateObserver = state.objectWillChange.sink { _ in appStatePublishes += 1 }
+        defer { appStateObserver.cancel() }
+        var liveTurnPublishes = 0
+        let liveTurnObserver = state.liveTurn.objectWillChange.sink { _ in liveTurnPublishes += 1 }
+        defer { liveTurnObserver.cancel() }
+
+        let thoughts = (0..<30).map { "thought \($0) " }
+        for thought in thoughts {
+            state.handleStreamEvent(.reasoningDelta(sessionId: "stored-a", text: thought))
+            state.flushReasoningPublish()
+        }
+        let words = (0..<60).map { "word\($0) " }
+        for word in words {
+            state.handleStreamEvent(.messageDelta(sessionId: "stored-a", text: word))
+        }
+        // The coalesced text publish lands on its own scheduled task. The
+        // wait stays inside the counted window on purpose: that task's write
+        // must reach only `liveTurn`, never AppState. It ends as soon as the
+        // text lands; the 10 s cap is only a failsafe.
+        let expectedText = words.joined()
+        let deadline = Date().addingTimeInterval(10)
+        while state.streamingText != expectedText, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        XCTAssertEqual(state.streamingText, expectedText)
+        XCTAssertEqual(liveReasoningContent(on: state), thoughts.joined())
+        XCTAssertTrue(state.isBusy)
+        XCTAssertGreaterThan(liveTurnPublishes, 0, "the live rows still update")
+        // The invariant: a streaming turn's deltas touch only `liveTurn`.
+        // Anything a delta changes that other screens show is a real change
+        // and belongs on a turn edge, not on every delta.
+        XCTAssertEqual(
+            appStatePublishes, 0,
+            "a streaming turn's deltas must not re-render every view and sheet observing AppState"
+        )
+    }
+
     func testReasoningCardIdentityIsStableAcrossCoalescedPublications() {
         let state = makeAppState()
         installActiveSession(state, id: "stored-a")
@@ -709,6 +762,88 @@ final class AppStateReasoningStreamTests: XCTestCase {
         )
         XCTAssertEqual(state.messages[4].content, "third segment")
         XCTAssertNil(state.liveReasoningSegment)
+    }
+
+    /// #572: Hermes' clarify tool.start is skipped, so the clarify card is
+    /// the first boundary after the explanation streamed ahead of it. The
+    /// explanation must commit above the card instead of staying in the
+    /// live tail below it.
+    func testClarifyCardCommitsPrecedingAssistantTextAboveIt() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        feedReasoning(["weighing options "], sessionId: "stored-a", state: state)
+        state.handleStreamEvent(.messageDelta(sessionId: "stored-a", text: "Two ways to do this. "))
+        state.handleStreamEvent(.toolStart(sessionId: "stored-a", toolName: "clarify", toolInput: "{}", toolID: "clarify-tool"))
+        state.handleStreamEvent(.messageDelta(sessionId: "stored-a", text: "A is faster, B is safer."))
+        state.handleStreamEvent(.clarify(sessionId: "stored-a", activity: clarifyActivity("req-1")))
+
+        XCTAssertEqual(state.messages.map(\.role), [.reasoning, .partial, .clarify])
+        XCTAssertEqual(state.messages[1].content, "Two ways to do this. A is faster, B is safer.")
+        XCTAssertEqual(state.streamingText, "")
+
+        // A replayed request updates the existing card in place: text that
+        // streamed after the card stays live below it, not above.
+        state.handleStreamEvent(.messageDelta(sessionId: "stored-a", text: "Waiting on you."))
+        state.handleStreamEvent(.clarify(sessionId: "stored-a", activity: clarifyActivity("req-1")))
+        XCTAssertEqual(state.messages.map(\.role), [.reasoning, .partial, .clarify])
+        forceFlushPendingReasoning(on: state)
+        XCTAssertEqual(state.streamingText, "Waiting on you.")
+
+        // A clarify with nothing buffered adds no empty partial row.
+        let quiet = makeAppState()
+        installActiveSession(quiet, id: "stored-a")
+        quiet.handleStreamEvent(.clarify(sessionId: "stored-a", activity: clarifyActivity("req-2")))
+        XCTAssertEqual(quiet.messages.map(\.role), [.clarify])
+    }
+
+    /// Approval and masked-input cards are the same kind of boundary: text
+    /// streamed ahead of a live one commits above it.
+    func testApprovalAndInputPromptCardsCommitPrecedingAssistantTextAboveThem() {
+        let state = makeAppState()
+        installActiveSession(state, id: "stored-a")
+
+        state.handleStreamEvent(.messageDelta(sessionId: "stored-a", text: "I need to run the tests."))
+        state.handleStreamEvent(.approval(
+            sessionId: "stored-a",
+            activity: ApprovalActivity(
+                sessionId: "stored-a",
+                command: "run tests",
+                description: "wants to run tests",
+                choices: nil,
+                allowPermanent: false,
+                smartDenied: false,
+                status: .pending,
+                choice: nil,
+                error: nil
+            )
+        ))
+        XCTAssertEqual(state.messages.map(\.role), [.partial, .approval])
+        XCTAssertEqual(state.messages.first?.content, "I need to run the tests.")
+
+        state.handleStreamEvent(.messageDelta(sessionId: "stored-a", text: "Now the token."))
+        state.handleStreamEvent(.inputPrompt(sessionId: "stored-a", activity: inputPromptActivity()))
+        XCTAssertEqual(state.messages.map(\.role), [.partial, .approval, .partial, .inputPrompt])
+        XCTAssertEqual(state.messages[2].content, "Now the token.")
+    }
+
+    private func inputPromptActivity() -> InputPromptActivity {
+        var activity = InputPromptActivity(requestId: "srq-1", sessionId: "stored-a", kind: .secret)
+        activity.envVar = "API_TOKEN"
+        activity.prompt = "Paste the token"
+        return activity
+    }
+
+    private func clarifyActivity(_ requestId: String) -> ClarifyActivity {
+        ClarifyActivity(
+            requestId: requestId,
+            questions: [
+                ClarifyQuestion(id: "q0", question: "which one?", choices: [
+                    ClarifyChoice(label: "A", value: "a"),
+                    ClarifyChoice(label: "B", value: "b")
+                ])
+            ]
+        )
     }
 
     func testSessionSwitchDiscardsPendingReasoningPublishForNewSession() async {

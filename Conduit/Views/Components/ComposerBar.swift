@@ -7,7 +7,9 @@
 //  an authoritative `running` value.
 //
 
+import AVFoundation
 import SwiftUI
+import UIKit
 import PhotosUI
 import UniformTypeIdentifiers
 
@@ -19,9 +21,13 @@ struct ComposerBar: View {
     @State private var text = ""
     @State private var composerTextHeight = ComposerPasteTextView.minimumHeight
     @State private var attachments: [Attachment] = []
+    /// A whole reply attached with its Quote button (#385); it rides along
+    /// with the next message.
+    @State private var replyReference: ComposerReplyReference?
     @State private var showAttachmentMenu = false
-    @State private var photoItem: PhotosPickerItem?
+    @State private var photoItems: [PhotosPickerItem] = []
     @State private var showDocumentPicker = false
+    @State private var showCamera = false
     @State private var isFocused = false
     @State private var isShowingSlashSuggestions = false
     @State private var composerErrorMessage: String?
@@ -38,10 +44,13 @@ struct ComposerBar: View {
     /// an UNCHANGED revision and can never rewrite the editor or move the
     /// cursor mid-typing.
     @State private var composerRevision: UInt64 = 0
+    /// The latest replacement puts the cursor after the text.
+    @State private var composerCursorAtEnd = false
     @State private var loadedDraftKey: ComposerDraftKey?
     @State private var photoImportContext: AsyncAttachmentContext?
     @State private var photoImportGeneration: UInt64 = 0
     @State private var documentImportContext: AsyncAttachmentContext?
+    @State private var cameraImportContext: AsyncAttachmentContext?
     @State private var attachmentGeneration: UInt64 = 0
     @State private var suppressNextTextChangeSuggestions = false
     /// Round 6: non-nil presents the Repair Connection wizard seeded from
@@ -50,7 +59,23 @@ struct ComposerBar: View {
     /// Local, device-only input preference. Defaults to off so existing
     /// users keep Return inserting a newline after updating.
     @AppStorage(ComposerReturnKey.preferenceKey) private var returnKeySends = false
+    @AppStorage(AttachmentSizeLimit.preferenceKey) private var attachmentLimitMegabytes = AttachmentSizeLimit.defaultMegabytes
     @Namespace private var glassNamespace
+    /// The dictate button types into the draft (#290, #335).
+    @StateObject private var dictation = ComposerDictationService()
+    /// The draft as it was when dictation began; dictated text goes after it.
+    @State private var dictationPrefix = ""
+    /// The draft as dictation last wrote it, so the full editor, which
+    /// reports every change the same way, can tell it from typing.
+    @State private var dictatedDraft: String?
+    /// The full-screen editor for long drafts (#335).
+    @State private var isShowingFullEditor = false
+    /// V2's conversation: rest as a slim bar until the composer is used.
+    @Environment(\.v2ComposerRests) private var restsWhenIdle
+    /// Kept expanded a moment after use ends, so a tap on a control (which
+    /// can take focus from the field) doesn't collapse it under the finger.
+    @State private var holdsExpanded = false
+    @State private var collapseTask: Task<Void, Never>?
 
     struct AsyncAttachmentContext: Equatable {
         let editorIdentity: UUID
@@ -58,11 +83,32 @@ struct ComposerBar: View {
         let attachmentGeneration: UInt64
     }
 
+    /// About three lines of body text: below this a draft is short enough
+    /// to read in place, so the expand icon stays out of the way.
+    static let fullEditorThreshold: CGFloat = 80
+
+    static func showsFullEditorButton(measuredHeight: CGFloat) -> Bool {
+        // At large Text Sizes one line alone can reach 80 pt; the icon still
+        // waits for more than a line.
+        measuredHeight >= max(fullEditorThreshold, ComposerPasteTextView.minimumHeight + 20)
+    }
+
     static func composerDraftKey(for sessionID: String?, profile: String) -> ComposerDraftKey {
         ComposerDraftKey(
             profile: profile,
             sessionID: sessionID ?? ComposerDraftKey.newConversationSessionID
         )
+    }
+
+    /// A prefill goes in only over the draft it was made for, or the same
+    /// chat under its other id.
+    static func shouldApplyPrefill(
+        for target: ComposerDraftKey?,
+        loaded: ComposerDraftKey?,
+        identity: ChatScrollSessionIdentity
+    ) -> Bool {
+        guard let target, let loaded else { return false }
+        return draftKeysAreEquivalent(target, loaded, identity: identity)
     }
 
     static func draftKeysAreEquivalent(
@@ -151,7 +197,7 @@ struct ComposerBar: View {
     }
 
     static func pastedImageErrorMessage(_ message: String) -> String {
-        "Could not paste image: \(message)"
+        AppLocalization.string("Could not paste image: \(message)")
     }
 
     private var hasText: Bool {
@@ -164,9 +210,18 @@ struct ComposerBar: View {
     /// can keep these replacements from ever surfacing as user input — the
     /// user-edit ownership signal lives in that bridge's
     /// `textViewDidChange`, guarded by the same machinery.
-    private func replaceComposerText(_ newValue: String) {
+    private func replaceComposerText(_ newValue: String, cursorAtEnd: Bool = false) {
         text = newValue
+        composerCursorAtEnd = cursorAtEnd
         composerRevision &+= 1
+    }
+
+    /// "New Chat" beside the screenshot: what was typed goes with it, so
+    /// none of it is left behind in this chat's draft.
+    private func moveScreenshotToNewChat() {
+        let carried = text
+        replaceComposerText("")
+        Task { await appState.moveComposerScreenshotToNewChat(carrying: carried) }
     }
 
     /// Returns the slash prefix being typed, or nil if the cursor has moved
@@ -193,11 +248,22 @@ struct ComposerBar: View {
     }
 
     private var action: ComposerAction {
-        appState.composerAction(hasText: hasText, hasAttachments: !attachments.isEmpty)
+        // A slash command runs on Hermes, so it waits for the chat itself
+        // rather than being sent later.
+        if appState.composerWaitsForChat, Self.slashPrefix(in: text) != nil { return .unavailable }
+        return appState.composerAction(hasText: hasText, hasAttachments: !attachments.isEmpty || pendingScreenshot != nil)
     }
 
+    /// A screenshot from Ask Hermes About Screen waiting on this chat. It
+    /// is AppState's, not the draft's, so a spoken question can carry it.
+    private var pendingScreenshot: Attachment? {
+        appState.pendingScreenshot(forSession: appState.activeSessionId)
+    }
+
+    /// The chat the composer types into: a saved copy's or a New Chat's
+    /// while one is on screen (AppState+PendingSend.swift).
     private var activeDraftKey: ComposerDraftKey {
-        composerDraftKey(for: appState.activeSessionId)
+        appState.composerDraftKeyOnScreen
     }
 
     private var stopOnly: Bool {
@@ -207,8 +273,8 @@ struct ComposerBar: View {
     private var actionSymbol: String {
         switch action {
         case .stop: return "stop.fill"
-        case .steer: return "arrow.triangle.branch"
-        case .interrupt: return "arrow.uturn.backward"
+        case .steer: return BusyInputMode.steer.symbol
+        case .interrupt: return BusyInputMode.interrupt.symbol
         case .send: return "arrow.up"
         case .unavailable: return "lock"
         }
@@ -242,16 +308,10 @@ struct ComposerBar: View {
         colorScheme == .dark ? Color.white.opacity(0.14) : Color.black.opacity(0.09)
     }
 
-    private var fieldFoundation: Color {
-        colorScheme == .dark ? Color.white.opacity(0.065) : Color.black.opacity(0.035)
-    }
-
-    private var fieldStroke: Color {
-        colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.08)
-    }
-
-    var body: some View {
-        let _ = TranscriptPerf.note(.composerBarBody)
+    /// The composer with its padding and the handlers for requests from
+    /// AppState and the draft. Split from `body` so the type checker takes
+    /// the modifier chain in two parts.
+    private var composerWithRequestHandlers: some View {
         Group {
             if #available(iOS 26.0, *) {
                 GlassEffectContainer(spacing: 16) {
@@ -261,9 +321,27 @@ struct ComposerBar: View {
                 composerContent
             }
         }
-        .padding(.horizontal, 14)
+        // Resting, the voice button keeps its spot on the trailing side.
+        .padding(.leading, rests ? 16 : (restsWhenIdle ? 12 : 14))
+        .padding(.trailing, rests ? 84 : (restsWhenIdle ? 12 : 14))
         .padding(.top, 8)
         .padding(.bottom, 10)
+        .animation(restsWhenIdle ? ConduitMotion.ease(reduceMotion: reduceMotion) : nil, value: rests)
+        .preference(key: V2ComposerExpandedKey.self, value: restsWhenIdle && !rests)
+        .preference(key: V2ComposerTypingKey.self, value: Self.hidesMinimisedCallBar(restsWhenIdle: restsWhenIdle, isFocused: isFocused))
+        .onChange(of: composerInUse, initial: true) { _, inUse in
+            guard restsWhenIdle else { return }
+            composerUseChanged(inUse)
+        }
+        // One photo picker for both attach buttons (resting and expanded),
+        // so it survives the composer expanding under it.
+        .photosPicker(
+            isPresented: $showAttachmentMenu,
+            selection: $photoItems,
+            maxSelectionCount: Self.photoPickerSelectionLimit,
+            selectionBehavior: .ordered,
+            matching: .any(of: [.images, .videos])
+        )
         .onChange(of: text) { _, newValue in
             let isProgrammaticDraftRestore = suppressNextTextChangeSuggestions
             suppressNextTextChangeSuggestions = false
@@ -280,16 +358,43 @@ struct ComposerBar: View {
             }
         }
         .onChange(of: appState.composerPrefillToken) { _, _ in
-            replaceComposerText(appState.composerPrefillText)
-            isFocused = !text.isEmpty
-            isShowingSlashSuggestions = slashPrefix != nil
+            applyPendingPrefill()
         }
-        .onChange(of: photoItem) { _, _ in
+        .onChange(of: appState.composerQuoteRequest) { _, request in
+            applyQuoteRequest(request)
+        }
+        .onChange(of: appState.composerFocusRequest) { _, request in
+            applyFocusRequest(request)
+        }
+        .onChange(of: photoItems) { _, _ in
             handlePhotoSelection()
         }
+        .onChange(of: appState.chatTakeover?.readyToken) { _, _ in
+            resendAfterChatTakeover()
+        }
+        .onChange(of: loadedDraftKey) { _, _ in
+            // Back in a chat that was taken over while another was open:
+            // its draft is loaded now, so send it.
+            resendAfterChatTakeover()
+        }
+        .onChange(of: action) { _, _ in
+            // The composer offers Send again (a turn finished, or sync
+            // settled after the refusal).
+            resendAfterChatTakeover()
+        }
+    }
+
+    var body: some View {
+        let _ = TranscriptPerf.note(.composerBarBody)
+        composerWithRequestHandlers
         .onAppear {
-            guard loadedDraftKey == nil else { return }
-            loadDraft(for: activeDraftKey)
+            if loadedDraftKey == nil {
+                loadDraft(for: activeDraftKey)
+            }
+            applyComposerRestoreRequests()
+            applyPendingPrefill()
+            // A screenshot chat can open before this composer is on screen.
+            applyFocusRequest(appState.composerFocusRequest)
         }
         .onChange(of: activeDraftKey) { _, newKey in
             handoffComposer(to: newKey)
@@ -302,7 +407,26 @@ struct ComposerBar: View {
                 saveDraft(for: activeDraftKey)
             }
         }
+        .onChange(of: appState.composerTakesText) { _, takesText in
+            // The sheet has no room for the composer's notices; the inline
+            // composer explains why it is locked.
+            if !takesText { isShowingFullEditor = false }
+        }
+        .onChange(of: appState.composerIsEnabled) { _, enabled in
+            if enabled { applyFocusRequest(appState.composerFocusRequest) }
+        }
+        .onChange(of: appState.composerRestoreRequests) { _, _ in
+            applyComposerRestoreRequests()
+        }
+        .onChange(of: appState.isVoiceInUse) { _, inUse in
+            // Voice took the microphone: dictation steps aside.
+            guard inUse else { return }
+            dictation.cancel()
+        }
         .onDisappear {
+            dictation.cancel()
+            collapseTask?.cancel()
+            collapseTask = nil
             // Dependable second hook: whether this view leaves for a room,
             // a session switch, or teardown, the typed text lands in the
             // app-lifetime store first.
@@ -330,27 +454,45 @@ struct ComposerBar: View {
                 clearDocumentImportContextIfCurrent(origin)
             }
         )
+        .fullScreenCover(isPresented: $showCamera, onDismiss: { cameraImportContext = nil }) {
+            CameraCapture { image in
+                handleCapturedPhoto(image, startedIn: cameraImportContext)
+            }
+            .ignoresSafeArea()
+        }
     }
 
     private var composerContent: some View {
         VStack(spacing: 0) {
-            if !appState.composerIsEnabled {
+            if showsStateNotice {
                 stateNotice
+            }
+
+            if let notice = appState.composerNotice {
+                composerNoticeLine(notice)
             }
 
             if appState.isCompressingActiveSession {
                 compressingNotice
             }
 
+            if let takeover = appState.activeChatTakeover {
+                chatTakeoverNotice(takeover)
+            }
+
             if let composerErrorMessage, !composerErrorMessage.isEmpty {
                 pasteErrorNotice(composerErrorMessage)
             }
 
-            if !attachments.isEmpty {
-                attachmentStrip
+            if let replyReference {
+                replyReferenceChip(replyReference)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 8)
             }
 
-            sessionControls
+            if !attachments.isEmpty || pendingScreenshot != nil {
+                attachmentStrip
+            }
 
             if isShowingSlashSuggestions && !filteredSlashCommands.isEmpty {
                 SlashSuggestionsOverlay(
@@ -361,7 +503,7 @@ struct ComposerBar: View {
                     }
                 )
                 .padding(.horizontal, 10)
-                .padding(.bottom, 4)
+                .padding(.top, 8)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
@@ -370,57 +512,29 @@ struct ComposerBar: View {
                     replaceComposerText(MentionAutocomplete.completing(text, with: candidate))
                 }
                 .padding(.horizontal, 10)
-                .padding(.bottom, 4)
+                .padding(.top, 8)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
-                attachmentButton
-
-                ZStack(alignment: .topLeading) {
-                    let currentEditorIdentity = editorIdentity
-                    if text.isEmpty {
-                        Text(appState.composerPlaceholder)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 12)
-                    }
-                    ComposerPasteTextView(
-                        text: $text,
-                        isFocused: $isFocused,
-                        measuredHeight: $composerTextHeight,
-                        enabled: appState.composerIsEnabled,
-                        onPastedImage: { pastedImage in
-                            handlePastedImage(pastedImage, editorIdentity: currentEditorIdentity)
-                        },
-                        onPastedImageError: { message in
-                            handlePastedImageError(message, editorIdentity: currentEditorIdentity)
-                        },
-                        editorIdentity: editorIdentity,
-                        programmaticRevision: composerRevision,
-                        returnKeySends: returnKeySends,
-                        // May lag one render behind fast typing; the safe
-                        // failure mode is newline insertion, and
-                        // submitFromReturnKey() re-checks the live gate.
-                        canSubmitFromReturn: ComposerReturnKey.canSubmit(action: action),
-                        onSubmitFromReturn: { submitFromReturnKey() },
-                        onUserEdit: { appState.noteComposerUserEdit() }
-                    )
-                    .id(editorIdentity)
-                    .padding(.horizontal, 5)
-                    .frame(height: composerTextHeight)
+            // The field spans the card; every control sits in the row
+            // below it, so a long draft wraps across the full width (#335).
+            // Resting (V2), attach sits beside the field and the row waits.
+            HStack(spacing: 2) {
+                if rests {
+                    attachmentButton
+                        .padding(.leading, 6)
+                        .transition(.opacity)
                 }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                .background(fieldFoundation, in: RoundedRectangle(cornerRadius: 19, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 19, style: .continuous)
-                        .strokeBorder(fieldStroke, lineWidth: 1)
-                }
-                .animation(ConduitMotion.response, value: isFocused)
-
-                trailingSlot
+                composerField
             }
-            .padding(10)
+            .padding(.horizontal, 6)
+            .padding(.vertical, rests ? 6 : 0)
+            .padding(.top, rests ? 0 : 6)
+
+            if !rests {
+                controlsRow
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
         .background(composerFoundation, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
         .overlay {
@@ -432,26 +546,266 @@ struct ComposerBar: View {
         .preferredColorScheme(appState.themePreference.colorScheme)
         .sheet(item: $repairContext) { context in
             ConnectionRepairSetupSheet(context: context)
+                .environmentObject(appState)
         }
+    }
+
+    private var composerField: some View {
+        ZStack(alignment: .topLeading) {
+            let currentEditorIdentity = editorIdentity
+            if text.isEmpty {
+                Text(appState.composerPlaceholder)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+            }
+            ComposerPasteTextView(
+                text: $text,
+                isFocused: $isFocused,
+                measuredHeight: $composerTextHeight,
+                enabled: appState.composerTakesText,
+                onPastedImage: { pastedImage in
+                    handlePastedImage(pastedImage, editorIdentity: currentEditorIdentity)
+                },
+                onPastedImageError: { message in
+                    handlePastedImageError(message, editorIdentity: currentEditorIdentity)
+                },
+                editorIdentity: editorIdentity,
+                programmaticRevision: composerRevision,
+                programmaticCursorAtEnd: composerCursorAtEnd,
+                returnKeySends: returnKeySends,
+                // May lag one render behind fast typing; the safe
+                // failure mode is newline insertion, and
+                // submitFromReturnKey() re-checks the live gate.
+                canSubmitFromReturn: ComposerReturnKey.canSubmit(action: action),
+                onSubmitFromReturn: { submitFromReturnKey() },
+                onUserEdit: {
+                    // Typed here: no later change matching dictation's last
+                    // write is dictation's.
+                    dictatedDraft = nil
+                    appState.noteComposerUserEdit()
+                    // Typing ends a dictation: its next result would rewrite
+                    // the draft from where it began and drop the keystrokes.
+                    // The words so far stay.
+                    dictation.yieldToTyping()
+                }
+            )
+            .id(editorIdentity)
+            .padding(.leading, 5)
+            // Room for the expand icon, so the text wraps before it.
+            .padding(.trailing, showsFullEditorButton ? 40 : 5)
+            .frame(height: composerTextHeight)
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .overlay(alignment: .topTrailing) {
+            if showsFullEditorButton {
+                Button {
+                    Haptics.selection()
+                    // A dictation carries on into the sheet, which has its
+                    // own dictate button.
+                    isFocused = false
+                    isShowingSlashSuggestions = false
+                    isShowingFullEditor = true
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!appState.composerTakesText)
+                .accessibilityLabel(Text("Expand editor"))
+                .accessibilityIdentifier("composer.expand-editor")
+                .transition(.opacity)
+            }
+        }
+        .animation(reduceMotion ? nil : ConduitMotion.response, value: showsFullEditorButton)
+        .sheet(isPresented: $isShowingFullEditor, onDismiss: {
+            // The inline editor only takes programmatic changes, so hand it
+            // what was written in the sheet, cursor at the end. An unchanged
+            // draft keeps the cursor where it was.
+            replaceComposerText(text, cursorAtEnd: true)
+            // Typing a slash command in the sheet arms suggestions the sheet
+            // never shows; they'd pop up over the unfocused inline field.
+            isShowingSlashSuggestions = false
+        }) {
+            ComposerFullEditor(
+                text: $text,
+                placeholder: appState.composerPlaceholder,
+                enabled: appState.composerTakesText,
+                onUserEdit: { edited in
+                    // Dictation writing the draft is not typing.
+                    // Dictation's last write can be reported after it has
+                    // finished, so this doesn't ask whether it is still running.
+                    guard ComposerDictation.isTyping(edited, dictationWrote: dictatedDraft) else { return }
+                    // Spent: the same text typed again by hand is typing.
+                    dictatedDraft = nil
+                    appState.noteComposerUserEdit()
+                    // As inline: typing ends a dictation, keeping its words.
+                    dictation.yieldToTyping()
+                },
+                onCollapse: { isShowingFullEditor = false },
+                attachments: {
+                    if let replyReference {
+                        replyReferenceChip(replyReference)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 6)
+                    }
+                    if !attachments.isEmpty || pendingScreenshot != nil {
+                        attachmentStrip
+                    }
+                },
+                dictateButton: { dictateButton },
+                actionButton: { composerActionButton }
+            )
+            .preferredColorScheme(appState.themePreference.colorScheme)
+        }
+    }
+
+    private var showsFullEditorButton: Bool {
+        Self.showsFullEditorButton(measuredHeight: composerTextHeight)
+    }
+
+    /// Anything that needs the full composer: focus, a draft, an
+    /// attachment, a reply, dictation, a running turn's Stop, a notice, or a
+    /// control's sheet.
+    private var composerInUse: Bool {
+        let hasDraft = isFocused || hasText || !attachments.isEmpty || pendingScreenshot != nil
+            || replyReference != nil || isShowingFullEditor
+        let isDictating = dictation.isDictating || dictation.isStarting || dictation.isTranscribing
+        // Stop, steer and interrupt live in the controls row.
+        let turnControl = action == .stop || action == .steer || action == .interrupt
+        let hasNotice = showsStateNotice || appState.composerNotice != nil || appState.isCompressingActiveSession
+            || appState.activeChatTakeover != nil || composerErrorMessage != nil
+        let pickerUp = showAttachmentMenu || showDocumentPicker || showCamera
+        let sheetUp = appState.showModelPicker || appState.showContextSheet || appState.showAgentsSheet
+        return hasDraft || isDictating || turnControl || hasNotice || pickerUp || sheetUp
+    }
+
+    /// The minimised call bar above a V2 composer hides only while someone
+    /// types. A running turn, a notice or a draft left unfocused keeps it,
+    /// so a call minimised in a chat can always be brought back (#695).
+    static func hidesMinimisedCallBar(restsWhenIdle: Bool, isFocused: Bool) -> Bool {
+        restsWhenIdle && isFocused
+    }
+
+    /// V2's resting composer: attach and the placeholder in a slim bar.
+    private var rests: Bool {
+        restsWhenIdle && !composerInUse && !holdsExpanded
+    }
+
+    private func composerUseChanged(_ inUse: Bool) {
+        collapseTask?.cancel()
+        if inUse {
+            holdsExpanded = true
+            return
+        }
+        guard holdsExpanded else { return }
+        collapseTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            collapseTask = nil
+            withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) { holdsExpanded = false }
+        }
+    }
+
+    /// Attach, model and session status on the left; dictate and the
+    /// voice/send slot on the right, like the Codex composer (#335).
+    /// The round controls match the context ring, leaving the model chip
+    /// more width (#466).
+    static let controlSize: CGFloat = 32
+    /// Taps land a little outside each control. Half the row spacing, so
+    /// neighbours never overlap.
+    static var controlHitShape: some Shape { Rectangle().inset(by: -4) }
+
+    private var controlsRow: some View {
+        HStack(spacing: 8) {
+            attachmentButton
+
+            modelButton
+
+            if let callID = appState.activeVoiceCallSessionID, appState.canResumeVoiceCall {
+                resumeVoiceCallButton(callID)
+            }
+
+            Button {
+                Haptics.selection()
+                appState.showContextSheet = true
+            } label: {
+                ContextRingView(percent: appState.runtime.contextPercent)
+                    .frame(width: Self.controlSize, height: Self.controlSize)
+                    .contentShape(Self.controlHitShape)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Context usage, \(Int(appState.runtime.contextPercent.rounded())) percent")
+
+            if appState.activeAgents > 0 {
+                Button {
+                    Haptics.selection()
+                    appState.showAgentsSheet = true
+                } label: {
+                    Label("\(appState.activeAgents)", systemImage: "person.2")
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.conduitAccent)
+                        .frame(minWidth: Self.controlSize, minHeight: Self.controlSize)
+                        .contentShape(Self.controlHitShape)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(AppLocalization.string("Delegate agents, \(Int(appState.activeAgents)) active"))
+            }
+
+            dictateButton
+
+            trailingSlot
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 6)
+        .padding(.bottom, 10)
+        // Seven controls share one row of fixed 32 pt circles; past this
+        // size the model chip shrinks to nothing and glyphs spill out.
+        // The typed text above still follows the full Text Size.
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+    }
+
+    /// Why the composer is locked. While the chat on screen is on its way
+    /// the composer takes a message anyway, so the line about syncing
+    /// stays away; an error or a repair still shows.
+    private var showsStateNotice: Bool {
+        guard !appState.composerIsEnabled else { return false }
+        guard appState.composerWaitsForChat else { return true }
+        return !(appState.errorMessage ?? "").isEmpty || showsRepairConnection
+    }
+
+    /// Round 6: Repair Connection appears only once the connection is
+    /// actually down AND a failed attempt has surfaced — through the typed
+    /// classified failure or the visible error banner — never during
+    /// normal automatic recovery, and never uninvited.
+    private var showsRepairConnection: Bool {
+        appState.connection != nil
+            && !appState.isConnected
+            && (appState.lastConnectionFailure != nil || !(appState.errorMessage ?? "").isEmpty)
     }
 
     @ViewBuilder
     private var stateNotice: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-            if appState.turnState != .unsupportedGateway {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-            }
-            Text(appState.turnState == .unsupportedGateway
-                 ? AppLocalization.string("Update this Hermes gateway to recover active turns safely.")
-                 : AppLocalization.string("Synchronizing with Hermes before enabling chat controls"))
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
+            if !appState.composerWaitsForChat {
+                HStack(spacing: 8) {
+                if appState.turnState != .unsupportedGateway {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+                Text(appState.turnState == .unsupportedGateway
+                     ? AppLocalization.string("Update this Hermes gateway to recover active turns safely.")
+                     : AppLocalization.string("Synchronizing with Hermes before enabling chat controls"))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
             }
 
             if let error = appState.errorMessage, !error.isEmpty {
@@ -461,17 +815,10 @@ struct ComposerBar: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // Round 6: Repair Connection appears only once the connection is
-            // actually down AND a failed attempt has surfaced — through the
-            // typed classified failure or the visible error banner — never
-            // during normal automatic recovery, and never uninvited.
             // Entering repair hands recovery authority to the user; the
             // automatic retry loop stays stopped until the repair reconnects
             // or the user retries manually.
-            if appState.connection != nil,
-               !appState.isConnected,
-               (appState.lastConnectionFailure != nil
-                   || !(appState.errorMessage ?? "").isEmpty) {
+            if showsRepairConnection {
                 Button {
                     Haptics.light()
                     repairContext = appState.beginConnectionRepair()
@@ -479,7 +826,7 @@ struct ComposerBar: View {
                     Label("Repair Connection", systemImage: "wrench.and.screwdriver")
                         .font(.footnote.weight(.semibold))
                         .frame(maxWidth: .infinity)
-                        .frame(height: 34)
+                        .padding(.vertical, 6).frame(minHeight: 34)
                 }
                 .buttonStyle(.bordered)
                 .tint(.conduitAccent)
@@ -491,6 +838,104 @@ struct ComposerBar: View {
         .padding(.horizontal, 14)
         .padding(.top, 10)
         .padding(.bottom, 2)
+    }
+
+    /// Offered when Hermes refused a send because Hermes Desktop or a
+    /// terminal owns this chat (#304). Taking over waits for a reply running
+    /// there to finish, then sends the draft again.
+    private func chatTakeoverNotice(_ takeover: ChatTakeoverState) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                switch takeover.phase {
+                case .waiting:
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(Text("Waiting to take this chat over"))
+                case .failed, .heldHere, .unavailable:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                case .offered, .ready:
+                    Image(systemName: "desktopcomputer")
+                        .foregroundStyle(.secondary)
+                }
+                Text(Self.chatTakeoverMessage(takeover))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                Button {
+                    Haptics.selection()
+                    appState.dismissChatTakeover()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(takeover.phase == .waiting
+                    ? AppLocalization.string("Stop waiting")
+                    : AppLocalization.string("Dismiss"))
+            }
+
+            switch takeover.phase {
+            case .offered, .failed:
+                Button {
+                    Haptics.light()
+                    appState.takeOverChat()
+                } label: {
+                    Label("Take over this chat", systemImage: "arrow.down.to.line")
+                        .font(.footnote.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6).frame(minHeight: 34)
+                }
+                .buttonStyle(.bordered)
+                .tint(.conduitAccent)
+                .accessibilityIdentifier("composer.take-over-chat")
+                .accessibilityHint("Makes Conduit the app for this chat, then sends your message")
+            case .waiting, .ready, .heldHere, .unavailable:
+                EmptyView()
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
+    static func chatTakeoverMessage(_ takeover: ChatTakeoverState) -> String {
+        switch takeover.phase {
+        case .offered:
+            return takeover.openElsewhereMessage
+        case .waiting:
+            return takeover.takingOverMessage
+        case .ready:
+            return AppLocalization.string("This chat is yours now. Send your message again.")
+        case .failed(let message), .unavailable(let message):
+            return message
+        case .heldHere:
+            return AppLocalization.string(
+                "This chat is open in Conduit on another device or in the Hermes web chat. Send from there, or close it there and try again."
+            )
+        }
+    }
+
+    /// The chat is Conduit's now: send the refused draft again, exactly as
+    /// the Send button would. When that can't happen here (another chat is
+    /// open, the composer isn't offering Send, or its draft isn't the refused
+    /// message, as after a refused voice turn), the ready notice stays and
+    /// asks the user to send again.
+    private func resendAfterChatTakeover() {
+        guard let takeover = appState.activeChatTakeover, takeover.phase == .ready,
+              case .send = action else { return }
+        // The refused text carried the quoted reply, if one was attached.
+        let outbound = ComposerReplyReference.outboundText(
+            text.trimmingCharacters(in: .whitespacesAndNewlines),
+            hasAttachments: !attachments.isEmpty,
+            replyingTo: replyReference
+        )
+        guard takeover.isRefusedMessage(outbound, hasAttachments: !attachments.isEmpty) else { return }
+        appState.dismissChatTakeover()
+        submit()
     }
 
     /// Small in-flight affordance for the dedicated `session.compress` RPC
@@ -520,44 +965,62 @@ struct ComposerBar: View {
                 .foregroundStyle(.red)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
+            if message == Self.cameraAccessMessage {
+                Button("Open Settings") {
+                    composerErrorMessage = nil
+                    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                    UIApplication.shared.open(url)
+                }
+                .font(.caption.weight(.semibold))
+            }
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)
         .padding(.bottom, 2)
     }
 
+    /// Scrolls inside the composer card: clipped to the card's width so a
+    /// long row never runs past its rounded edges or off-screen (#334).
     private var attachmentStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(attachments) { attachment in
-                    HStack(spacing: 4) {
-                        Image(systemName: attachment.kind == .image ? "photo" : "doc")
-                            .font(.caption)
-                        Text(attachment.name)
-                            .font(.caption)
-                            .lineLimit(1)
-                        Button {
-                            Haptics.light()
-                            attachments.removeAll { $0.id == attachment.id }
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .disabled(!appState.composerIsEnabled)
+                if let pendingScreenshot {
+                    ComposerAttachmentChip(
+                        attachment: pendingScreenshot,
+                        canRemove: appState.composerIsEnabled
+                    ) {
+                        appState.discardPendingScreenshot(forSession: appState.activeSessionId)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .conduitGlassSurface(cornerRadius: 16, tint: .conduitAccent.opacity(0.07))
+                    if appState.canMoveComposerScreenshotToNewChat {
+                        ScreenshotNewChatButton(placement: .composer, action: moveScreenshotToNewChat)
+                    }
+                }
+                ForEach(attachments) { attachment in
+                    ComposerAttachmentChip(
+                        attachment: attachment,
+                        canRemove: appState.composerIsEnabled
+                    ) {
+                        attachments.removeAll { $0.id == attachment.id }
+                        Self.discardStagedFile(attachment)
+                    }
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
         }
+        .frame(maxWidth: .infinity)
+        .clipShape(Rectangle())
     }
 
     private var attachmentButton: some View {
         Menu {
+            if CameraCapture.isAvailable {
+                Button {
+                    openCamera()
+                } label: {
+                    Label("Camera", systemImage: "camera")
+                }
+            }
             Button {
                 openPhotoLibraryPicker()
             } label: {
@@ -577,12 +1040,13 @@ struct ComposerBar: View {
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 20, weight: .medium))
-                .frame(width: 44, height: 44)
+                .font(.system(size: 16, weight: .medium))
+                .frame(width: Self.controlSize, height: Self.controlSize)
+                .contentShape(Self.controlHitShape)
         }
+        .accessibilityLabel(Text("Attach"))
         .disabled(!appState.composerIsEnabled || appState.isBusy)
-        .conduitGlassControl(cornerRadius: 22, tint: .conduitAccent.opacity(0.08))
-        .photosPicker(isPresented: $showAttachmentMenu, selection: $photoItem)
+        .conduitGlassControl(cornerRadius: Self.controlSize / 2, tint: .conduitAccent.opacity(0.08))
     }
 
     /// What the single trailing slot of the input row holds.
@@ -591,11 +1055,12 @@ struct ComposerBar: View {
         case action
     }
 
-    /// Mic and send share one trailing slot, like Messages (#194): with
+    /// Voice and send share one trailing slot, like Messages (#194): with
     /// nothing to send the slot offers voice (when it's enabled for the
     /// profile), and any sendable draft or live turn swaps it for the
-    /// action button. The slot itself never disappears, so the field keeps
-    /// its width as the first character is typed.
+    /// action button. The slot itself never disappears, so the row keeps
+    /// its layout as the first character is typed. Dictation has its own
+    /// button beside it (#335), so Send shows up as soon as words land.
     static func trailingControl(action: ComposerAction, showsVoiceButton: Bool) -> TrailingControl {
         action == .unavailable && showsVoiceButton ? .voice : .action
     }
@@ -626,6 +1091,7 @@ struct ComposerBar: View {
         Button {
             if stopOnly {
                 dismissComposer()
+                isShowingFullEditor = false
                 Haptics.warning()
                 Task { await appState.cancelCurrent() }
             } else {
@@ -634,7 +1100,7 @@ struct ComposerBar: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: actionSymbol)
-                    .font(.system(size: stopOnly ? 14 : 17, weight: .semibold))
+                    .font(.system(size: stopOnly ? 12 : 14, weight: .semibold))
                     .contentTransition(.symbolEffect(.replace))
                 if let actionTitle {
                     Text(actionTitle)
@@ -643,93 +1109,123 @@ struct ComposerBar: View {
                 }
             }
             .foregroundStyle(action == .unavailable ? Color.secondary.opacity(0.48) : Color.white)
-            .frame(minWidth: actionTitle == nil ? 44 : 94, minHeight: 44)
+            .frame(minWidth: actionTitle == nil ? Self.controlSize : 86, minHeight: Self.controlSize)
             .padding(.horizontal, actionTitle == nil ? 0 : 4)
+            .contentShape(Self.controlHitShape)
             .animation(ConduitMotion.transition, value: action)
         }
         .disabled(action == .unavailable)
         .conduitGlassControl(
-            cornerRadius: 22,
+            cornerRadius: Self.controlSize / 2,
             tint: actionSurfaceTint,
             prominent: action == .send,
             interactive: action != .unavailable
         )
+        .accessibilityShowsLargeContentViewer {
+            Label {
+                Text(actionTitle ?? accessibilityLabel)
+            } icon: {
+                Image(systemName: actionSymbol)
+            }
+        }
         .accessibilityLabel(accessibilityLabel)
     }
 
-    private var sessionControls: some View {
-        HStack(spacing: 10) {
+    /// The model and effort, truncating first when the row is crowded.
+    private var modelButton: some View {
+        HStack(spacing: 2) {
             Button {
-                Haptics.selection()
-                appState.showModelPicker = true
+                openModelPicker()
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "cpu")
-                        .foregroundStyle(Color.conduitAccent)
-                        .symbolEffect(
-                            .variableColor.iterative,
-                            options: .repeating,
-                            isActive: appState.turnState == .running && !reduceMotion
-                        )
+                HStack(spacing: 5) {
                     Text(appState.runtime.model.isEmpty ? AppLocalization.string("Model") : appState.runtime.model)
                         .lineLimit(1)
-                    if !appState.runtime.reasoningEffort.isEmpty {
-                        Text("/")
-                            .foregroundStyle(.secondary)
-                        Text(formatEffort(appState.runtime.reasoningEffort))
-                            .foregroundStyle(Color.conduitAccent)
-                            .lineLimit(1)
-                    }
+                        .truncationMode(.tail)
                     if appState.runtime.yolo {
                         Image(systemName: "shield.slash.fill")
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(Color.orange)
                     }
-                    Image(systemName: "chevron.down")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.secondary)
                 }
-                .font(.footnote.weight(.semibold))
-                .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+                .frame(minHeight: 44, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // The controls row is capped; touch and hold shows the model large.
+            .accessibilityShowsLargeContentViewer {
+                Text(appState.runtime.model.isEmpty ? AppLocalization.string("Model") : appState.runtime.model)
+            }
             .accessibilityLabel(modelAccessibilityLabel)
 
-            if let callID = appState.activeVoiceCallSessionID, appState.canResumeVoiceCall {
-                resumeVoiceCallButton(callID)
-            }
-
-            Button {
-                Haptics.selection()
-                appState.showContextSheet = true
-            } label: {
-                HStack(spacing: 5) {
-                    ContextRingView(percent: appState.runtime.contextPercent)
-                        .frame(width: 32, height: 32)
-                }
-                .frame(minWidth: 36, minHeight: 36)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Context usage, \(Int(appState.runtime.contextPercent.rounded())) percent")
-
-            if appState.activeAgents > 0 {
-                Button {
-                    Haptics.selection()
-                    appState.showAgentsSheet = true
-                } label: {
-                    Label("\(appState.activeAgents)", systemImage: "person.2")
-                        .font(.caption.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(.conduitAccent)
-                        .frame(minWidth: 36, minHeight: 36)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(AppLocalization.string("Delegate agents, \(String(appState.activeAgents)) active"))
+            if !appState.runtime.model.isEmpty {
+                // The model name gives way first, then the effort.
+                reasoningMenu
+                    .layoutPriority(1)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 7)
-        .padding(.bottom, 1)
+        .font(.footnote.weight(.semibold))
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        // The rest of the chip's width still opens the sheet.
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { openModelPicker() }
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func openModelPicker() {
+        Haptics.selection()
+        appState.showModelPicker = true
+    }
+
+    /// One tap to change reasoning, the setting changed most, without opening
+    /// the Model sheet. Hermes applies it to the live agent at once.
+    private var reasoningMenu: some View {
+        let current = ReasoningEffortLevel(runtimeEffort: appState.runtime.reasoningEffort)
+        return Menu {
+            Picker(
+                selection: Binding<ReasoningEffortLevel?>(
+                    get: { current },
+                    set: { level in
+                        guard let level, level != current, !appState.isWritingReasoningEffort else { return }
+                        Haptics.selection()
+                        Task { @MainActor in
+                            // The state notice only shows while the composer
+                            // is disabled, so report it in the composer's own
+                            // notice.
+                            if case .failed(let message) = await appState.setReasoningEffort(level.rawValue) {
+                                composerErrorMessage = message
+                                Haptics.error()
+                                UIAccessibility.post(notification: .announcement, argument: message)
+                            }
+                        }
+                    }
+                )
+            ) {
+                ForEach(ReasoningEffortLevel.allCases) { level in
+                    Text(level.title).tag(Optional(level))
+                }
+            } label: {
+                Text("Reasoning")
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text(ReasoningEffortLevel.displayTitle(for: appState.runtime.reasoningEffort))
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 4)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .menuOrder(.fixed)
+        // Picks land in order: the next waits for this write.
+        .disabled(appState.isWritingReasoningEffort)
+        .accessibilityLabel(Text("Reasoning"))
+        .accessibilityValue(Text(ReasoningEffortLevel.displayTitle(for: appState.runtime.reasoningEffort)))
     }
 
     /// Return-shortcut entry point. Invokes the exact same submission path
@@ -748,17 +1244,41 @@ struct ComposerBar: View {
 
     private func submit() {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        guard !trimmed.isEmpty || !attachments.isEmpty || pendingScreenshot != nil else { return }
+        if appState.composerWaitsForChat {
+            queueUntilChatIsReady(trimmed)
+            return
+        }
 
+        // Send is beside the dictate button, so it can be tapped mid-dictation:
+        // the words so far go out, and late results must not refill the
+        // emptied field.
+        // The send haptic stands for both.
+        // A Hermes dictation still transcribing keeps going instead: none
+        // of its words were sent, and they land in the emptied field.
+        if !dictation.isTranscribing {
+            dictation.onFinish = nil
+            dictation.cancel()
+        }
+        isShowingFullEditor = false
         let submittedText = text
         let submittedAttachments = attachments
+        // A slash command leaves the reply attached for the next message.
+        let submittedReply = ComposerReplyReference.appliesToDraft(
+            trimmed,
+            hasAttachments: !submittedAttachments.isEmpty
+        ) ? replyReference : nil
+        let outboundText = ComposerReplyReference.outboundText(
+            trimmed,
+            hasAttachments: !submittedAttachments.isEmpty,
+            replyingTo: submittedReply
+        )
         let submittedAction = action
-        let prefillToken = appState.composerPrefillToken
         let submittedDraftKey = loadedDraftKey ?? activeDraftKey
         let submittedDraftBucket = draftStore.submissionBucket(for: submittedDraftKey)
         let submissionContext = appState.composerSubmissionContext()
         rotateAttachmentGeneration()
-        collapseSubmittedDraft()
+        collapseSubmittedDraft(clearingReply: submittedReply != nil)
 
         switch submittedAction {
         case .send: Haptics.medium()
@@ -769,7 +1289,7 @@ struct ComposerBar: View {
 
         Task {
             let didSubmit = await appState.submitComposer(
-                text: trimmed,
+                text: outboundText,
                 attachments: submittedAttachments,
                 context: submissionContext
             )
@@ -777,6 +1297,7 @@ struct ComposerBar: View {
                 restoreSubmittedDraftIfNeeded(
                     text: submittedText,
                     attachments: submittedAttachments,
+                    replyReference: submittedReply,
                     for: submittedDraftKey
                 )
                 Haptics.error()
@@ -784,82 +1305,277 @@ struct ComposerBar: View {
             }
             draftStore.removeDraft(for: submittedDraftBucket)
             guard loadedDraftKey == submittedDraftKey else { return }
-            if appState.composerPrefillToken != prefillToken {
-                replaceComposerText(appState.composerPrefillText)
-                isFocused = !text.isEmpty
-            }
+            // A prefill the reply asked for (a slash command's) goes in
+            // here if its update hasn't put it in yet.
+            applyPendingPrefill()
             isShowingSlashSuggestions = slashPrefix != nil
         }
     }
 
+    /// The chat on screen is still on its way: the message waits in it as
+    /// "Sends when connected" and goes once the chat is ready
+    /// (AppState+PendingSend.swift). Text only.
+    private func queueUntilChatIsReady(_ trimmed: String) {
+        guard action == .send, attachments.isEmpty, pendingScreenshot == nil else { return }
+        let submittedReply = ComposerReplyReference.appliesToDraft(trimmed, hasAttachments: false)
+            ? replyReference : nil
+        let submittedDraftKey = loadedDraftKey ?? activeDraftKey
+        guard appState.sendWhenConnected(trimmed, replyReference: submittedReply) else {
+            Haptics.error()
+            return
+        }
+        if !dictation.isTranscribing {
+            dictation.onFinish = nil
+            dictation.cancel()
+        }
+        isShowingFullEditor = false
+        collapseSubmittedDraft(clearingReply: submittedReply != nil)
+        draftStore.removeDraft(for: submittedDraftKey)
+        Haptics.medium()
+    }
+
+    /// Words AppState puts back: a waiting message that wasn't sent, or
+    /// the one its Edit took back. Into the field when they're this draft's,
+    /// otherwise into their chat's stored draft.
+    private func applyComposerRestoreRequests() {
+        guard let loadedDraftKey else { return }
+        for request in appState.composerRestoreRequests where request.dashboardID == appState.activeDashboardID {
+            if restoreRequest(request, belongsTo: loadedDraftKey) {
+                let restored = ComposerDraft(text: text, attachments: attachments, replyReference: replyReference)
+                    .restoring(request.draft)
+                replaceComposerText(restored.text, cursorAtEnd: true)
+                attachments = restored.attachments
+                replyReference = restored.replyReference
+                if request.focuses {
+                    // After this update, as a focus request does.
+                    Task { @MainActor in
+                        isFocused = true
+                    }
+                }
+            } else {
+                let key = draftStore.keys.first { appState.composerDraftKeysAreSameChat($0, request.key) }
+                    ?? request.key
+                draftStore.save(draftStore.draft(for: key).restoring(request.draft), for: key)
+            }
+            appState.consumeComposerRestoreRequest(request.id)
+        }
+    }
+
+    private func restoreRequest(_ request: ComposerRestoreRequest, belongsTo key: ComposerDraftKey) -> Bool {
+        guard request.key.profile == key.profile else { return false }
+        return appState.composerDraftKeysAreSameChat(request.key, key)
+    }
+
+    /// Why a waiting message came back, until the next edit or send.
+    private func composerNoticeLine(_ notice: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "arrow.uturn.backward.circle")
+                .foregroundStyle(.secondary)
+            Text(notice)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button {
+                appState.dismissComposerNotice()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text("Dismiss notice"))
+            .accessibilityValue(Text(notice))
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+        .accessibilityIdentifier("composer.notice")
+    }
+
     /// A saved live call: pick it up with a new live call that continues
-    /// the same row. Labeled, beside the model, so it isn't mistaken for
-    /// the mic, which always starts a new call.
+    /// the same row, as the voice button there does too.
     private func resumeVoiceCallButton(_ callID: String) -> some View {
         Button {
             dismissComposer()
             Haptics.selection()
             Task { await appState.resumeVoiceCall(sessionID: callID) }
         } label: {
-            HStack(spacing: 6) {
+            Group {
                 if appState.isPreparingVoiceResume {
                     ProgressView()
                         .controlSize(.small)
                 } else {
-                    Image(systemName: "waveform")
+                    Image(systemName: "phone.arrow.up.right")
                 }
-                Text(AppLocalization.string("Resume call"))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
             }
-            .font(.footnote.weight(.semibold))
+            .font(.subheadline.weight(.semibold))
             .foregroundStyle(Color.conduitAccent)
-            .padding(.horizontal, 12)
-            .frame(minHeight: 36)
+            .frame(width: Self.controlSize, height: Self.controlSize)
+            .contentShape(Self.controlHitShape)
         }
         .buttonStyle(.plain)
         .disabled(appState.isPreparingVoiceResume || appState.isBusy)
-        .conduitGlassControl(cornerRadius: 18, tint: .conduitAura.opacity(0.14), interactive: true)
+        .conduitGlassControl(cornerRadius: Self.controlSize / 2, tint: .conduitAura.opacity(0.14), interactive: true)
         .accessibilityLabel(AppLocalization.string("Resume call"))
         .accessibilityHint(AppLocalization.string("Starts a new live call that continues this one"))
     }
 
+    /// Opens Voice. A waveform, so it reads as "talk live", apart from the
+    /// plain mic that dictates.
     private var voiceButton: some View {
-        Button {
-            dismissComposer()
-            Haptics.selection()
-            Task {
-                _ = await appState.openVoiceConversation(
-                    PendingVoiceIntent(
-                        profile: appState.activeProfile,
-                        startsFreshConversation: false,
-                        source: .composer
-                    )
-                )
+        let canOpenVoice = canOpenVoiceFromComposer
+        return Button {
+            openVoiceFromComposer()
+        } label: {
+            Image(systemName: appState.canStartPhoneVoiceConversation ? "waveform" : "waveform.slash")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(canOpenVoice ? Color.accentColor : Color.secondary)
+                .frame(width: Self.controlSize, height: Self.controlSize)
+                .contentShape(Self.controlHitShape)
+        }
+        .buttonStyle(.plain)
+        .disabled(!canOpenVoice)
+        .conduitGlassControl(
+            cornerRadius: Self.controlSize / 2,
+            tint: appState.canStartPhoneVoiceConversation ? .conduitAura.opacity(0.14) : .secondary.opacity(0.06),
+            interactive: canOpenVoice
+        )
+        .accessibilityLabel(Text("Start voice conversation"))
+        .accessibilityHint(appState.phoneVoiceUnavailableReason
+            ?? AppLocalization.string("Starts a voice call; in a chat with messages, the call works in that chat"))
+    }
+
+    /// Tap to dictate into the draft, tap again to stop; the words are
+    /// never sent on their own. Neutral glass, so the tinted voice/send
+    /// slot stays the one "go" control.
+    private var dictateButton: some View {
+        let canDictate = canDictateFromComposer
+        let isCapturing = dictation.isCapturing
+        // A Hermes dictation still transcribing pulses too, and a tap
+        // waits for its words.
+        let isActive = isCapturing || dictation.isStarting || dictation.isTranscribing
+        return Button {
+            switch ComposerDictation.tap(
+                isCapturing: dictation.isCapturing,
+                isStarting: dictation.isStarting,
+                canDictate: canDictate,
+                isTranscribing: dictation.isTranscribing
+            ) {
+            case .start: beginDictation()
+            case .stop: dictation.stop()
+            // Tapped again before the microphone came up.
+            case .cancelStart: dictation.cancel()
+            case .nothing: break
             }
         } label: {
-            Image(systemName: appState.canStartPhoneVoiceConversation ? "mic.fill" : "mic.slash")
-                .font(.system(size: 18, weight: .semibold))
-                .frame(width: 44, height: 44)
+            Image(systemName: isCapturing ? "mic.fill" : "mic")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(isCapturing ? Color.red : (canDictate ? Color.primary : Color.secondary))
+                // Pulses from the tap, so a start still waiting on
+                // permission or the microphone shows it's in flight.
+                .symbolEffect(.pulse, isActive: isActive && !reduceMotion)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: Self.controlSize, height: Self.controlSize)
+                .contentShape(Self.controlHitShape)
         }
-        .disabled(!appState.canStartPhoneVoiceConversation || appState.isBusy || !appState.composerIsEnabled)
+        .buttonStyle(.plain)
+        .disabled(!canDictate && !isActive)
         .conduitGlassControl(
-            cornerRadius: 22,
-            tint: appState.canStartPhoneVoiceConversation ? .conduitAura.opacity(0.14) : .secondary.opacity(0.06),
-            interactive: appState.canStartPhoneVoiceConversation
+            cornerRadius: Self.controlSize / 2,
+            tint: isCapturing ? .red.opacity(0.16) : .primary.opacity(0.025),
+            interactive: canDictate || isActive
         )
-        .accessibilityLabel("Start voice conversation")
-        .accessibilityHint(appState.phoneVoiceUnavailableReason ?? AppLocalization.string("Opens voice controls over this conversation"))
+        .accessibilityLabel(isCapturing
+            ? Text("Stop dictation")
+            : (dictation.isStarting ? Text("Cancel dictation")
+                : (dictation.isTranscribing ? Text("Transcribing") : Text("Dictate"))))
+        .accessibilityHint(isCapturing
+            ? AppLocalization.string("Stops dictating; the words stay in the message")
+            : (dictation.isStarting || dictation.isTranscribing ? "" : (appState.isVoiceInUse
+                ? AppLocalization.string("Dictation is unavailable while a voice conversation has the microphone")
+                : AppLocalization.string("Types what you say into the message"))))
+    }
+
+    private func openVoiceFromComposer() {
+        dismissComposer()
+        Haptics.selection()
+        Task {
+            _ = await appState.openVoiceConversation(
+                PendingVoiceIntent(
+                    profile: appState.activeProfile,
+                    startsFreshConversation: false,
+                    source: .composer
+                )
+            )
+        }
+    }
+
+    private var canOpenVoiceFromComposer: Bool {
+        appState.canStartPhoneVoiceConversation && !appState.isBusy && appState.composerIsEnabled
+    }
+
+    private var canDictateFromComposer: Bool {
+        appState.composerIsEnabled && !appState.isVoiceInUse
+    }
+
+    private func beginDictation() {
+        // Reserved first: it ends a dictation still settling, whose
+        // callbacks must not be the new ones.
+        guard let token = dictation.reserveStart() else { return }
+        dictationPrefix = text
+        dictatedDraft = nil
+        Haptics.medium()
+        dictation.onTranscript = { transcript in
+            // Typed or replaced since dictation last wrote it: the sheet
+            // reports typing only on its next update, which can trail this
+            // result. End the dictation instead of writing over the change.
+            let prefix: String
+            if ComposerDictation.draftIsAsDictationLeftIt(
+                text, prefix: dictationPrefix, lastWrite: dictatedDraft
+            ) {
+                prefix = dictationPrefix
+            } else if dictation.isTranscribing {
+                // Words that never reached the draft (a Hermes upload)
+                // go after whatever it holds now, sent or typed.
+                prefix = text
+                dictationPrefix = text
+            } else {
+                dictation.cancel()
+                return
+            }
+            let draft = ComposerDictation.draft(before: prefix, dictated: transcript)
+            dictatedDraft = draft
+            // The cursor follows the words, so the next dictation or typing
+            // carries on after them.
+            replaceComposerText(draft, cursorAtEnd: true)
+        }
+        dictation.onFinish = { _ in
+            Haptics.light()
+        }
+        dictation.onFailure = { message in
+            composerErrorMessage = message
+        }
+        Task {
+            do {
+                try await dictation.start(token: token, hermesGateway: { appState.makeVoiceGateway() })
+            } catch {
+                composerErrorMessage = UserFacingError.message(for: error)
+            }
+        }
     }
 
     /// Collapse the draft in the same transaction that dismisses the keyboard.
     /// Waiting for the gateway RPC leaves the side controls aligned to the old
     /// multiline field while the keyboard's safe area is already animating.
-    private func collapseSubmittedDraft() {
+    private func collapseSubmittedDraft(clearingReply: Bool) {
         dismissComposer()
         let updates = {
             replaceComposerText("")
             attachments = []
+            if clearingReply { replyReference = nil }
             composerTextHeight = ComposerPasteTextView.minimumHeight
         }
         if reduceMotion {
@@ -874,6 +1590,7 @@ struct ComposerBar: View {
     private func restoreSubmittedDraftIfNeeded(
         text submittedText: String,
         attachments submittedAttachments: [Attachment],
+        replyReference submittedReply: ComposerReplyReference?,
         for key: ComposerDraftKey
     ) {
         let restorationKey: ComposerDraftKey
@@ -889,7 +1606,11 @@ struct ComposerBar: View {
 
         guard loadedDraftKey == restorationKey else {
             draftStore.saveIfMissing(
-                ComposerDraft(text: submittedText, attachments: submittedAttachments),
+                ComposerDraft(
+                    text: submittedText,
+                    attachments: submittedAttachments,
+                    replyReference: submittedReply
+                ),
                 for: restorationKey
             )
             return
@@ -899,6 +1620,101 @@ struct ComposerBar: View {
         guard text.isEmpty, attachments.isEmpty else { return }
         replaceComposerText(submittedText)
         attachments = submittedAttachments
+        if replyReference == nil { replyReference = submittedReply }
+    }
+
+    /// A screenshot chat opened with the keyboard: the field takes focus.
+    private func applyFocusRequest(_ request: ComposerFocusRequest?) {
+        // A locked composer keeps the request until it unlocks.
+        guard let request, appState.composerIsEnabled else { return }
+        appState.consumeComposerFocusRequest(request.id)
+        // Left for another chat before it applied: dropped.
+        guard request.sessionID == appState.activeSessionId else { return }
+        // After this update: the new chat's draft load, which can land in
+        // the same update, unfocuses the field.
+        Task { @MainActor in
+            isFocused = true
+        }
+    }
+
+    /// A quote from the transcript (#385): selected text joins the draft as
+    /// a `>` quote with the cursor below it; a reply's Quote button attaches
+    /// the whole reply as the "Replying to…" chip. Either way the composer
+    /// takes focus for the reply.
+    private func applyQuoteRequest(_ request: ComposerQuoteRequest?) {
+        guard let request else { return }
+        appState.consumeComposerQuoteRequest(request.id)
+        // The composer can lock in the same update that delivers the quote
+        // (the connection dropped); a locked draft takes nothing.
+        guard appState.composerIsEnabled else { return }
+        // Quoting is composing: a pending automatic chat resume must not
+        // switch away from the draft it just changed.
+        appState.noteComposerUserEdit()
+        let announcement: String
+        switch request.content {
+        case .text(let quote):
+            // A running dictation would rewrite the draft from where it began.
+            dictation.yieldToTyping()
+            replaceComposerText(ChatQuote.inserting(quote, into: text), cursorAtEnd: true)
+            isShowingSlashSuggestions = false
+            announcement = AppLocalization.string("Quoted in your message")
+        case .reply(let reference):
+            withAnimation(reduceMotion ? nil : ConduitMotion.response) {
+                replyReference = reference
+            }
+            announcement = AppLocalization.string("Replying to \(reference.authorName)")
+        }
+        Haptics.selection()
+        isFocused = true
+        // VoiceOver hears where the quote went, queued behind what it says
+        // about the newly focused composer rather than cut off by it.
+        UIAccessibility.post(
+            notification: .announcement,
+            argument: NSAttributedString(
+                string: announcement,
+                attributes: [.accessibilitySpeechQueueAnnouncement: true]
+            )
+        )
+    }
+
+    private func replyReferenceChip(_ reference: ComposerReplyReference) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "quote.bubble")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(Color.conduitAccent)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(AppLocalization.string("Replying to \(reference.authorName)"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(reference.excerpt)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityHint(AppLocalization.string("Sent with your next message"))
+            Spacer(minLength: 0)
+            Button {
+                Haptics.selection()
+                withAnimation(reduceMotion ? nil : ConduitMotion.response) {
+                    replyReference = nil
+                }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(AppLocalization.string("Remove quoted reply"))
+            .accessibilityIdentifier("composer.reply-reference.remove")
+        }
+        .padding(.leading, 12)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
     /// Sending, steering, and stopping all move attention back to the live
@@ -939,23 +1755,69 @@ struct ComposerBar: View {
         )
     }
 
+    static var cameraAccessMessage: String {
+        AppLocalization.string("Taking a photo needs camera access. You can allow it in Settings.")
+    }
+
+    /// Asks for camera access first when it hasn't been decided, so a "Don't
+    /// Allow" never leaves the picker open on a black screen; when access is
+    /// off, the composer says so with a way to Settings instead.
+    private func openCamera() {
+        composerErrorMessage = nil
+        let origin = asyncAttachmentContext
+        let present = {
+            cameraImportContext = origin
+            showCamera = true
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            present()
+        case .notDetermined:
+            Task {
+                let granted = await AVCaptureDevice.requestAccess(for: .video)
+                guard shouldAcceptAsyncAttachmentCompletion(startedIn: origin) else { return }
+                if granted { present() } else { showCameraAccessNotice() }
+            }
+        default:
+            showCameraAccessNotice()
+        }
+    }
+
+    private func showCameraAccessNotice() {
+        composerErrorMessage = Self.cameraAccessMessage
+        Haptics.error()
+    }
+
     private func openPhotoLibraryPicker() {
+        // A fresh selection each time, so items an earlier import is still
+        // staging aren't picked up again.
+        photoItems = []
         photoImportContext = asyncAttachmentContext
         photoImportGeneration &+= 1
         showAttachmentMenu = true
     }
 
     private func saveDraft(for key: ComposerDraftKey) {
-        draftStore.save(ComposerDraft(text: text, attachments: attachments), for: key)
+        draftStore.save(
+            ComposerDraft(text: text, attachments: attachments, replyReference: replyReference),
+            for: key
+        )
     }
 
     private func loadDraft(for key: ComposerDraftKey) {
+        // Kept under another of the chat's ids (typed over its saved copy,
+        // or in the New Chat that created it): it's this chat's draft.
+        if !draftStore.hasDraft(for: key),
+           let other = draftStore.keys.first(where: { $0 != key && appState.composerDraftKeysAreSameChat($0, key) }) {
+            draftStore.migrateDraft(from: other, to: key)
+        }
         let draft = draftStore.draft(for: key)
         if text != draft.text {
             suppressNextTextChangeSuggestions = true
         }
         replaceComposerText(draft.text)
         attachments = draft.attachments
+        replyReference = draft.replyReference
         loadedDraftKey = key
         composerTextHeight = ComposerPasteTextView.minimumHeight
         isFocused = false
@@ -964,6 +1826,20 @@ struct ComposerBar: View {
 
     private func handoffComposer(to destinationKey: ComposerDraftKey) {
         guard loadedDraftKey != destinationKey else { return }
+        // The same chat under another id (a saved copy's chat opening, the
+        // chat a New Chat created): the field stays as it is, focus and
+        // dictation with it.
+        if let loadedDraftKey, appState.composerDraftKeysAreSameChat(loadedDraftKey, destinationKey) {
+            saveDraft(for: destinationKey)
+            draftStore.removeDraft(for: loadedDraftKey)
+            self.loadedDraftKey = destinationKey
+            applyPendingPrefill()
+            return
+        }
+        // Dictated words belong to the draft they started in, and the full
+        // editor to the chat it was opened in.
+        dictation.cancel()
+        isShowingFullEditor = false
         if let loadedDraftKey {
             saveDraft(for: loadedDraftKey)
             if Self.draftKeysAreEquivalent(
@@ -982,14 +1858,40 @@ struct ComposerBar: View {
         loadDraft(for: destinationKey)
         composerTextHeight = ComposerPasteTextView.minimumHeight
         isFocused = false
+        // A prefill for this chat goes in over its draft; one for a chat
+        // left behind is dropped.
+        if let target = appState.composerPrefillDraftKey,
+           !Self.draftKeysAreEquivalent(target, destinationKey, identity: appState.activeChatScrollSessionIdentity) {
+            appState.consumeComposerPrefill(appState.composerPrefillToken)
+        } else {
+            applyPendingPrefill()
+        }
+    }
+
+    /// Puts a waiting prefill in once its chat's draft is the one loaded.
+    /// Opening a chat with a prefill (Try a test call, Have Hermes watch
+    /// for this) changes the chat and the prefill in one update, and that
+    /// chat's draft load can run after the prefill: put in first, it was
+    /// saved into the chat being left and the new chat opened blank.
+    private func applyPendingPrefill() {
+        guard Self.shouldApplyPrefill(
+            for: appState.composerPrefillDraftKey,
+            loaded: loadedDraftKey,
+            identity: appState.activeChatScrollSessionIdentity
+        ) else { return }
+        appState.consumeComposerPrefill(appState.composerPrefillToken)
+        replaceComposerText(appState.composerPrefillText)
+        isFocused = !text.isEmpty
+        isShowingSlashSuggestions = slashPrefix != nil
     }
 
     private func rotateAttachmentGeneration() {
         attachmentGeneration &+= 1
         photoImportGeneration &+= 1
-        photoItem = nil
+        photoItems = []
         photoImportContext = nil
         documentImportContext = nil
+        cameraImportContext = nil
         editorIdentity = UUID()
     }
 
@@ -1013,23 +1915,117 @@ struct ComposerBar: View {
         Haptics.error()
     }
 
+    /// Photos and videos picked together, numbered in the order they were
+    /// tapped (#334).
+    static let photoPickerSelectionLimit = 10
+
     private func handlePhotoSelection() {
-        guard let item = photoItem else { return }
+        let items = photoItems
+        guard !items.isEmpty else { return }
         guard let origin = photoImportContext else {
-            photoItem = nil
+            photoItems = []
             return
         }
         let completionGeneration = photoImportGeneration
+        let limitMegabytes = attachmentLimitMegabytes
         Task {
-            if let data = try? await item.loadTransferable(type: Data.self),
-               shouldAcceptPhotoPickerCompletion(openedIn: origin) {
-                addAttachment(data: data, name: "photo.jpg", mimeType: "image/jpeg", kind: .image)
+            var tally = ImportTally()
+            for (index, item) in items.enumerated() {
+                guard shouldAcceptPhotoPickerCompletion(openedIn: origin) else { break }
+                // File copies and JPEG re-encodes stay off the main actor;
+                // only the strip update comes back here.
+                let outcome = await Task.detached(priority: .userInitiated) {
+                    await Self.stagePickedItem(item, ordinal: index + 1, limitMegabytes: limitMegabytes)
+                }.value
+                guard shouldAcceptPhotoPickerCompletion(openedIn: origin) else {
+                    if case .staged(let attachment) = outcome { Self.discardStagedFile(attachment) }
+                    break
+                }
+                record(outcome, in: &tally)
+            }
+            if shouldAcceptPhotoPickerCompletion(openedIn: origin) {
+                finishImport(tally, limitMegabytes: limitMegabytes)
             }
             clearPhotoImportContextIfCurrent(
                 completingGeneration: completionGeneration,
                 completingContext: origin
             )
         }
+    }
+
+    typealias StagedImport = AttachmentStaging.StagedImport
+
+    struct ImportTally {
+        var stagedAny = false
+        var oversized: [String] = []
+        var failed: [String] = []
+    }
+
+    private func record(_ outcome: StagedImport, in tally: inout ImportTally) {
+        switch outcome {
+        case .staged(let attachment):
+            attachments.append(attachment)
+            tally.stagedAny = true
+        case .tooLarge(let name):
+            tally.oversized.append(name)
+        case .failed(let name):
+            tally.failed.append(name)
+        }
+    }
+
+    /// One cue per selection: the error haptic and message when anything
+    /// was left out, otherwise a light tap if something was staged.
+    private func finishImport(_ tally: ImportTally, limitMegabytes: Int) {
+        if tally.oversized.isEmpty && tally.failed.isEmpty {
+            if tally.stagedAny { Haptics.light() }
+            return
+        }
+        reportImportProblems(oversized: tally.oversized, failed: tally.failed, limitMegabytes: limitMegabytes)
+    }
+
+    /// Copies one picked item into the staging folder under its real name
+    /// and type. Videos stay files end to end; images in a format model
+    /// providers can't read (HEIC...) are re-encoded as JPEG.
+    nonisolated static func stagePickedItem(_ item: PhotosPickerItem, ordinal: Int, limitMegabytes: Int) async -> StagedImport {
+        let pickedType = item.supportedContentTypes.first
+        let fallbackName = AttachmentTypePolicy.filename(suggested: nil, type: pickedType, ordinal: ordinal)
+        if let file = try? await item.loadTransferable(type: PickedMediaFile.self) {
+            let type = UTType(filenameExtension: file.url.pathExtension) ?? pickedType
+            let name = AttachmentTypePolicy.filename(suggested: file.originalName, type: type, ordinal: ordinal)
+            return AttachmentStaging.finishStaging(fileAt: file.url, name: name, type: type, limitMegabytes: limitMegabytes)
+        }
+        // Some images only hand over their bytes. Videos never take this
+        // path: it would hold the whole file in memory.
+        guard pickedType?.conforms(to: .image) == true,
+              let data = try? await item.loadTransferable(type: Data.self), !data.isEmpty else {
+            return .failed(fallbackName)
+        }
+        do {
+            let url = try AttachmentStaging.destination(for: fallbackName)
+            try data.write(to: url, options: .atomic)
+            return AttachmentStaging.finishStaging(fileAt: url, name: fallbackName, type: pickedType, limitMegabytes: limitMegabytes)
+        } catch {
+            return .failed(fallbackName)
+        }
+    }
+
+    nonisolated static func discardStagedFile(_ attachment: Attachment) {
+        guard let url = URL(string: attachment.uri), url.isFileURL else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func reportImportProblems(oversized: [String], failed: [String], limitMegabytes: Int) {
+        var messages: [String] = []
+        if !oversized.isEmpty {
+            messages.append(AttachmentSizeLimit.tooLargeMessage(names: oversized, megabytes: limitMegabytes))
+        }
+        if !failed.isEmpty {
+            let list = failed.joined(separator: ", ")
+            messages.append(AppLocalization.string("Could not prepare \(list) for upload."))
+        }
+        guard !messages.isEmpty else { return }
+        composerErrorMessage = messages.joined(separator: "\n")
+        Haptics.error()
     }
 
     private func clearPhotoImportContextIfCurrent(
@@ -1042,7 +2038,7 @@ struct ComposerBar: View {
             currentGeneration: photoImportGeneration,
             currentContext: photoImportContext
         ) else { return }
-        photoItem = nil
+        photoItems = []
         photoImportContext = nil
     }
 
@@ -1052,19 +2048,87 @@ struct ComposerBar: View {
     ) {
         guard let origin,
               shouldAcceptAsyncAttachmentCompletion(startedIn: origin) else { return }
-        guard case .success(let urls) = result else { return }
-        for url in urls {
-            let didAccess = url.startAccessingSecurityScopedResource()
-            defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url) else { continue }
-            let type = UTType(filenameExtension: url.pathExtension)
-            addAttachment(
-                data: data,
-                name: url.lastPathComponent,
-                mimeType: type?.preferredMIMEType ?? "application/octet-stream",
-                kind: type?.conforms(to: .image) == true ? .image : .document
-            )
+        let urls: [URL]
+        switch result {
+        case .success(let picked):
+            urls = picked
+        case .failure(let error):
+            composerErrorMessage = AppLocalization.string("Could not open the file: \(UserFacingError.message(for: error))")
+            Haptics.error()
+            return
         }
+        let limitMegabytes = attachmentLimitMegabytes
+        Task {
+            var tally = ImportTally()
+            for url in urls {
+                guard shouldAcceptAsyncAttachmentCompletion(startedIn: origin) else { break }
+                // Copied, checked and (for images) re-encoded off the main
+                // actor, like picked photos.
+                let outcome = await Task.detached(priority: .userInitiated) {
+                    Self.stageDocument(at: url, limitMegabytes: limitMegabytes)
+                }.value
+                guard shouldAcceptAsyncAttachmentCompletion(startedIn: origin) else {
+                    if case .staged(let attachment) = outcome { Self.discardStagedFile(attachment) }
+                    break
+                }
+                record(outcome, in: &tally)
+            }
+            if shouldAcceptAsyncAttachmentCompletion(startedIn: origin) {
+                finishImport(tally, limitMegabytes: limitMegabytes)
+            }
+        }
+    }
+
+    /// Stages a file from the document picker the same way as a picked
+    /// photo: size checked before it is read, copied rather than loaded.
+    nonisolated static func stageDocument(at url: URL, limitMegabytes: Int) -> StagedImport {
+        let name = url.lastPathComponent
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        if let size = AttachmentSizeLimit.fileSize(at: url),
+           !AttachmentSizeLimit.allows(byteCount: size, megabytes: limitMegabytes) {
+            return .tooLarge(name)
+        }
+        do {
+            let staged = try AttachmentStaging.destination(for: name)
+            try FileManager.default.copyItem(at: url, to: staged)
+            return AttachmentStaging.finishStaging(
+                fileAt: staged,
+                name: name,
+                type: UTType(filenameExtension: url.pathExtension),
+                limitMegabytes: limitMegabytes
+            )
+        } catch {
+            return .failed(name)
+        }
+    }
+
+    /// A photo from the Camera item, staged like a picked one: encoded as
+    /// JPEG off the main actor, then size checked.
+    private func handleCapturedPhoto(_ image: UIImage, startedIn origin: AsyncAttachmentContext?) {
+        guard let origin, shouldAcceptAsyncAttachmentCompletion(startedIn: origin) else { return }
+        composerErrorMessage = nil
+        let limitMegabytes = attachmentLimitMegabytes
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.stageCapturedPhoto(image, limitMegabytes: limitMegabytes)
+            }.value
+            guard shouldAcceptAsyncAttachmentCompletion(startedIn: origin) else {
+                if case .staged(let attachment) = outcome { Self.discardStagedFile(attachment) }
+                return
+            }
+            var tally = ImportTally()
+            record(outcome, in: &tally)
+            finishImport(tally, limitMegabytes: limitMegabytes)
+        }
+    }
+
+    nonisolated static func stageCapturedPhoto(_ image: UIImage, limitMegabytes: Int) -> StagedImport {
+        let name = AttachmentTypePolicy.jpegFilename(for: "photo")
+        guard let data = image.jpegData(compressionQuality: 0.9),
+              let url = try? AttachmentStaging.destination(for: name),
+              (try? data.write(to: url, options: .atomic)) != nil else { return .failed(name) }
+        return AttachmentStaging.finishStaging(fileAt: url, name: name, type: .jpeg, limitMegabytes: limitMegabytes)
     }
 
     private func clearDocumentImportContextIfCurrent(_ completingContext: AsyncAttachmentContext?) {
@@ -1072,28 +2136,31 @@ struct ComposerBar: View {
         documentImportContext = nil
     }
 
+    /// Pasted images: written to the staging folder off the main actor and
+    /// normalized like picked photos (a pasted HEIC goes up as JPEG).
     private func addAttachment(data: Data, name: String, mimeType: String, kind: Attachment.Kind) {
         guard !data.isEmpty else { return }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Hermes-Conduit-Attachments", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let url = directory.appendingPathComponent("\(UUID().uuidString)-\(name)")
-            try data.write(to: url, options: .atomic)
-            attachments.append(Attachment(id: UUID().uuidString, name: name, uri: url.absoluteString, mimeType: mimeType, kind: kind))
-            Haptics.light()
-        } catch {
-            appState.errorMessage = AppLocalization.string("Could not prepare \(name) for upload.")
-            Haptics.error()
+        let limitMegabytes = attachmentLimitMegabytes
+        guard AttachmentSizeLimit.allows(byteCount: Int64(data.count), megabytes: limitMegabytes) else {
+            reportImportProblems(oversized: [name], failed: [], limitMegabytes: limitMegabytes)
+            return
         }
-    }
-
-    private func formatEffort(_ value: String) -> String {
-        let lower = value.lowercased()
-        if lower == "none" || lower == "off" { return AppLocalization.string("Off") }
-        if lower == "xhigh" { return AppLocalization.string("Extra High") }
-        return lower.capitalized
-            .replacingOccurrences(of: "-", with: " ")
-            .replacingOccurrences(of: "_", with: " ")
+        let origin = asyncAttachmentContext
+        let type = UTType(mimeType: mimeType)
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) { () -> StagedImport in
+                guard let url = try? AttachmentStaging.destination(for: name),
+                      (try? data.write(to: url, options: .atomic)) != nil else { return .failed(name) }
+                return AttachmentStaging.finishStaging(fileAt: url, name: name, type: type, limitMegabytes: limitMegabytes)
+            }.value
+            guard shouldAcceptAsyncAttachmentCompletion(startedIn: origin) else {
+                if case .staged(let attachment) = outcome { Self.discardStagedFile(attachment) }
+                return
+            }
+            var tally = ImportTally()
+            record(outcome, in: &tally)
+            finishImport(tally, limitMegabytes: limitMegabytes)
+        }
     }
 
     private var accessibilityLabel: String {
@@ -1108,12 +2175,10 @@ struct ComposerBar: View {
 
     private var modelAccessibilityLabel: String {
         let model = appState.runtime.model.isEmpty ? AppLocalization.string("Model") : appState.runtime.model
-        let reasoning = appState.runtime.reasoningEffort.isEmpty
-            ? AppLocalization.string("reasoning not set")
-            : AppLocalization.string("reasoning \(formatEffort(appState.runtime.reasoningEffort))")
+        // Reasoning has its own control beside the model name.
         let approvals = appState.runtime.yolo ? AppLocalization.string(", auto-approve enabled") : ""
         let activity = appState.turnState == .running ? AppLocalization.string(", agent working") : ""
-        return "\(model), \(reasoning)\(approvals)\(activity)"
+        return "\(model)\(approvals)\(activity)"
     }
 }
 

@@ -14,7 +14,7 @@ private final class FakeChatScrollSurface: ChatScrollSurface {
     var isTracking = false
     var isDecelerating = false
     var transcriptOriginY: CGFloat = 18
-    private(set) var sets: [(y: CGFloat, animated: Bool)] = []
+    var sets: [(y: CGFloat, animated: Bool)] = []
 
     init(contentHeight: CGFloat = 4000, viewportHeight: CGFloat = 800) {
         self.contentHeight = contentHeight
@@ -53,6 +53,8 @@ final class ChatScrollEngineTests: XCTestCase {
     /// keeps only the surface would otherwise talk to a freed engine and
     /// pass without testing anything.
     private var engines: [ChatScrollEngine] = []
+    /// Work the engine scheduled for later, run by the test when it chooses.
+    private var scheduled: [@MainActor () -> Void] = []
 
     private let keyA = ChatScrollSessionKey(profile: "p", sessionID: "a")
     private let keyB = ChatScrollSessionKey(profile: "p", sessionID: "b")
@@ -62,6 +64,17 @@ final class ChatScrollEngineTests: XCTestCase {
         clock = 100
         events = []
         engines = []
+        scheduled = []
+    }
+
+    /// Runs the main run loop until every block already on the main queue
+    /// has run: the queue is FIFO, so a marker queued now runs after them.
+    /// The 10s is a cap, not a timing; a fixed 50ms window could expire on a
+    /// loaded runner before the queue was serviced at all.
+    private func drainMainQueue() {
+        let drained = expectation(description: "earlier main-queue blocks ran")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 10)
     }
 
     private func identity(_ sessionID: String) -> ChatScrollSessionIdentity {
@@ -91,7 +104,10 @@ final class ChatScrollEngineTests: XCTestCase {
         surface providedSurface: FakeChatScrollSurface? = nil
     ) -> (ChatScrollEngine, FakeChatScrollSurface) {
         let surface = providedSurface ?? FakeChatScrollSurface()
-        let engine = ChatScrollEngine(now: { [unowned self] in self.clock })
+        let engine = ChatScrollEngine(
+            now: { [unowned self] in self.clock },
+            schedule: { [unowned self] _, body in self.scheduled.append(body) }
+        )
         engines.append(engine)
         engine.onEvent = { [unowned self] event in self.events.append(event) }
         surface.engine = engine
@@ -137,6 +153,57 @@ final class ChatScrollEngineTests: XCTestCase {
         XCTAssertEqual(surface.contentOffsetY, 2900, "no empty space left under the last message")
     }
 
+    /// SwiftUI can write its previous offset back after the pass that
+    /// pinned a shrink, leaving empty space under the last message.
+    func testFollowingPinsAnOffsetWrittenPastTheBottom() {
+        let (engine, surface) = makeEngine()
+        surface.contentHeight = 3700
+        surface.contentOffsetY = 3200
+        engine.surfaceScrolled()
+        XCTAssertEqual(surface.contentOffsetY, 2900)
+        XCTAssertTrue(engine.isFollowingLatest)
+    }
+
+    func testPastTheBottomCorrectionsCannotLoopWithAnotherWriter() {
+        let (engine, surface) = makeEngine()
+        surface.contentHeight = 3700
+        surface.sets.removeAll()
+        // A writer that puts its own offset back after every pin, all within
+        // one main-queue turn: one inline correction, no recursion.
+        for _ in 0..<10 {
+            surface.contentOffsetY = 3200
+            engine.surfaceScrolled()
+        }
+        XCTAssertEqual(surface.sets.count, 1)
+
+        // Once the turn is over, the deferred check leaves it on the bottom.
+        drainMainQueue()
+        XCTAssertEqual(surface.contentOffsetY, 2900)
+        XCTAssertEqual(surface.sets.count, 2)
+        XCTAssertTrue(engine.isFollowingLatest)
+    }
+
+    func testATitleTapCancelsAPendingPastTheBottomCheck() {
+        let (engine, surface) = makeEngine()
+        surface.contentHeight = 3700
+        surface.contentOffsetY = 3200
+        engine.surfaceScrolled()
+        engine.explicitTopRequested()
+        XCTAssertEqual(surface.contentOffsetY, surface.minOffsetY)
+
+        drainMainQueue()
+        XCTAssertEqual(surface.contentOffsetY, surface.minOffsetY, "the reader asked for the top")
+        XCTAssertEqual(engine.mode, .browsing)
+    }
+
+    func testFollowingLeavesARubberBandPastTheBottomToTheFinger() {
+        let (engine, surface) = makeEngine()
+        surface.isTracking = true
+        surface.contentOffsetY = 3300
+        engine.surfaceScrolled()
+        XCTAssertEqual(surface.contentOffsetY, 3300)
+    }
+
     func testFollowingDoesNotFightAFingerOnTheScreen() {
         let (_, surface) = makeEngine()
         surface.isTracking = true
@@ -144,7 +211,116 @@ final class ChatScrollEngineTests: XCTestCase {
         XCTAssertEqual(surface.contentOffsetY, 3200)
     }
 
+    // MARK: - Opening and closing rows
+
+    /// Eric's report: opening a Thinking or tool row at the bottom of the
+    /// chat jumped far down. Following pinned the content's new bottom, so
+    /// the tapped header went off the top and the end of the row showed.
+    func testOpeningARowAtTheBottomKeepsTheTappedRowStill() {
+        let (engine, surface) = makeEngine()
+        XCTAssertEqual(surface.contentOffsetY, 3200)
+
+        engine.userWillToggleRow()
+        surface.layOut(contentHeight: 4600)
+        XCTAssertEqual(surface.contentOffsetY, 3200, "the row the reader tapped stays where it was")
+        XCTAssertEqual(engine.mode, .browsing)
+        XCTAssertTrue(engine.showsJumpToLatest)
+
+        scheduled.forEach { $0() }
+        XCTAssertEqual(engine.mode, .browsing, "the reader is reading what they opened")
+        surface.layOut(contentHeight: 5000)
+        XCTAssertEqual(surface.contentOffsetY, 3200, "new rows below do not pull them away")
+    }
+
+    func testOpeningAShortRowAtTheBottomFollowsAgainOnceItHasOpened() {
+        let (engine, surface) = makeEngine()
+        engine.userWillToggleRow()
+        surface.layOut(contentHeight: 4030)
+        XCTAssertEqual(surface.contentOffsetY, 3200)
+
+        scheduled.forEach { $0() }
+        XCTAssertTrue(engine.isFollowingLatest, "still at the bottom, so still following")
+        XCTAssertEqual(surface.contentOffsetY, 3230)
+        surface.layOut(contentHeight: 4400)
+        XCTAssertEqual(surface.contentOffsetY, 3600)
+    }
+
+    func testOnlyTheLatestToggleSettles() {
+        let (engine, surface) = makeEngine()
+        engine.userWillToggleRow()
+        engine.userWillToggleRow()
+        surface.layOut(contentHeight: 4020)
+        scheduled.forEach { $0() }
+        XCTAssertTrue(engine.isFollowingLatest)
+        XCTAssertEqual(surface.sets.filter { $0.y == 3220 }.count, 1, "one settle, one pin")
+    }
+
+    func testACommandAfterAToggleCancelsItsSettle() {
+        let (engine, surface) = makeEngine()
+        engine.userWillToggleRow()
+        surface.layOut(contentHeight: 4030)
+        engine.explicitMessageRequested(id: "m9")
+        XCTAssertEqual(events.last, .revealRow(id: "m9"))
+
+        scheduled.forEach { $0() }
+        XCTAssertEqual(engine.mode, .browsing, "the row the reader asked for is not undone by a pin")
+        XCTAssertEqual(surface.contentOffsetY, 3200)
+    }
+
+    /// Rows resumed without an id are numbered from 0 in every
+    /// conversation, so an opened "0-reasoning" must not open another
+    /// conversation's; another spelling of the same one keeps it.
+    func testOpenedRowsBelongToTheirConversation() {
+        let disclosure = ChatRowDisclosure()
+        var current = identity("a")
+        disclosure.currentConversation = { current }
+        disclosure.willToggle("0-reasoning", to: true)
+        XCTAssertTrue(disclosure.isExpanded("0-reasoning", default: false))
+
+        current = ChatScrollSessionIdentity(
+            profile: "p",
+            canonicalSessionID: "a-server",
+            equivalentSessionIDs: ["a", "a-server"],
+            isReconciling: false,
+            settledRevision: 1
+        )
+        XCTAssertTrue(disclosure.isExpanded("0-reasoning", default: false), "same conversation, new spelling")
+
+        current = identity("b")
+        XCTAssertFalse(disclosure.isExpanded("0-reasoning", default: false), "another conversation")
+        XCTAssertTrue(disclosure.isExpanded("0-tool-0", default: true), "defaults apply there")
+    }
+
+    func testClosingARowAtTheBottomLeavesNoEmptySpace() {
+        let (engine, surface) = makeEngine()
+        engine.userWillToggleRow()
+        surface.layOut(contentHeight: 3600)
+        XCTAssertEqual(surface.contentOffsetY, 2800, "the shorter content sits on the bottom")
+        XCTAssertTrue(engine.isFollowingLatest)
+    }
+
+    func testAToggleUnderAFingerChangesNothing() {
+        let (engine, surface) = makeEngine()
+        surface.isTracking = true
+        engine.userWillToggleRow()
+        XCTAssertTrue(engine.isFollowingLatest)
+        XCTAssertTrue(scheduled.isEmpty)
+    }
+
     // MARK: - Browsing
+
+    /// A reader just above the bottom whose content shrinks (a row closing,
+    /// a turn's live rows settling) is left over empty space that UIKit
+    /// never closes on its own.
+    func testABrowsingReaderLeftPastTheBottomReturnsToTheLatestMessage() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 3000)
+        XCTAssertEqual(engine.mode, .browsing)
+
+        surface.layOut(contentHeight: 3500)
+        XCTAssertEqual(surface.contentOffsetY, 2700)
+        XCTAssertTrue(engine.isFollowingLatest)
+    }
 
     func testDraggingAwayStopsFollowingAndNewContentLeavesTheReaderAlone() {
         let (engine, surface) = makeEngine()
@@ -155,6 +331,33 @@ final class ChatScrollEngineTests: XCTestCase {
         surface.layOut(contentHeight: 4800)
         XCTAssertEqual(surface.contentOffsetY, 1000, "rows arriving below never move the reader")
         XCTAssertTrue(events.contains(.flushPersistence))
+    }
+
+    func testAppendingPendingClarifyDoesNotAutoScrollWhileBrowsing() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 1000)
+        let pendingQuestion = ChatMessage(
+            id: "clarify-pending",
+            role: .clarify,
+            content: "Continue?",
+            timestamp: "2026-01-01T00:00:00Z",
+            clarify: ClarifyActivity(
+                requestId: "request-1",
+                question: "Continue?",
+                choices: [],
+                status: .pending
+            )
+        )
+
+        engine.transcriptChanged(
+            messages: Self.messages(0..<10) + [pendingQuestion],
+            transcriptRevision: 2,
+            viewportTransitionGeneration: 1
+        )
+
+        XCTAssertEqual(surface.contentOffsetY, 1000)
+        XCTAssertEqual(engine.mode, .browsing)
+        XCTAssertTrue(engine.showsJumpToLatest)
     }
 
     func testScrollingBackNearTheBottomResumesFollowing() {
@@ -247,11 +450,36 @@ final class ChatScrollEngineTests: XCTestCase {
         surface.layOut(contentHeight: 4550)
         XCTAssertEqual(surface.contentOffsetY, 1050)
 
-        // After the hold, a later change is ordinary browsing again.
-        clock += 1
+        // No row frame ever confirms the reader's place here, so the hold
+        // gives up at its limit; a later change is ordinary browsing again.
+        clock += ChatScrollEngine.prependSettleLimit
         surface.layOut(contentHeight: 4700)
         XCTAssertEqual(surface.contentOffsetY, 1050)
         XCTAssertNil(engine.prependAnchor)
+    }
+
+    /// A busy main thread can put the layout of the prepended page, and
+    /// SwiftUI's own offset write after it, seconds after the landing.
+    func testPrependHoldsThroughALateLayout() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 500)
+        engine.olderPageBackfillRequested(sessionKey: keyA)
+
+        engine.transcriptChanged(
+            messages: Self.messages(-5..<10),
+            transcriptRevision: 2,
+            viewportTransitionGeneration: 1
+        )
+        clock += 2
+        surface.layOut(contentHeight: 4600)
+        XCTAssertEqual(surface.contentOffsetY, 1100)
+
+        // SwiftUI writes its own offset in a later pass.
+        clock += 1
+        surface.contentOffsetY = 300
+        engine.surfaceScrolled()
+        XCTAssertEqual(surface.contentOffsetY, 1100, "the reader is put back")
+        XCTAssertNotNil(engine.prependAnchor)
     }
 
     /// SwiftUI can lay the prepended page out (content-size KVO) before its
@@ -302,6 +530,105 @@ final class ChatScrollEngineTests: XCTestCase {
         // The settled frame: the rows below were estimated 40 pt too tall.
         engine.rowFramesChanged(["m2": ChatScrollRowFrame(minY: 1052, maxY: 1260, order: 7)])
         XCTAssertEqual(surface.contentOffsetY, 1060, "the reader's row is back where it was")
+    }
+
+    /// The estimate can leave the reader's top row just off screen, where it
+    /// reports no frame; any row that was on screen refines the position.
+    func testPrependRefinesThroughALowerRowWhenTheTopRowHasNoFrame() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 500)
+        engine.rowFramesChanged([
+            "m2": ChatScrollRowFrame(minY: 492, maxY: 700, order: 2),
+            "m3": ChatScrollRowFrame(minY: 700, maxY: 900, order: 3),
+        ])
+        engine.olderPageBackfillRequested(sessionKey: keyA)
+
+        engine.transcriptChanged(
+            messages: Self.messages(-5..<10),
+            transcriptRevision: 2,
+            viewportTransitionGeneration: 1
+        )
+        surface.layOut(contentHeight: 4600)
+        XCTAssertEqual(surface.contentOffsetY, 1100)
+
+        engine.rowFramesChanged(["m3": ChatScrollRowFrame(minY: 1260, maxY: 1460, order: 8)])
+        XCTAssertEqual(surface.contentOffsetY, 1060, "m3 is back where it was, and m2 above it")
+    }
+
+    /// Once the reader's row is in place by its own frame, the hold lasts
+    /// `prependHoldDuration` more, for heights still settling.
+    func testPrependHoldEndsShortlyAfterTheReadersRowIsInPlace() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 500)
+        engine.rowFramesChanged(["m2": ChatScrollRowFrame(minY: 492, maxY: 700, order: 2)])
+        engine.olderPageBackfillRequested(sessionKey: keyA)
+
+        engine.transcriptChanged(
+            messages: Self.messages(-5..<10),
+            transcriptRevision: 2,
+            viewportTransitionGeneration: 1
+        )
+        surface.layOut(contentHeight: 4600)
+        XCTAssertNil(engine.prependAnchor?.settledAt, "the bottom-distance estimate alone confirms nothing")
+
+        engine.rowFramesChanged(["m2": ChatScrollRowFrame(minY: 1052, maxY: 1260, order: 7)])
+        XCTAssertEqual(surface.contentOffsetY, 1060)
+        XCTAssertEqual(engine.prependAnchor?.settledAt, clock, "confirmed once the correction lands")
+
+        // Within the tail the hold still answers another writer, and the
+        // tail starts again from that correction.
+        clock += 0.4
+        surface.contentOffsetY = 300
+        engine.surfaceScrolled()
+        XCTAssertEqual(surface.contentOffsetY, 1060)
+        XCTAssertEqual(engine.prependAnchor?.settledAt, clock)
+
+        clock += ChatScrollEngine.prependHoldDuration + 0.1
+        surface.layOut(contentHeight: 4700)
+        XCTAssertNil(engine.prependAnchor)
+        XCTAssertEqual(surface.contentOffsetY, 1060, "a later change is ordinary browsing again")
+    }
+
+    /// A confirmation that comes late still gets its tail past the limit
+    /// that bounds an unconfirmed hold, and a correction in that tail
+    /// restarts it, but nothing outlives the limit plus one tail.
+    func testPrependHoldKeepsALateConfirmationsTailUpToItsCeiling() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 500)
+        engine.rowFramesChanged(["m2": ChatScrollRowFrame(minY: 492, maxY: 700, order: 2)])
+        engine.olderPageBackfillRequested(sessionKey: keyA)
+
+        engine.transcriptChanged(
+            messages: Self.messages(-5..<10),
+            transcriptRevision: 2,
+            viewportTransitionGeneration: 1
+        )
+        surface.layOut(contentHeight: 4600)
+        XCTAssertEqual(surface.contentOffsetY, 1100)
+
+        // The reader's row reports its new frame late.
+        clock += ChatScrollEngine.prependSettleLimit - 0.4
+        engine.rowFramesChanged(["m2": ChatScrollRowFrame(minY: 1052, maxY: 1260, order: 7)])
+        XCTAssertEqual(surface.contentOffsetY, 1060)
+        XCTAssertEqual(engine.prependAnchor?.settledAt, clock)
+
+        // Past the limit, within the tail: another writer is undone, and so
+        // is its follow-up write.
+        clock += 0.5
+        surface.contentOffsetY = 300
+        engine.surfaceScrolled()
+        XCTAssertEqual(surface.contentOffsetY, 1060)
+        clock += 0.3
+        surface.contentOffsetY = 2000
+        engine.surfaceScrolled()
+        XCTAssertEqual(surface.contentOffsetY, 1060)
+
+        // Past the limit plus one tail the hold is over.
+        clock += 0.3
+        surface.contentOffsetY = 2000
+        engine.surfaceScrolled()
+        XCTAssertNil(engine.prependAnchor)
+        XCTAssertEqual(surface.contentOffsetY, 2000)
     }
 
     func testPrependAnchorWaitsForTheActualPrepend() {
@@ -479,6 +806,122 @@ final class ChatScrollEngineTests: XCTestCase {
         )
     }
 
+    private func messagesWithClarify(
+        status: ClarifyQuestion.Status,
+        answer: String? = nil
+    ) -> [ChatMessage] {
+        var messages = Self.messages(0..<10)
+        messages[5] = ChatMessage(
+            id: "m5",
+            role: .clarify,
+            content: "Continue?",
+            timestamp: "2026-01-01T00:00:00Z",
+            clarify: ClarifyActivity(
+                requestId: "request-m5",
+                question: "Continue?",
+                choices: [],
+                status: status,
+                answer: answer
+            )
+        )
+        return messages
+    }
+
+    private func pendingClarifyRequest(
+        _ engine: ChatScrollEngine,
+        row index: Int,
+        fallbackRow fallbackIndex: Int,
+        generation: UInt64 = 9
+    ) -> ChatResumeRestorationRequest {
+        let target = engine.targets[index]
+        let fallback = engine.targets[fallbackIndex]
+        return ChatResumeRestorationRequest(
+            generation: generation,
+            sessionKey: keyA,
+            destination: .pendingClarify(
+                messageID: target.id,
+                fallbackSnapshot: ChatScrollSnapshot(
+                    anchorMessageID: fallback.semanticID,
+                    followsLatest: false,
+                    anchorMetadata: fallback.restorationMetadata,
+                    anchorSourceMessageID: fallback.id
+                )
+            )
+        )
+    }
+
+    func testPendingClarifyRestorationOverridesSavedViewport() {
+        let (engine, surface) = makeEngine()
+        surface.insetTop = 50
+        engine.transcriptChanged(
+            messages: messagesWithClarify(status: .pending),
+            transcriptRevision: 2,
+            viewportTransitionGeneration: 1
+        )
+        engine.rowFramesChanged([
+            "m2": ChatScrollRowFrame(minY: 300, maxY: 400, order: 2),
+            "m5": ChatScrollRowFrame(minY: 1000, maxY: 1200, order: 5)
+        ])
+        engine.restorationRequested(pendingClarifyRequest(engine, row: 5, fallbackRow: 2))
+
+        XCTAssertTrue(engine.restorationTick(transcriptRevision: 2))
+        XCTAssertEqual(surface.contentOffsetY, 968, "the pending question takes priority over m2")
+        XCTAssertFalse(engine.restorationTick(transcriptRevision: 2))
+        XCTAssertEqual(engine.topVisibleMessageID, "m5")
+    }
+
+    func testAnsweredPendingClarifyFallsBackToSavedViewportBeforePlacement() {
+        let (engine, surface) = makeEngine()
+        surface.insetTop = 50
+        engine.transcriptChanged(
+            messages: messagesWithClarify(status: .pending),
+            transcriptRevision: 2,
+            viewportTransitionGeneration: 1
+        )
+        engine.rowFramesChanged([
+            "m2": ChatScrollRowFrame(minY: 300, maxY: 400, order: 2),
+            "m5": ChatScrollRowFrame(minY: 1000, maxY: 1200, order: 5)
+        ])
+        engine.restorationRequested(pendingClarifyRequest(engine, row: 5, fallbackRow: 2))
+
+        engine.transcriptChanged(
+            messages: messagesWithClarify(status: .answered, answer: "yes"),
+            transcriptRevision: 3,
+            viewportTransitionGeneration: 1
+        )
+
+        XCTAssertTrue(engine.restorationTick(transcriptRevision: 3))
+        XCTAssertEqual(surface.contentOffsetY, 268, "a resolved card should not replace the saved viewport")
+        XCTAssertFalse(engine.restorationTick(transcriptRevision: 3))
+        XCTAssertEqual(engine.topVisibleMessageID, "m2")
+    }
+
+    func testMissingPendingClarifyFallsBackToSavedViewport() {
+        let (engine, surface) = makeEngine()
+        engine.rowFramesChanged([
+            "m2": ChatScrollRowFrame(minY: 300, maxY: 400, order: 2)
+        ])
+        let fallback = engine.targets[2]
+        engine.restorationRequested(ChatResumeRestorationRequest(
+            generation: 10,
+            sessionKey: keyA,
+            destination: .pendingClarify(
+                messageID: "missing-question",
+                fallbackSnapshot: ChatScrollSnapshot(
+                    anchorMessageID: fallback.semanticID,
+                    followsLatest: false,
+                    anchorMetadata: fallback.restorationMetadata,
+                    anchorSourceMessageID: fallback.id
+                )
+            )
+        ))
+
+        XCTAssertTrue(engine.restorationTick(transcriptRevision: 1))
+        XCTAssertEqual(surface.contentOffsetY, 318, "m2 remains the fallback anchor")
+        XCTAssertFalse(engine.restorationTick(transcriptRevision: 1))
+        XCTAssertEqual(engine.topVisibleMessageID, "m2")
+    }
+
     func testRestorationPlacesTheSavedRowAtTheTop() {
         let (engine, surface) = makeEngine()
         surface.insetTop = 50
@@ -570,6 +1013,69 @@ final class ChatScrollEngineTests: XCTestCase {
         XCTAssertEqual(engine.mode, .browsing)
     }
 
+    func testExplicitMessageRequestRevealsTheExactRowWhileBrowsing() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 1000)
+        events = []
+
+        engine.explicitMessageRequested(id: "m5")
+
+        XCTAssertTrue(events.contains(.revealRow(id: "m5")))
+        XCTAssertEqual(surface.contentOffsetY, 1000, "the view routes the row reveal; the engine does not jump to latest")
+        XCTAssertEqual(engine.mode, .browsing)
+    }
+
+    func testExplicitMessageRequestDoesNotOverrideAFingerOnTheScreen() {
+        let (engine, surface) = makeEngine()
+        surface.userScroll(to: 1000)
+        surface.isTracking = true
+        events = []
+
+        engine.explicitMessageRequested(id: "m5")
+
+        XCTAssertFalse(events.contains(.revealRow(id: "m5")))
+        XCTAssertEqual(surface.contentOffsetY, 1000)
+        XCTAssertEqual(engine.mode, .browsing)
+    }
+
+    func testMissingExplicitMessageDoesNotCancelRestoration() {
+        let (engine, _) = makeEngine()
+        engine.restorationRequested(anchorRequest(engine, row: 5))
+        events = []
+
+        engine.explicitMessageRequested(id: "not-in-transcript")
+
+        XCTAssertEqual(engine.mode, .restoring)
+        XCTAssertFalse(events.contains(.cancelAutomaticRestoration))
+        XCTAssertFalse(events.contains(.revealRow(id: "not-in-transcript")))
+    }
+
+    func testValidExplicitMessageCancelsRestorationAndRevealsTheRow() {
+        let (engine, _) = makeEngine()
+        engine.restorationRequested(anchorRequest(engine, row: 5))
+        events = []
+
+        engine.explicitMessageRequested(id: "m5")
+
+        XCTAssertNil(engine.restoration)
+        XCTAssertEqual(engine.mode, .browsing)
+        XCTAssertTrue(events.contains(.cancelAutomaticRestoration))
+        XCTAssertTrue(events.contains(.revealRow(id: "m5")))
+    }
+
+    func testExplicitMessageRequestWhilePausedDoesNotCancelRestoration() {
+        let (engine, _) = makeEngine()
+        engine.restorationRequested(anchorRequest(engine, row: 5))
+        engine.setPaused(true)
+        events = []
+
+        engine.explicitMessageRequested(id: "m5")
+
+        XCTAssertEqual(engine.mode, .restoring)
+        XCTAssertFalse(events.contains(.cancelAutomaticRestoration))
+        XCTAssertFalse(events.contains(.revealRow(id: "m5")))
+    }
+
     func testAReplacementRestorationPublishesItsGeneration() {
         let (engine, _) = makeEngine()
         engine.restorationRequested(anchorRequest(engine, row: 5))
@@ -651,25 +1157,46 @@ final class ChatScrollEngineTests: XCTestCase {
         XCTAssertEqual(surface.contentOffsetY, 4200, "returning pins the new conversation")
     }
 
-    func testRenderInputsFromUIKitCallbacksPublishOnTheNextTurn() {
+    func testChromeInputsFromUIKitCallbacksPublishOnTheNextTurn() {
         let (engine, surface) = makeEngine()
-        XCTAssertFalse(engine.renderInputs.showsJumpToLatest)
+        XCTAssertFalse(engine.chrome.inputs.showsJumpToLatest)
 
         surface.userScroll(to: 1000)
         XCTAssertTrue(engine.showsJumpToLatest)
         XCTAssertFalse(
-            engine.renderInputs.showsJumpToLatest,
+            engine.chrome.inputs.showsJumpToLatest,
             "a change made inside a UIKit callback must not publish during the SwiftUI update"
         )
 
-        let published = expectation(description: "published on the next main-queue turn")
-        DispatchQueue.main.async { published.fulfill() }
-        wait(for: [published], timeout: 1)
-        XCTAssertTrue(engine.renderInputs.showsJumpToLatest)
-        XCTAssertFalse(engine.renderInputs.isFollowingLatest)
+        drainMainQueue()
+        XCTAssertTrue(engine.chrome.inputs.showsJumpToLatest)
+        XCTAssertFalse(engine.chrome.inputs.isFollowingLatest)
 
         engine.explicitLatestRequested(animated: false)
-        XCTAssertTrue(engine.renderInputs.isFollowingLatest, "a SwiftUI-driven command publishes directly")
+        XCTAssertTrue(engine.chrome.inputs.isFollowingLatest, "a SwiftUI-driven command publishes directly")
+    }
+
+    func testTrackedMessageVisibilityPublishesOnlyAtViewportTransitions() {
+        let (engine, surface) = makeEngine()
+        engine.trackMessageVisibility(of: "m5")
+        XCTAssertEqual(engine.chrome.inputs.visibilityTrackedMessageID, "m5")
+        XCTAssertTrue(engine.chrome.inputs.isVisibilityTrackedMessageOffscreen)
+
+        engine.rowFramesChanged(["m5": ChatScrollRowFrame(minY: 3200, maxY: 3300, order: 5)])
+        drainMainQueue()
+        XCTAssertFalse(engine.chrome.inputs.isVisibilityTrackedMessageOffscreen)
+
+        surface.userScroll(to: 100)
+        drainMainQueue()
+        XCTAssertTrue(engine.chrome.inputs.isVisibilityTrackedMessageOffscreen)
+
+        engine.rowFramesChanged(["m5": ChatScrollRowFrame(minY: 200, maxY: 400, order: 5)])
+        drainMainQueue()
+        XCTAssertFalse(engine.chrome.inputs.isVisibilityTrackedMessageOffscreen)
+
+        engine.trackMessageVisibility(of: nil)
+        XCTAssertNil(engine.chrome.inputs.visibilityTrackedMessageID)
+        XCTAssertFalse(engine.chrome.inputs.isVisibilityTrackedMessageOffscreen)
     }
 
     func testReduceMotionSnapsTheJumpToLatest() {

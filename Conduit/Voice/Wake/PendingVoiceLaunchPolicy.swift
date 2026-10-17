@@ -33,6 +33,11 @@ struct VoiceLaunchConnectionSnapshot: Equatable {
     var hasStableFailureEvidence: Bool
     /// Classified failure when available (better user-facing copy).
     var classifiedFailure: ConnectionFailure?
+    /// Connected, but Conduit hasn't settled: a reconnect, the foreground
+    /// refresh or the connect's chat sync is still running, so the chat on
+    /// screen may yet be replaced and its turn state isn't known. Only a
+    /// screenshot waits this out (see `readiness`).
+    var isSettling = false
 
     var phase: Phase {
         if isConnected { return .connected }
@@ -58,7 +63,8 @@ extension AppState {
             isConnecting: isConnecting,
             hasStableFailureEvidence: lastConnectionFailure != nil
                 || fallbackFailure != nil,
-            classifiedFailure: lastConnectionFailure ?? fallbackFailure
+            classifiedFailure: lastConnectionFailure ?? fallbackFailure,
+            isSettling: isSettlingConnection
         )
     }
 }
@@ -75,13 +81,15 @@ enum PendingVoiceLaunchPolicy {
 
     /// User-visible explanation when an external launch cannot start voice
     /// and AppState has no classified failure to show.
-    static let disconnectedFailureMessage =
-        "Conduit could not connect to Hermes, so voice did not start. Ask again after the connection is restored."
+    static var disconnectedFailureMessage: String {
+        AppLocalization.string("Conduit could not connect to Hermes, so voice did not start. Ask again after the connection is restored.")
+    }
 
     /// User-visible explanation when a pending Siri request outlived its
     /// launch window without a conclusive ready/failed outcome.
-    static let expiredFailureMessage =
-        "The Siri voice request expired before Hermes was ready. Ask Siri again now that Conduit is open."
+    static var expiredFailureMessage: String {
+        AppLocalization.string("The Siri voice request expired before Hermes was ready. Ask Siri again now that Conduit is open.")
+    }
 
     static func normalizedProfile(_ raw: String?) -> String? {
         guard let raw else { return nil }
@@ -108,6 +116,62 @@ enum PendingVoiceLaunchPolicy {
         )
     }
 
+    /// Wake phrases only fire while Hermes is connected, so a wake launch
+    /// that is not ready within a few seconds is dropped instead of opening
+    /// Voice much later (and it must not hold the wake listener off).
+    static let wakePhraseLaunchBudget: TimeInterval = 10
+
+    static var wakePhraseFailureMessage: String {
+        AppLocalization.string("Conduit lost the connection to Hermes, so voice did not start. Say the wake phrase again after the connection is restored.")
+    }
+
+    static func makeWakePhrasePendingIntent(
+        profile: String,
+        startsFreshConversation: Bool,
+        now: Date = Date(),
+        budget: TimeInterval = wakePhraseLaunchBudget,
+        clock: ContinuousClock = ContinuousClock()
+    ) -> PendingVoiceIntent {
+        PendingVoiceIntent(
+            profile: normalizedProfile(profile),
+            startsFreshConversation: startsFreshConversation,
+            source: .wakePhrase,
+            externalLaunchDeadline: now.addingTimeInterval(budget),
+            externalLaunchElapsedDeadline: clock.now.advanced(by: .seconds(budget))
+        )
+    }
+
+    /// The screenshot is never thrown away when Hermes isn't reachable: it
+    /// is attached once Hermes connects (`resumeParkedScreenQuestion`).
+    static var screenQuestionFailureMessage: String {
+        AppLocalization.string(
+            "Conduit couldn't reach Hermes. Your screenshot is kept and will be attached to a chat when Hermes is back."
+        )
+    }
+
+    /// Builds the pending request for one Ask Hermes About Screen run. It
+    /// has Siri's budget: Conduit was just brought to the foreground for it.
+    static func makeScreenQuestionPendingIntent(
+        _ request: ScreenQuestionRequest,
+        profile: String?,
+        now: Date = Date(),
+        budget: TimeInterval = externalLaunchBudget,
+        clock: ContinuousClock = ContinuousClock()
+    ) -> PendingVoiceIntent {
+        var request = request
+        request.question = request.question
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        return PendingVoiceIntent(
+            profile: normalizedProfile(profile),
+            startsFreshConversation: false,
+            source: .screenQuestion,
+            externalLaunchDeadline: now.addingTimeInterval(budget),
+            externalLaunchElapsedDeadline: clock.now.advanced(by: .seconds(budget)),
+            screenQuestion: request
+        )
+    }
+
     enum Readiness: Equatable {
         /// Hermes is live — consume the request exactly once.
         case ready
@@ -123,14 +187,16 @@ enum PendingVoiceLaunchPolicy {
         for connection: VoiceLaunchConnectionSnapshot
     ) -> String {
         if let failure = connection.classifiedFailure {
-            return "\(failure.userTitle). \(failure.userMessage) Voice did not start — ask Siri again after reconnecting."
+            return AppLocalization.string("\(failure.userTitle). \(failure.userMessage) Voice did not start — ask Siri again after reconnecting.")
         }
         return disconnectedFailureMessage
     }
 
     /// Lifecycle decision for a pending external launch.
     ///
-    /// - Connected → ready (exactly once).
+    /// - Connected → ready (exactly once). A screenshot also waits for
+    ///   Conduit to settle: placed earlier, it lands on a chat the settling
+    ///   work then replaces, and the voice start finds a turn in sync.
     /// - Connecting / inconclusive → wait (Siri window still open).
     /// - Stable failure (positive evidence, not connecting) → terminal fail
     ///   for Siri; do not wait out the deadline.
@@ -143,31 +209,40 @@ enum PendingVoiceLaunchPolicy {
         now: Date
     ) -> Readiness {
         if let deadline = intent.externalLaunchDeadline, now >= deadline {
-            return .failed(message: expiredFailureMessage)
+            switch intent.source {
+            case .wakePhrase: return .failed(message: wakePhraseFailureMessage)
+            case .screenQuestion: return .failed(message: screenQuestionFailureMessage)
+            case .siri, .composer, .newCall, .hermesCall: return .failed(message: expiredFailureMessage)
+            }
         }
         switch connection.phase {
         case .connected:
+            if intent.source == .screenQuestion, connection.isSettling { return .waiting }
             return .ready
         case .connecting, .inconclusive:
             return .waiting
         case .stableFailure:
-            if intent.source == .siri {
-                return .failed(message: stableFailureMessage(for: connection))
+            switch intent.source {
+            case .siri: return .failed(message: stableFailureMessage(for: connection))
+            case .wakePhrase: return .failed(message: wakePhraseFailureMessage)
+            case .screenQuestion: return .failed(message: screenQuestionFailureMessage)
+            case .composer, .newCall, .hermesCall: return .waiting
             }
-            return .waiting
         }
     }
 
     /// Outcome when the launch handler reports it could not open Voice.
-    /// Production store traffic is Siri-only (Composer calls
-    /// `openVoiceConversation` directly). Siri launches are terminal so Voice
-    /// cannot open minutes later.
+    /// Production store traffic is Siri and wake phrases (Composer calls
+    /// `openVoiceConversation` directly). Both are terminal so Voice cannot
+    /// open minutes later.
     static func handlerFailure(
         for intent: PendingVoiceIntent
     ) -> PendingVoiceHandlerFailure {
-        if intent.source == .siri {
-            return .terminal(message: disconnectedFailureMessage)
+        switch intent.source {
+        case .siri: return .terminal(message: disconnectedFailureMessage)
+        case .wakePhrase: return .terminal(message: wakePhraseFailureMessage)
+        case .screenQuestion: return .terminal(message: screenQuestionFailureMessage)
+        case .composer, .newCall, .hermesCall: return .retryLater
         }
-        return .retryLater
     }
 }

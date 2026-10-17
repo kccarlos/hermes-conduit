@@ -3,11 +3,13 @@ import Foundation
 struct ComposerDraft: Equatable {
     var text: String
     var attachments: [Attachment]
+    /// A whole reply attached with its Quote button (#385).
+    var replyReference: ComposerReplyReference? = nil
 
     static let empty = ComposerDraft(text: "", attachments: [])
 
     var isEmpty: Bool {
-        text.isEmpty && attachments.isEmpty
+        text.isEmpty && attachments.isEmpty && replyReference == nil
     }
 }
 
@@ -59,6 +61,15 @@ final class ComposerDraftStore {
         refreshGeneration(for: key)
         touch(key)
         evictIfNeeded()
+    }
+
+    func hasDraft(for key: ComposerDraftKey) -> Bool {
+        drafts[key] != nil
+    }
+
+    /// The keys with a draft, most recently used first.
+    var keys: [ComposerDraftKey] {
+        order.reversed()
     }
 
     func saveIfMissing(_ draft: ComposerDraft, for key: ComposerDraftKey) {

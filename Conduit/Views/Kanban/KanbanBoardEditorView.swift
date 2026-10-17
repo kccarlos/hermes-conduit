@@ -406,7 +406,7 @@ struct KanbanBoardEditorView: View {
         } catch {
             if liveness.owns(operationID) { isSaving = false }
             guard store.isCurrentConfiguration(generation) else { return }
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingError.message(for: error)
         }
     }
 
@@ -443,11 +443,11 @@ struct KanbanBoardEditorView: View {
             descriptionText = updated.description ?? ""
             projectID = (updated.projectID ?? "").isEmpty ? nil : updated.projectID
             seedDraft = currentDraft
-            notice = "Board settings saved."
+            notice = AppLocalization.string("Board settings saved.")
         } catch {
             if liveness.owns(operationID) { isSaving = false }
             guard store.isCurrentConfiguration(generation) else { return }
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingError.message(for: error)
         }
     }
 }

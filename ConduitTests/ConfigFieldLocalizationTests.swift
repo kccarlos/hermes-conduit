@@ -18,6 +18,8 @@ final class ConfigFieldLocalizationTests: XCTestCase {
         ChatSettingsDetail.fields
             + SettingsView.workspaceFields
             + SettingsView.memoryFields
+            + SettingsView.modelFields
+            + SettingsView.advancedFields
     }
 
     /// Raw protocol values each config key accepts. Persisted values must be
@@ -33,6 +35,7 @@ final class ConfigFieldLocalizationTests: XCTestCase {
         "context.engine": ["default"],
         "display.memory_notifications": ["default", "on", "off"],
         "display.tool_progress": ["all", "off"],
+        "updates.non_interactive_local_changes": ["stash", "discard"],
     ]
 
     func testImageInputModeOptionsAreRawProtocolValues() {
@@ -103,7 +106,8 @@ final class ConfigFieldLocalizationTests: XCTestCase {
     /// menu. (Locale-neutral names like "uwu" may map to themselves.)
     func testOptionsHaveDisplayLabels() {
         let displayMappedFields = ["approvals.mode", "code_execution.mode",
-                                   "agent.image_input_mode", "display.personality"]
+                                   "agent.image_input_mode", "display.personality",
+                                   "updates.non_interactive_local_changes"]
         for key in displayMappedFields {
             for value in Self.rawValuesByField[key] ?? [] {
                 XCTAssertNotNil(ProfileConfigValueDisplay.optionValueDisplay[key]?[value],
@@ -123,7 +127,7 @@ final class ConfigFieldLocalizationTests: XCTestCase {
             (key: $0.key, control: $0.control)
         }
         XCTAssertFalse(baseline.isEmpty)
-        for language in AppLanguage.allCases {
+        for language in AppLanguage.selectable {
             standardDefaults.set(language.rawValue, forKey: AppLanguageStore.defaultsKey)
             XCTAssertEqual(AppLanguage.current, language,
                            "each iteration must activate a different language")
@@ -150,6 +154,8 @@ final class ConfigFieldLocalizationTests: XCTestCase {
                     XCTAssertEqual(a, b)
                 case (.toggle(let a), .toggle(let b)):
                     XCTAssertEqual(a, b)
+                case (.stringList, .stringList):
+                    break
                 default:
                     XCTFail("\(before.key) control changed shape under \(language)")
                 }

@@ -28,7 +28,9 @@
 
 import Foundation
 import Combine
+import Network
 import os
+import UniformTypeIdentifiers
 
 // MARK: - JSON-RPC Types
 
@@ -43,13 +45,28 @@ private struct JsonRpcRequest: Encodable {
 /// client's own requests echo its integer ids; server→client requests
 /// (`tui_gateway/server_requests.py`) carry string ids (`srq-<hex>`), so a
 /// string id must decode instead of dropping the whole frame.
-private enum JsonRpcID: Decodable, Equatable {
+private enum JsonRpcID: Decodable, Equatable, Sendable {
     case int(Int)
     case string(String)
     /// Any other scalar (JSON-RPC forbids them): decoded so the rest of the
     /// frame is not lost. It never matches a request of ours and is never
     /// answered (requests need a string id).
     case other
+
+    /// From a `JSONSerialization` value. Nil for an absent or null id, as
+    /// the Decodable path reads it.
+    init?(jsonObject value: Any?) {
+        guard let value, !(value is NSNull) else { return nil }
+        switch value {
+        case let string as String:
+            self = .string(string)
+        case let number as NSNumber where !AnyCodable.isBoolean(number):
+            let int = number.intValue
+            self = Double(int) == number.doubleValue ? .int(int) : .other
+        default:
+            self = .other
+        }
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -87,23 +104,118 @@ private final class ResumeOnce: @unchecked Sendable {
     }
 }
 
-private struct JsonRpcResponse: Decodable {
+private struct JsonRpcResponse: Decodable, Sendable {
     let id: JsonRpcID?
     let result: AnyCodable?
     let error: RpcError?
     let method: String?
     let params: AnyCodable?
+
+    /// Reads an inbound frame with `JSONSerialization`. `JSONDecoder` finds
+    /// each `AnyCodable` value's type by trying to decode it as every type
+    /// in turn, and on the main actor that cost a frame's worth of time for
+    /// a large tool result, even one from a chat in the background. Nil for
+    /// anything the Decodable path would refuse.
+    init?(frame data: Data) {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+        var method: String?
+        if let value = object["method"], !(value is NSNull) {
+            guard let string = value as? String else { return nil }
+            method = string
+        }
+        var error: RpcError?
+        if let value = object["error"], !(value is NSNull) {
+            guard let fields = value as? [String: Any],
+                  let parsed = RpcError(jsonObject: fields) else { return nil }
+            error = parsed
+        }
+        self.id = JsonRpcID(jsonObject: object["id"])
+        self.result = AnyCodable(optionalJSONObject: object["result"])
+        self.error = error
+        self.method = method
+        self.params = AnyCodable(optionalJSONObject: object["params"])
+    }
 }
 
-struct RpcError: Decodable, Error, LocalizedError {
+/// An inbound frame, read and (for a stream event) parsed in one place, so
+/// a large one can be done off the main actor. Immutable once built, and
+/// handed to the main actor once.
+///
+/// `@unchecked` holds only while everything reachable from `StreamEvent` is
+/// an immutable value, and while `StreamEventParser.parse` and what it calls
+/// touch no shared mutable state (no shared formatters or caches, nothing
+/// main-actor bound): it runs off the main actor for large frames.
+private struct DecodedFrame: @unchecked Sendable {
+    let response: JsonRpcResponse?
+    /// The parsed stream event, for an `event` notification.
+    let event: StreamEvent?
+    let byteCount: Int
+
+    init(_ data: Data) {
+        let response = JsonRpcResponse(frame: data)
+        self.response = response
+        if response?.method == "event", let params = response?.params {
+            event = StreamEventParser.parse(params: params)
+        } else {
+            event = nil
+        }
+        byteCount = data.count
+    }
+}
+
+struct RpcError: Decodable, Error, LocalizedError, Sendable {
     let code: Int?
     let message: String
+    /// Machine-readable refusal reason from the error's `data.reason`
+    /// (Hermes' contract; the message is for people), e.g.
+    /// `SESSION_NOT_OWNED` on a `prompt.submit` 4090.
+    var reason: String? = nil
 
     var errorDescription: String? { message }
+
+    /// Hermes refused the send because another live surface (Hermes
+    /// Desktop, a terminal) owns this chat.
+    var isSessionNotOwned: Bool { reason == "SESSION_NOT_OWNED" }
+
+    /// Hermes' contract check refused a key this gateway doesn't know
+    /// (`4000 invalid params for <method>: <key>: Extra inputs are not
+    /// permitted`). Nothing ran, so the request is safe to resend without it.
+    func refusesUnknownParam(_ key: String) -> Bool {
+        code == 4000 && message.contains("invalid params") && message.contains(key)
+    }
+}
+
+extension RpcError {
+    private enum CodingKeys: String, CodingKey { case code, message, data }
+
+    /// From a `JSONSerialization` object, refusing what `init(from:)` does.
+    fileprivate init?(jsonObject object: [String: Any]) {
+        guard let message = object["message"] as? String else { return nil }
+        var code: Int?
+        if let value = object["code"], !(value is NSNull) {
+            guard let number = value as? NSNumber, !AnyCodable.isBoolean(number),
+                  Double(number.intValue) == number.doubleValue else { return nil }
+            code = number.intValue
+        }
+        let data = AnyCodable(optionalJSONObject: object["data"])
+        self.init(code: code, message: message, reason: data?.objectValue?["reason"]?.stringValue)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let data = try? container.decodeIfPresent(AnyCodable.self, forKey: .data)
+        self.init(
+            code: try container.decodeIfPresent(Int.self, forKey: .code),
+            message: try container.decode(String.self, forKey: .message),
+            reason: data?.objectValue?["reason"]?.stringValue
+        )
+    }
 }
 
 // Type-erased Codable for dynamic JSON
-enum AnyCodable: Codable, Equatable {
+enum AnyCodable: Codable, Equatable, Sendable {
     case null
     case bool(Bool)
     case number(Double)
@@ -113,21 +225,51 @@ enum AnyCodable: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
+        // Each miss below throws and builds an error, so the common kinds go
+        // first. JSONDecoder never reads a number or a bool as a string, or
+        // the reverse, so the order doesn't change any value.
         if container.decodeNil() {
             self = .null
+        } else if let v = try? container.decode(String.self) {
+            self = .string(v)
+        } else if let v = try? container.decode([String: AnyCodable].self) {
+            self = .object(v)
         } else if let v = try? container.decode(Bool.self) {
             self = .bool(v)
         } else if let v = try? container.decode(Double.self) {
             self = .number(v)
-        } else if let v = try? container.decode(String.self) {
-            self = .string(v)
         } else if let v = try? container.decode([AnyCodable].self) {
             self = .array(v)
-        } else if let v = try? container.decode([String: AnyCodable].self) {
-            self = .object(v)
         } else {
             self = .null
         }
+    }
+
+    /// From a `JSONSerialization` value.
+    init(jsonObject value: Any) {
+        switch value {
+        case let string as String:
+            self = .string(string)
+        case let number as NSNumber:
+            self = Self.isBoolean(number) ? .bool(number.boolValue) : .number(number.doubleValue)
+        case let object as [String: Any]:
+            self = .object(object.mapValues(AnyCodable.init(jsonObject:)))
+        case let array as [Any]:
+            self = .array(array.map(AnyCodable.init(jsonObject:)))
+        default:
+            self = .null
+        }
+    }
+
+    /// Nil for an absent or null value, as `decodeIfPresent` reads it.
+    init?(optionalJSONObject value: Any?) {
+        guard let value, !(value is NSNull) else { return nil }
+        self.init(jsonObject: value)
+    }
+
+    /// `JSONSerialization` hands back true and false as NSNumber too.
+    static func isBoolean(_ number: NSNumber) -> Bool {
+        CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 
     func encode(to encoder: Encoder) throws {
@@ -211,11 +353,27 @@ enum AnyCodable: Codable, Equatable {
 
 // MARK: - Stream Events
 
+/// Which row a `message.react` call addresses.
+enum MessageReactionTarget: Equatable {
+    case row(Int)
+    /// The newest persisted row of this role (`"assistant"` or `"user"`).
+    case newest(role: String)
+}
+
+struct MessageReactionResult: Equatable {
+    let rowId: Int
+    let reactions: [MessageReaction]
+}
+
 enum StreamEvent {
     case messageStart(sessionId: String)
     case messageDelta(sessionId: String, text: String)
     case reasoningDelta(sessionId: String, text: String)
     case messageComplete(sessionId: String, messageId: String?, content: String?, reasoning: String?)
+    /// The agent reacted to a message (its `react_to_message` tool). The
+    /// reaction is already persisted; this only paints it now. `role` names
+    /// the reacted row's role so a live row with no `rowId` yet can match.
+    case messageReaction(sessionId: String, rowId: Int, reactions: [MessageReaction], role: String)
     case messageError(sessionId: String, message: String)
     case messageInterrupted(sessionId: String)
     case sessionBusy(sessionId: String, busy: Bool)
@@ -695,6 +853,20 @@ final class HermesClient: ObservableObject {
     private var socketHasOpened = false
     private var openContinuation: CheckedContinuation<Void, Error>?
     private var openTimeoutTask: Task<Void, Never>?
+    /// Keepalive: a `ping` after `keepaliveInterval` without any frame from
+    /// the gateway. Tailscale relays, carrier NATs and proxies drop idle
+    /// connections without a close, so a quiet socket can be dead for
+    /// minutes before the next send finds out. The ping keeps the path warm
+    /// and finds a dead one while nobody is waiting on it.
+    // nonisolated(unsafe): deinit cancels both; cancel() is thread-safe.
+    nonisolated(unsafe) private var keepaliveTask: Task<Void, Never>?
+    private var lastInboundAt = Date()
+    private var isProbing = false
+    nonisolated(unsafe) private var pathMonitor: NWPathMonitor?
+    private var pathMonitorSawInitialPath = false
+    private let keepaliveInterval: TimeInterval?
+    private let keepalivePingTimeout: TimeInterval
+    private let monitorsPath: Bool
 
     let connection: HermesConnection
     let profile: String?
@@ -712,14 +884,21 @@ final class HermesClient: ObservableObject {
     /// so it gets a bounded-but-generous budget instead of the ordinary
     /// request timeout.
     static let legacyResumeTimeout: TimeInterval = 60
-    /// Shared budget for liveness probes (`healthCheck`,
-    /// `session.active_list`). These sit on latency-sensitive paths — the
-    /// foreground refresh and the pre-send stale-idle correction — so a
-    /// stalled gateway must fail them fast instead of holding the composer
-    /// for the generic request timeout. 8s matches the pre-existing
-    /// health-check budget; a timed-out probe takes the same fallback paths
-    /// as any other probe failure.
+    /// Budget for the `session.active_list` liveness probe. It sits on
+    /// latency-sensitive paths — the foreground refresh and the pre-send
+    /// stale-idle correction — so a stalled gateway must fail it fast instead
+    /// of holding the composer for the generic request timeout. 8s matches
+    /// the old `session.list` health-check budget; a timed-out probe takes
+    /// the same fallback paths as any other probe failure.
     static let livenessProbeTimeout: TimeInterval = 8
+    /// Budget for the foreground `ping` (`healthCheck`). See there.
+    static let pingTimeout: TimeInterval = 5
+    /// Quiet time before a keepalive `ping`. Well under the 30-60 s idle
+    /// limits NATs and relays commonly use.
+    static let defaultKeepaliveInterval: TimeInterval = 15
+    /// A keepalive ping waits longer than the foreground one: nobody is
+    /// waiting on it, and a relayed path can be slow without being dead.
+    static let keepalivePingTimeout: TimeInterval = 10
     /// Dedicated budget for `session.compress`. Manual compression is
     /// LLM-bound and routinely outlives the generic request timeout on large
     /// sessions, while the gateway keeps compressing after the client gives
@@ -756,12 +935,23 @@ final class HermesClient: ObservableObject {
         connection: HermesConnection,
         profile: String? = nil,
         cloudflareAccess: CloudflareAccessCredentials? = nil,
-        transportFactory: @escaping @MainActor () -> any HermesWebSocketTransport = { URLSessionWebSocketTransport() }
+        transportFactory: @escaping @MainActor () -> any HermesWebSocketTransport = { URLSessionWebSocketTransport() },
+        keepaliveInterval: TimeInterval? = HermesClient.defaultKeepaliveInterval,
+        keepalivePingTimeout: TimeInterval = HermesClient.keepalivePingTimeout,
+        monitorsPath: Bool = true
     ) {
+        self.monitorsPath = monitorsPath
+        self.keepaliveInterval = keepaliveInterval
+        self.keepalivePingTimeout = keepalivePingTimeout
         self.connection = connection
         self.profile = profile
         self.cloudflareAccess = cloudflareAccess
         self.transportFactory = transportFactory
+    }
+
+    deinit {
+        keepaliveTask?.cancel()
+        pathMonitor?.cancel()
     }
 
     // MARK: - Connection
@@ -782,6 +972,7 @@ final class HermesClient: ObservableObject {
         // intra-instance reconnect — which no caller does today.)
         receiveTask?.cancel()
         receiveTask = nil
+        stopKeepalive()
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         transport?.invalidate()
@@ -817,7 +1008,9 @@ final class HermesClient: ObservableObject {
         self.transport = transport
 
         var request = URLRequest(url: url)
-        request = cloudflareAccess?.applying(to: request) ?? request
+        request = request.applyingProxyHeaders(cloudflare: cloudflareAccess)
+        // Lets the notifier plugin tell Conduit's opens from Desktop's (#454).
+        request.setValue("conduit", forHTTPHeaderField: "X-Conduit-Client")
         let socket = transport.makeSocket(
             request: request,
             onOpen: { [weak self] socket in Task { @MainActor in self?.didOpen(socket) } },
@@ -833,6 +1026,82 @@ final class HermesClient: ObservableObject {
         receiveTask = Task { [weak self] in
             await self?.receiveLoop()
         }
+        startKeepalive(for: socket)
+    }
+
+    // MARK: - Keepalive
+
+    private func startKeepalive(for socket: any HermesWebSocket) {
+        stopKeepalive()
+        guard let interval = keepaliveInterval, interval > 0 else { return }
+        lastInboundAt = Date()
+        // Spelled out though Task inherits it here: the loop reads socket
+        // state, which lives on the main actor.
+        keepaliveTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(interval / 3))
+                guard !Task.isCancelled, let self else { return }
+                guard self.socket === socket else { return }
+                if Date().timeIntervalSince(self.lastInboundAt) >= interval {
+                    await self.probe(socket)
+                }
+            }
+        }
+        guard monitorsPath else { return }
+        // A network change (Wi-Fi to cellular, the VPN tunnel coming back)
+        // usually leaves the old TCP connection dead: check it at once
+        // instead of at the next quiet interval. The monitor reports the
+        // current path first; only later changes matter.
+        let monitor = NWPathMonitor()
+        pathMonitorSawInitialPath = false
+        let socketID = ObjectIdentifier(socket)
+        monitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                guard let self, let current = self.socket,
+                      ObjectIdentifier(current) == socketID else { return }
+                guard self.pathMonitorSawInitialPath else {
+                    self.pathMonitorSawInitialPath = true
+                    return
+                }
+                guard satisfied else { return }
+                await self.probe(current)
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "com.milim.conduit.hermes-path"))
+        pathMonitor = monitor
+    }
+
+    private func stopKeepalive() {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+    }
+
+    /// Pings the gateway, once more if the first goes unanswered, and closes
+    /// the socket when neither does. Closing fails the receive loop, which
+    /// reports the disconnect so AppState reconnects as for any other drop.
+    private func probe(_ socket: any HermesWebSocket) async {
+        guard !isProbing, self.socket === socket, !closedIntentionally else { return }
+        isProbing = true
+        defer { isProbing = false }
+        let probeStarted = Date()
+        for _ in 0..<2 {
+            do {
+                try await ping(timeout: keepalivePingTimeout)
+                return
+            } catch HermesError.connectionClosed, HermesError.notConnected {
+                return
+            } catch {
+                guard self.socket === socket, !closedIntentionally else { return }
+                // Any frame since the probe began proves the socket alive.
+                if lastInboundAt > probeStarted { return }
+            }
+        }
+        guard self.socket === socket, !closedIntentionally else { return }
+        logger.error("Keepalive ping unanswered twice; closing the socket")
+        socket.cancel(with: .goingAway, reason: nil)
     }
 
     private func waitForSocketOpen(_ socket: any HermesWebSocket) async throws {
@@ -882,20 +1151,34 @@ final class HermesClient: ObservableObject {
         while !Task.isCancelled {
             do {
                 let message = try await socket.receive()
+                lastInboundAt = Date()
                 // A reconnect replaces `self.socket`; if this loop has been
                 // superseded, drop the frame rather than dispatch it —
                 // `handleMessage` has no identity check of its own and could
                 // otherwise fire `onEvent`/resolve pending RPCs for the new
                 // connection. Same guard the catch uses below.
                 guard self.socket === socket else { break }
+                let data: Data
                 switch message {
-                case .data(let data):
-                    handleMessage(data: data)
+                case .data(let bytes):
+                    data = bytes
                 case .string(let text):
-                    handleMessage(data: Data(text.utf8))
+                    data = Data(text.utf8)
                 @unknown default:
-                    break
+                    continue
                 }
+                let frame: DecodedFrame
+                if data.count >= Self.backgroundDecodeThreshold {
+                    // A big frame (a resume, a history page, a tool's
+                    // output, often from a chat in the background) is read
+                    // off the main actor so it can't stall a scroll. The
+                    // loop waits for it, so frames still apply in order.
+                    frame = await Self.decodeInBackground(data)
+                    guard self.socket === socket else { break }
+                } else {
+                    frame = DecodedFrame(data)
+                }
+                handleMessage(frame)
             } catch {
                 // Socket closed or errored
                 logger.error("WebSocket receive failed: \(error.localizedDescription, privacy: .public)")
@@ -906,6 +1189,7 @@ final class HermesClient: ObservableObject {
                 // RPCs. didOpen/didClose/failSocketOpen guard the same way.
                 guard self.socket === socket else { break }
                 isConnected = false
+                stopKeepalive()
                 // No response can ever arrive on a dead socket; failing the
                 // in-flight requests here keeps awaiting UI from hanging for
                 // the remainder of each request's timeout.
@@ -922,9 +1206,17 @@ final class HermesClient: ObservableObject {
         }
     }
 
-    private func handleMessage(data: Data) {
-        guard let json = try? JSONDecoder().decode(JsonRpcResponse.self, from: data) else {
-            logger.error("Dropped undecodable inbound WebSocket frame (\(data.count) bytes)")
+    /// Frames this size or larger are decoded off the main actor. Stream
+    /// deltas and RPC acks are far smaller and stay on the fast path.
+    static let backgroundDecodeThreshold = 16 * 1024
+
+    nonisolated private static func decodeInBackground(_ data: Data) async -> DecodedFrame {
+        DecodedFrame(data)
+    }
+
+    private func handleMessage(_ frame: DecodedFrame) {
+        guard let json = frame.response else {
+            logger.error("Dropped undecodable inbound WebSocket frame (\(frame.byteCount) bytes)")
             return
         }
 
@@ -992,7 +1284,9 @@ final class HermesClient: ObservableObject {
             default:
                 break
             }
-            handleStreamEvent(params: params)
+            if let event = frame.event {
+                onEvent?(event)
+            }
         } else {
             logger.debug("Received non-event WebSocket notification without an RPC id")
         }
@@ -1235,6 +1529,7 @@ final class HermesClient: ObservableObject {
 
     func disconnect() {
         closedIntentionally = true
+        stopKeepalive()
         receiveTask?.cancel()
         receiveTask = nil
         openTimeoutTask?.cancel()
@@ -1411,6 +1706,75 @@ final class HermesClient: ObservableObject {
         return (sessionId, stored)
     }
 
+    // MARK: - Bot management
+    //
+    // Every `profiles.*` write addresses its profile through `name` and is
+    // sent UNSCOPED, like `profiles.list`: the dashboard's own profile
+    // context must never redirect a write meant for another bot.
+
+    /// `profiles.create`. A fresh profile (bundled skills) that inherits the
+    /// launch profile's model and credentials (the gateway's default).
+    func createBotProfile(name: String, description: String, soul: String) async throws {
+        _ = try await rpc("profiles.create", params: [
+            "name": name,
+            "description": description,
+            "soul": soul
+        ], timeout: 60, scoped: false)
+    }
+
+    /// `profiles.describe`: the editor snapshot (description + SOUL.md).
+    func describeBotProfile(name: String) async throws -> BotProfileDetails {
+        let result = try await rpc("profiles.describe", params: ["name": name], scoped: false)
+        guard let object = result.objectValue else { throw HermesError.invalidResponse }
+        return BotProfileDetails(
+            description: object["description"]?.stringValue ?? "",
+            soul: object["soul"]?.stringValue ?? ""
+        )
+    }
+
+    /// `profiles.configure`. Sections are independent; the answer's
+    /// `applied` reports each. `expectedMetaRevision` turns the ui_meta
+    /// write into a compare-and-swap against the roster snapshot it was
+    /// built from.
+    func configureBotProfile(
+        name: String,
+        botMeta: [String: Any]? = nil,
+        expectedMetaRevision: Int? = nil,
+        description: String? = nil,
+        soul: String? = nil
+    ) async throws -> AnyCodable {
+        var params: [String: Any] = ["name": name]
+        if let botMeta {
+            params["ui_meta"] = [BotManagement.uiMetaKey: botMeta]
+            if let expectedMetaRevision {
+                params["ui_meta_expected_revisions"] = [BotManagement.uiMetaKey: expectedMetaRevision]
+            }
+        }
+        if let description { params["description"] = description }
+        if let soul { params["soul"] = soul }
+        return try await rpc("profiles.configure", params: params, scoped: false)
+    }
+
+    /// `profiles.get_asset` for the bot's avatar. Nil when it has none.
+    func botAvatar(name: String) async throws -> Data? {
+        let result = try await rpc("profiles.get_asset", params: [
+            "name": name,
+            "asset": BotManagement.avatarAsset
+        ], scoped: false)
+        return BotAvatarImage.imageData(fromGetAssetResult: result)
+    }
+
+    /// `profiles.set_asset`: stores the avatar PNG, or clears it when nil.
+    func setBotAvatar(name: String, png: Data?) async throws {
+        var params: [String: Any] = ["name": name, "asset": BotManagement.avatarAsset]
+        if let png {
+            params["data"] = BotAvatarImage.dataURL(png: png)
+        } else {
+            params["clear"] = true
+        }
+        _ = try await rpc("profiles.set_asset", params: params, scoped: false)
+    }
+
 
     /// Projects are a newer, optional gateway capability. Unlike the ordinary
     /// session catalog, membership comes from Hermes' server-side project tree
@@ -1436,6 +1800,16 @@ final class HermesClient: ObservableObject {
         return MessageNormalizer.normalizeProject(project, profile: profile)
     }
 
+    func renameProject(_ projectId: String, name: String) async throws {
+        _ = try await rpc("projects.update", params: ["id": projectId, "name": name])
+    }
+
+    /// Removes the project record and its folder list from projects.db. The
+    /// folders, files and conversations themselves are left untouched.
+    func deleteProject(_ projectId: String) async throws {
+        _ = try await rpc("projects.delete", params: ["id": projectId])
+    }
+
     /// Re-homes a stored session's workspace into `cwd`, the same RPC Hermes
     /// Desktop's "Move to project" uses. Project membership follows the
     /// session's folder, so moving the folder is moving the session; the
@@ -1452,8 +1826,29 @@ final class HermesClient: ObservableObject {
         return moved.isEmpty ? cwd : moved
     }
 
+    /// Is this socket still alive? Asked when Conduit comes back to the
+    /// foreground with a socket iOS may have killed while it slept (#417).
+    ///
+    /// `ping` is Hermes' cheapest probe, answered on the WebSocket reader
+    /// thread even while every agent is mid-turn (upstream
+    /// `tui_gateway/contracts/liveness.py`), so it gets a shorter budget than
+    /// the `session.list` it replaces, which builds a whole session list:
+    /// the 5 s Hermes Desktop gives the same probe. Unscoped, like
+    /// `profiles.list`, because it takes no arguments at all.
+    ///
+    /// A gateway that predates `ping` answers "method not found". That reply
+    /// travelled over this socket, so it proves the socket alive exactly as a
+    /// pong would; Hermes Desktop reads it the same way.
     func healthCheck() async throws {
-        _ = try await rpc("session.list", params: nil, timeout: Self.livenessProbeTimeout)
+        try await ping(timeout: Self.pingTimeout)
+    }
+
+    private func ping(timeout: TimeInterval) async throws {
+        do {
+            _ = try await rpc("ping", params: nil, timeout: timeout, scoped: false)
+        } catch let error where Self.isMissingRPCMethod(error) {
+            return
+        }
     }
 
     /// Resumes a session with the compact projection: `omit_messages` asks
@@ -1495,6 +1890,10 @@ final class HermesClient: ObservableObject {
         ]
         if omitMessages {
             params["omit_messages"] = true
+        } else {
+            // The transcript without the copy of every picture stored in
+            // it (#652); a gateway without the flag ignores it.
+            params["inline_images"] = false
         }
         // A bot chat lives in the bot profile's state.db; the gateway's
         // `session.resume` reads the `profile` param to open that store
@@ -1604,7 +2003,9 @@ final class HermesClient: ObservableObject {
         _ = try await rpc("config.set", params: ["key": "busy", "value": mode.rawValue])
     }
 
-    func createSession(model: String? = nil, provider: String? = nil, reasoningEffort: String? = nil, fast: Bool? = nil, cwd: String? = nil) async throws -> (sessionId: String, storedSessionId: String?, profile: String?) {
+    /// `inProfile` creates the session in another profile on the same
+    /// gateway (a voice job addressed to a bot); nil uses the client's own.
+    func createSession(model: String? = nil, provider: String? = nil, reasoningEffort: String? = nil, fast: Bool? = nil, cwd: String? = nil, inProfile: String? = nil) async throws -> (sessionId: String, storedSessionId: String?, profile: String?) {
         var params: [String: Any] = [
             "cols": 96,
             "source": "desktop"
@@ -1612,7 +2013,7 @@ final class HermesClient: ObservableObject {
         // Keep this explicit instead of relying solely on the generic RPC
         // scope. Hermes Desktop does the same: a global gateway can otherwise
         // create an unscoped session in its launch/default profile.
-        if let profile, !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if let profile = inProfile ?? profile, !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             params["profile"] = profile
         }
         if let model {
@@ -1751,17 +2152,36 @@ final class HermesClient: ObservableObject {
     /// turn). Hermes adds its spoken-reply note to the model input only, so
     /// the persisted user row stays what the user said; older gateways
     /// ignore the key.
-    func sendPrompt(_ sessionId: String, text: String, surface: String? = nil) async throws -> PromptSubmissionOutcome {
+    ///
+    /// `voiceTurn` marks a spoken voice-conversation turn, which Hermes runs
+    /// on its `auxiliary.voice_chat` model (reasoning off by default). A
+    /// gateway from before that slot refuses the unknown key with `4000`
+    /// before anything runs, so the turn is resent once without it and the
+    /// key is dropped for this client from then on.
+    func sendPrompt(_ sessionId: String, text: String, surface: String? = nil, voiceTurn: Bool = false) async throws -> PromptSubmissionOutcome {
         var params: [String: Any] = [
             "session_id": sessionId,
             "text": text
         ]
         if let surface { params["surface"] = surface }
-        let result = try await rpc("prompt.submit", params: params, timeout: Self.promptSubmitTimeout)
+        let marksVoiceTurn = voiceTurn && !gatewayRefusesVoiceTurn
+        if marksVoiceTurn { params["voice_turn"] = true }
+        let result: AnyCodable
+        do {
+            result = try await rpc("prompt.submit", params: params, timeout: Self.promptSubmitTimeout)
+        } catch let error as RpcError where marksVoiceTurn && error.refusesUnknownParam("voice_turn") {
+            gatewayRefusesVoiceTurn = true
+            params.removeValue(forKey: "voice_turn")
+            result = try await rpc("prompt.submit", params: params, timeout: Self.promptSubmitTimeout)
+        }
         return PromptSubmissionOutcome(
             gatewayStatus: result.objectValue?["status"]?.stringValue
         )
     }
+
+    /// Set once this gateway refused `prompt.submit`'s `voice_turn` key
+    /// (a Hermes from before `auxiliary.voice_chat`).
+    private var gatewayRefusesVoiceTurn = false
 
     /// Read-only liveness probe against the gateway's in-memory runtime
     /// registry (`session.active_list`). Unlike `session.resume` this does not
@@ -1772,10 +2192,12 @@ final class HermesClient: ObservableObject {
     /// under the default profile (non-default profiles add only the gateway
     /// `profile` context). Older gateways without the method throw `RpcError`;
     /// callers degrade to resume-based recovery.
-    func activeSessions() async throws -> [LiveSessionStatus] {
+    func activeSessions(inProfile: String? = nil) async throws -> [LiveSessionStatus] {
+        // An explicit profile reads another profile's registry (a voice job
+        // running on a bot); the client's own scope still applies otherwise.
         let result = try await rpc(
             "session.active_list",
-            params: [:],
+            params: inProfile.map { ["profile": $0] as [String: Any] } ?? [:],
             timeout: Self.livenessProbeTimeout
         )
         let rows = result.objectValue?["sessions"]?.arrayValue ?? []
@@ -1906,6 +2328,39 @@ final class HermesClient: ObservableObject {
         return .accepted(remaining: remaining)
     }
 
+    /// `message.react`: sets, replaces or (same emoji, or nil) retracts the
+    /// user's reaction. The row is named by its durable `row_id`; a live row
+    /// that hasn't been reloaded yet names `newest_role` instead and Hermes
+    /// resolves the newest row of that role. The reaction needs no turn of
+    /// its own: Hermes tells the agent about it with the next message.
+    func reactToMessage(
+        sessionId: String,
+        target: MessageReactionTarget,
+        emoji: String?
+    ) async throws -> MessageReactionResult {
+        var params: [String: Any] = [
+            "session_id": sessionId,
+            "author": MessageReaction.userAuthor
+        ]
+        // An explicit null clears the reaction.
+        params["emoji"] = emoji.map { $0 as Any } ?? NSNull()
+        switch target {
+        case .row(let rowId):
+            params["row_id"] = rowId
+        case .newest(let role):
+            params["newest_role"] = role
+        }
+        let result = try await rpc("message.react", params: params)
+        let object = result.objectValue ?? [:]
+        guard let rowId = Self.exactIntValue(object["row_id"]), rowId > 0 else {
+            throw HermesError.invalidResponse
+        }
+        return MessageReactionResult(
+            rowId: rowId,
+            reactions: MessageNormalizer.messageReactions(from: object["reactions"])
+        )
+    }
+
     /// Answers a sudo / secret / vault-unlock server request. `value` is
     /// sent once and never retained; an empty string tells Hermes the user
     /// skipped (the tool then proceeds without the value).
@@ -1980,6 +2435,20 @@ final class HermesClient: ObservableObject {
         }
     }
 
+    /// The `subagent_id`s Hermes still has running for one live session.
+    func liveSubagentIDs(sessionId: String) async throws -> Set<String> {
+        let result = try await rpc("subagent.list", params: ["session_id": sessionId])
+        guard let rows = result.objectValue?["subagents"]?.arrayValue else {
+            throw HermesError.invalidResponse
+        }
+        let ids = rows.compactMap { row in
+            row.objectValue?["subagent_id"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+        }
+        // A row without an id could be any running agent: trust none of it.
+        guard ids.count == rows.count else { throw HermesError.invalidResponse }
+        return Set(ids)
+    }
+
     func modelOptions(sessionId: String? = nil) async throws -> (model: String?, provider: String?, providers: [ProviderInfo]?) {
         var params: [String: Any] = ["explicit_only": true]
         if let sessionId { params["session_id"] = sessionId }
@@ -1991,12 +2460,19 @@ final class HermesClient: ObservableObject {
         return (model, provider, providers)
     }
 
-    func setModel(_ sessionId: String, model: String, provider: String) async throws {
-        _ = try await rpc("config.set", params: [
+    /// The gateway can answer without switching: a guarded pick (expensive
+    /// model, data-training tier, or a switch that abandons a large cached
+    /// context) comes back as `confirm_required` and nothing is applied until
+    /// the client repeats the call with `confirm_expensive_model`.
+    func setModel(_ sessionId: String, model: String, provider: String, confirmed: Bool = false) async throws -> ModelSwitchOutcome {
+        var params: [String: Any] = [
             "key": "model",
             "session_id": sessionId,
             "value": "\(model) --provider \(provider) --session"
-        ])
+        ]
+        if confirmed { params["confirm_expensive_model"] = true }
+        let result = try await rpc("config.set", params: params)
+        return ModelSwitchOutcome(from: result, requestedModel: model)
     }
 
     func setReasoning(_ sessionId: String, effort: String) async throws {
@@ -2149,22 +2625,48 @@ final class HermesClient: ObservableObject {
         return result.objectValue?["path"]?.stringValue
     }
 
-    func attachPdf(_ sessionId: String, base64: String, filename: String) async throws {
-        _ = try await rpc("pdf.attach", params: [
-            "session_id": sessionId,
-            "content_base64": base64,
-            "filename": filename
-        ], timeout: 120)
-    }
-
-    func attachFile(_ sessionId: String, dataUrl: String, name: String, path: String = "") async throws {
-        _ = try await rpc("file.attach", params: [
+    /// Stages any non-image file (PDFs included) in the session's
+    /// attachments folder, the way Hermes Desktop sends files. Returns the
+    /// `@file:` reference the prompt must carry: without it the agent is
+    /// never told the file is there.
+    func attachFile(_ sessionId: String, dataUrl: String, name: String, path: String = "") async throws -> String? {
+        let result = try await rpc("file.attach", params: [
             "session_id": sessionId,
             "data_url": dataUrl,
             "name": name,
             "path": path
         ], timeout: 120)
+        return Self.fileAttachmentReference(from: result)
     }
+
+    /// The `@file:` reference from a `file.attach` reply: its `ref_text`,
+    /// else one built from the staged path (a reply without `ref_text`).
+    static func fileAttachmentReference(from result: AnyCodable) -> String? {
+        let object = result.objectValue
+        if let reference = object?["ref_text"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           reference.hasPrefix("@file:"), reference.count > "@file:".count {
+            return reference
+        }
+        let path = [object?["ref_path"], object?["path"]]
+            .compactMap { $0?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        guard let path else { return nil }
+        return "@file:\(formatReferenceValue(path))"
+    }
+
+    /// Quotes a reference value that holds whitespace, brackets or quotes so
+    /// Hermes reads it back whole (its `format_reference_value`).
+    nonisolated static func formatReferenceValue(_ value: String) -> String {
+        guard value.rangeOfCharacter(from: referenceValueQuotingCharacters) != nil else { return value }
+        for quote in ["`", "\"", "'"] where !value.contains(quote) {
+            return "\(quote)\(value)\(quote)"
+        }
+        return value
+    }
+
+    nonisolated private static let referenceValueQuotingCharacters = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: "()[]{}<>\"'`"))
 
     // MARK: - Cron
 
@@ -2308,6 +2810,33 @@ final class HermesClient: ObservableObject {
         return Self.exactIntValue(result.objectValue?["cancelled"]) ?? 0
     }
 
+    /// Answer one member's pending approval (`groups.approve`). Every field
+    /// comes from the `pending_actions` row: the gateway resolves only the
+    /// exact request it is still holding and refuses a stale one. Only
+    /// offered when `groupsCapabilities` advertised the method.
+    ///
+    /// Returns false when the gateway answered but resolved nothing: a local
+    /// member's `result` is its `approval.respond` answer, whose `resolved`
+    /// count is 0 once the request settled elsewhere. A peer member's receipt
+    /// carries no count and counts as delivered.
+    func groupsApprove(roomID: String, approval: GroupPendingApproval, choice: String) async throws -> Bool {
+        let result = try await rpc(
+            "groups.approve",
+            params: [
+                "room_id": roomID,
+                "member_id": approval.memberID,
+                "task_id": approval.taskID,
+                "execution_generation": approval.executionGeneration,
+                "choice": choice,
+                "request_id": approval.requestID,
+            ],
+            scoped: false
+        )
+        guard let receipt = result.objectValue?["result"]?.objectValue,
+              let resolved = receipt["resolved"] else { return true }
+        return (Self.exactIntValue(resolved) ?? 1) > 0
+    }
+
     // delegateAgentActivity moved to StreamEventParser
 }
 
@@ -2316,6 +2845,69 @@ final class HermesClient: ObservableObject {
 struct ProviderInfo: Equatable {
     let name: String
     let models: [ModelInfo]
+    /// Display name and alternate spellings Hermes accepts for this row. A
+    /// saved `model.provider` can use any of them (e.g. `custom:<key>` for a
+    /// row whose slug is the bare key), so matching on `name` alone misses it.
+    var displayName: String? = nil
+    var aliases: [String] = []
+    /// Hermes marks the row backing the configured main model.
+    var isCurrent = false
+
+    /// True when `provider` names this row by slug, display name or alias,
+    /// mirroring Hermes Desktop's `catalogProviderMatches`.
+    func matches(_ provider: String) -> Bool {
+        let wanted = Self.normalized(provider)
+        guard !wanted.isEmpty else { return false }
+        return ([name, displayName ?? ""] + aliases).contains { Self.normalized($0) == wanted }
+    }
+
+    /// Picker label: the catalog's display name, else the slug.
+    var title: String {
+        let display = displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return display.isEmpty ? name : display
+    }
+
+    static func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
+/// The gateway's answer to `config.set model`.
+struct ModelSwitchOutcome: Equatable {
+    /// The model Hermes resolved the pick to (aliases expand).
+    let model: String
+    /// Nothing was switched; the user must confirm `confirmMessage` first.
+    let confirmRequired: Bool
+    let confirmMessage: String
+    /// The session is mid-turn; the switch applies when the next turn starts.
+    let deferred: Bool
+
+    init(model: String, confirmRequired: Bool = false, confirmMessage: String = "", deferred: Bool = false) {
+        self.model = model
+        self.confirmRequired = confirmRequired
+        self.confirmMessage = confirmMessage
+        self.deferred = deferred
+    }
+
+    init(from result: AnyCodable, requestedModel: String) {
+        let object = result.objectValue ?? [:]
+        // Hermes reports the resolved model name, but a gateway that echoes
+        // the raw request would hand back "<model> --provider <p> --session";
+        // keep only the model part so the flags never reach `runtime.model`.
+        let rawValue = object["value"]?.stringValue ?? ""
+        let value = (rawValue.range(of: " --").map { String(rawValue[..<$0.lowerBound]) } ?? rawValue)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // `warning` is Hermes' legacy alias for `confirm_message`.
+        let message = [object["confirm_message"]?.stringValue, object["warning"]?.stringValue]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
+        self.init(
+            model: value.isEmpty ? requestedModel : value,
+            confirmRequired: object["confirm_required"]?.boolValue ?? false,
+            confirmMessage: message,
+            deferred: object["deferred"]?.boolValue ?? false
+        )
+    }
 }
 
 struct ModelInfo: Equatable {
@@ -2330,6 +2922,9 @@ extension ProviderInfo {
         guard let name = object["slug"]?.stringValue ?? object["id"]?.stringValue ?? object["name"]?.stringValue,
               !name.isEmpty else { return nil }
         self.name = name
+        self.displayName = object["name"]?.stringValue
+        self.aliases = (object["aliases"]?.arrayValue ?? []).compactMap(\.stringValue)
+        self.isCurrent = object["is_current"]?.boolValue ?? false
         self.models = (object["models"]?.arrayValue ?? []).compactMap { model in
             if let id = model.stringValue, !id.isEmpty {
                 return ModelInfo(id: id, label: nil, reasoningCapable: false)
@@ -2418,13 +3013,25 @@ enum HermesError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidUrl: return "Invalid gateway URL."
-        case .invalidResponse: return "Hermes returned an incomplete response."
-        case .notConnected: return "Hermes is not connected."
-        case .connectionClosed: return "Hermes connection closed."
-        case .timeout(let method): return "Request timed out: \(method)"
-        case .steerRejected: return "Hermes could not steer the active response."
+        // Read by people who may not run servers: say what happened and
+        // what to do, never an RPC method name.
+        case .invalidUrl:
+            return AppLocalization.string("The dashboard address isn't valid. Check it in Settings > Connection.")
+        case .invalidResponse:
+            return AppLocalization.string("Hermes sent a reply Conduit didn't understand. Updating Hermes and Conduit usually fixes this.")
+        case .notConnected:
+            return AppLocalization.string("Conduit isn't connected to Hermes right now. It reconnects on its own, so try again in a moment.")
+        case .connectionClosed:
+            return AppLocalization.string("The connection to Hermes dropped. Conduit reconnects on its own, so try again in a moment.")
+        case .timeout:
+            return Self.timeoutMessage
+        case .steerRejected: return AppLocalization.string("Hermes could not steer the active response.")
         }
+    }
+
+    /// What any request to Hermes that ran out of time tells people.
+    static var timeoutMessage: String {
+        AppLocalization.string("Hermes didn't answer in time. Check that your Hermes server is running, then try again.")
     }
 }
 
@@ -2483,6 +3090,12 @@ enum MessageNormalizer {
             ?? object["previewSessions"]?.arrayValue
             ?? []
         let isHome = object["isNoProject"]?.boolValue ?? object["is_no_project"]?.boolValue ?? false
+        // Only projects created in Hermes have a projects.db row, and their ids
+        // are `p_<hex>`. When a gateway omits the flag, any non-Home id without
+        // that prefix is treated as auto, so rename and delete fail closed.
+        let isAuto = object["isAuto"]?.boolValue
+            ?? object["is_auto"]?.boolValue
+            ?? (!isHome && !id.hasPrefix("p_"))
         let folderPath = firstNonEmptyString(
             object["folders"]?.arrayValue?.compactMap { $0.objectValue?["path"]?.stringValue }.map(AnyCodable.string) ?? []
         )
@@ -2509,6 +3122,7 @@ enum MessageNormalizer {
             icon: object["icon"]?.stringValue,
             colorHex: object["color"]?.stringValue,
             isHome: isHome,
+            isAuto: isAuto,
             sessionCount: count,
             previewSessions: normalizeSessions(.array(previews), profile: profile)
         )
@@ -2530,12 +3144,14 @@ enum MessageNormalizer {
                 let groupObject = group.objectValue ?? [:]
                 let groupID = groupObject["id"]?.stringValue ?? UUID().uuidString
                 let groupLabel = firstNonEmptyString([groupObject["label"], groupObject["path"]]) ?? AppLocalization.string("Sessions")
+                let groupPath = firstNonEmptyString([groupObject["path"], groupObject["cwd"]])
                 let sessions = normalizeSessions(.array(groupObject["sessions"]?.arrayValue ?? []), profile: profile)
                 guard !sessions.isEmpty else { continue }
                 lanes.append(ProjectSessionLane(
                     id: groupID,
                     title: multipleRepos ? "\(repoLabel) · \(groupLabel)" : groupLabel,
-                    sessions: sessions
+                    sessions: sessions,
+                    path: groupPath == groupLabel ? nil : groupPath
                 ))
             }
         }
@@ -2607,9 +3223,26 @@ enum MessageNormalizer {
                 isActive: false,
                 isArchived: obj["archived"]?.boolValue ?? false,
                 messageCount: messageCount,
-                lineageRootId: obj["_lineage_root_id"]?.stringValue
+                isUnread: obj["unread"]?.boolValue,
+                readWatermark: obj["last_read_at"]?.doubleValue,
+                isPinned: obj["pinned"]?.boolValue,
+                lineageRootId: obj["_lineage_root_id"]?.stringValue,
+                preview: Self.sessionListPreview(in: obj)
             )
         }
+    }
+
+    /// A row's `preview`, kept only when the row also has a title: an
+    /// untitled row already shows its preview as the title.
+    static func sessionListPreview(in obj: [String: AnyCodable]) -> String? {
+        guard let title = obj["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty,
+              let preview = obj["preview"]?.stringValue?
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !preview.isEmpty,
+              preview != title else { return nil }
+        return preview
     }
 
     /// The ordering instant for a session row, so restoration can rank
@@ -2691,7 +3324,10 @@ enum MessageNormalizer {
         return "recently"
     }
 
-    private static func formattedSessionTimestamp(_ timestamp: Double) -> String {
+    /// A row's time as the session list shows it: the time alone today,
+    /// else the day and time. The saved chat list re-runs it at launch, so
+    /// a row saved yesterday doesn't still read as today's.
+    static func formattedSessionTimestamp(_ timestamp: Double) -> String {
         // The SAME unit normalization the ordering instant uses: a µs/ns
         // payload must not display one date and rank by another.
         guard let seconds = normalizedSessionTimestamp(timestamp) else {
@@ -2745,7 +3381,12 @@ enum MessageNormalizer {
         return .other
     }
 
-    static func normalizeMessages(_ payload: [AnyCodable]) -> [ChatMessage] {
+    /// `imageScope` names the session and profile the rows were read from,
+    /// so pictures stored inside them can be fetched again (#652).
+    static func normalizeMessages(
+        _ payload: [AnyCodable],
+        imageScope: TranscriptImageScope? = nil
+    ) -> [ChatMessage] {
         var messages: [ChatMessage] = []
         var callsById = [String: ChatMessage]()
 
@@ -2778,6 +3419,16 @@ enum MessageNormalizer {
 
             let rawRole = (obj["role"]?.stringValue ?? obj["type"]?.stringValue ?? "").lowercased()
             let isToolResult = rawRole == "tool" || rawRole.contains("tool_result") || rawRole.contains("tool-result")
+            // A mid-turn steer is persisted as its own `role=user` row typed
+            // `display_kind: "steer"`, its text wrapped in Hermes'
+            // out-of-band marker. It stays a user row (it IS the user's
+            // words, and ordering evidence keeps counting it as a user
+            // boundary); only the model-facing marker is removed and the
+            // row is tagged so the transcript renders it as a steer.
+            let isSteerRow = !isToolResult
+                && rawRole == "user"
+                && (obj["display_kind"]?.stringValue ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == ChatMessage.steerDisplayKind
             var role: MessageRole
             switch rawRole {
             case "user": role = .user
@@ -2825,8 +3476,11 @@ enum MessageNormalizer {
                     isToolResult: isToolResult
                 )
             }
-            guard let rawContent else {
+            guard var rawContent else {
                 continue
+            }
+            if isSteerRow {
+                rawContent = steerText(fromMarker: rawContent)
             }
             let modelChange = modelChangeActivity(fromText: rawContent)
             let systemNotice = systemNoticeText(fromText: rawContent)
@@ -2836,8 +3490,9 @@ enum MessageNormalizer {
             if modelChange != nil || systemNotice != nil || (displayKind != nil && !isToolResult) {
                 role = .system
             }
+            let rowId = durableRowId(in: obj)
             let userContent: (content: String, rawContent: String?, attachments: [Attachment]?) = role == .user
-                ? splitUserImageReferences(rawContent, messageId: id)
+                ? splitUserAttachmentReferences(rawContent, messageId: id, rowId: rowId, imageScope: imageScope)
                 : (content: rawContent, rawContent: nil, attachments: nil)
             let content: String
             if let displayKind, !isToolResult {
@@ -2890,6 +3545,8 @@ enum MessageNormalizer {
                     var updated = match
                     updated.tool?.output = content.isEmpty ? (match.tool?.output ?? "") : content
                     updated.tool?.status = .complete
+                    updated.tool?.duration = toolDuration(in: obj)
+                        ?? ChatStepTiming.elapsed(from: match.timestamp, to: extractTimestamp(obj))
                     if let idx = messages.firstIndex(where: { $0.id == match.id }) {
                         messages[idx] = updated
                         if !callId.isEmpty { callsById[callId] = updated }
@@ -2943,6 +3600,9 @@ enum MessageNormalizer {
                 review: review,
                 attachments: userContent.attachments,
                 displayKind: displayKind?.rawValue
+                    ?? (isSteerRow && role == .user ? ChatMessage.steerDisplayKind : nil),
+                rowId: rowId,
+                reactions: messageReactions(fromMetadata: obj["display_metadata"])
             )
 
             // External session history occasionally includes a role-less
@@ -2997,6 +3657,38 @@ enum MessageNormalizer {
         return object.mapValues { AnyCodable.from($0) }
     }
 
+    /// The durable `messages.id` a reaction addresses. A gateway resume row
+    /// names it `row_id`; a REST transcript row carries it as its numeric
+    /// `id` (a string `id` is some other identity, never a row address).
+    static func durableRowId(in obj: [String: AnyCodable]) -> Int? {
+        let rowId = HermesClient.exactIntValue(obj["row_id"])
+            ?? HermesClient.exactIntValue(obj["id"])
+        guard let rowId, rowId > 0 else { return nil }
+        return rowId
+    }
+
+    /// Reactions persisted under `display_metadata.reactions`. Entries
+    /// without an emoji or an author are skipped; anything malformed reads
+    /// as none.
+    static func messageReactions(fromMetadata metadata: AnyCodable?) -> [MessageReaction] {
+        messageReactions(from: displayMetadataObject(metadata)?["reactions"])
+    }
+
+    /// A `MessageReaction` list as Hermes sends it (`message.react` result,
+    /// `message.reaction` event, stored metadata).
+    static func messageReactions(from value: AnyCodable?) -> [MessageReaction] {
+        (value?.arrayValue ?? []).compactMap { entry in
+            guard let object = entry.objectValue,
+                  let emoji = object["emoji"]?.stringValue?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !emoji.isEmpty else { return nil }
+            guard let author = object["author"]?.stringValue?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !author.isEmpty else { return nil }
+            return MessageReaction(emoji: emoji, author: author, at: object["at"]?.doubleValue)
+        }
+    }
+
     /// The one-line title Hermes stamps on a background completion's
     /// `display_metadata.display_text` (Desktop's `timelineDisplayText`).
     /// Blank or non-string values degrade to nil.
@@ -3023,7 +3715,7 @@ enum MessageNormalizer {
         guard let taskCount = delegationTaskCount(metadata: metadata) else {
             return AppLocalization.string("Background agent work finished")
         }
-        return taskCount == 1 ? AppLocalization.string("1 background agent finished") : AppLocalization.string("\(String(taskCount)) background agents finished")
+        return AppLocalization.string("\(taskCount) background agents finished")
     }
 
     /// Final visible text for a row Hermes tags with a known synthetic
@@ -3133,9 +3825,29 @@ enum MessageNormalizer {
             return body.isEmpty ? nil : body
         }
         if isUserCorrectionInterruptionNotice(trimmed) {
-            return "Response interrupted by a user correction."
+            return AppLocalization.string("Response interrupted by a user correction.")
         }
         return nil
+    }
+
+    /// Hermes wraps a delivered steer as
+    /// `[OUT-OF-BAND USER MESSAGE — …]\n<text>\n[/OUT-OF-BAND USER MESSAGE]`
+    /// so the model trusts it. Returns the user's own text; anything that
+    /// does not carry the marker is returned trimmed but otherwise as is.
+    static func steerText(fromMarker text: String) -> String {
+        var body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let opener = "[OUT-OF-BAND USER MESSAGE"
+        let closer = "[/OUT-OF-BAND USER MESSAGE]"
+        // The header ends at its own `]` on the first line; never scan into
+        // the user's text, which may contain brackets.
+        let headerLine = body.prefix(while: { $0 != "\n" })
+        if body.hasPrefix(opener), let end = headerLine.firstIndex(of: "]") {
+            body = String(body[body.index(after: end)...])
+        }
+        if body.hasSuffix(closer) {
+            body = String(body.dropLast(closer.count))
+        }
+        return body.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func isUserCorrectionInterruptionNotice(_ text: String) -> Bool {
@@ -3420,40 +4132,241 @@ enum MessageNormalizer {
         return collapsed
     }
 
-    /// Desktop persists uploaded images as `@image:/gateway/path/file.ext`
-    /// tokens in the user prompt. Project those tokens into Conduit's regular
-    /// attachment model so resumed cross-client sessions keep their previews.
-    /// Retain the original prompt for replay/branch operations.
-    private static func splitUserImageReferences(
+    /// A user prompt's visible text once `@image:` tokens, leading `@file:`
+    /// references and Hermes' attached-context footer are projected out —
+    /// what a persisted user row's `content` holds.
+    static func visibleUserText(_ source: String) -> String {
+        splitUserAttachmentReferences(source, messageId: "").content
+    }
+
+    /// A persisted user prompt as its bubble shows it: images (`@image:`
+    /// tokens) and staged files (leading `@file:` lines, how Conduit and
+    /// Desktop send them) become attachments, and the context Hermes
+    /// expanded for the model below the typed text is dropped. The original
+    /// prompt is retained for replay/branch operations.
+    private static func splitUserAttachmentReferences(
         _ source: String,
-        messageId: String
+        messageId: String,
+        rowId: Int? = nil,
+        imageScope: TranscriptImageScope? = nil
     ) -> (content: String, rawContent: String?, attachments: [Attachment]?) {
-        let pattern = #"@image:(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s]+))"#
-        guard let expression = try? NSRegularExpression(pattern: pattern) else {
-            return (source, nil, nil)
-        }
+        let images = splitUserImageReferences(
+            source,
+            messageId: messageId,
+            rowId: rowId,
+            imageScope: imageScope
+        )
+        let files = splitLeadingFileReferences(
+            removingContextFooter(images.content),
+            messageId: messageId
+        )
+        guard files.content != images.content else { return images }
+        let attachments = files.attachments + (images.attachments ?? [])
+        // Without Hermes' picture stand-ins, which a branch must not replay.
+        return (files.content, images.rawContent ?? source, attachments.isEmpty ? nil : attachments)
+    }
 
-        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
-        let matches = expression.matches(in: source, range: fullRange)
-        guard !matches.isEmpty else { return (source, nil, nil) }
+    /// Hermes appends what it expanded for `@file:`/`@url:` references below
+    /// the typed text ("--- Context Warnings ---", "--- Attached Context ---").
+    /// That is for the model; like Desktop, the bubble shows only the text.
+    /// Hermes only adds the footer to a prompt holding a reference, so a
+    /// heading typed in a message without one stays.
+    static func removingContextFooter(_ text: String) -> String {
+        guard let footer = text.range(
+            of: #"(?:^|\n)--- (?:Context Warnings|Attached Context) ---[ \t]*(?:\r?\n|$)"#,
+            options: .regularExpression
+        ) else { return text }
+        let visible = String(text[..<footer.lowerBound])
+        // Hermes' reference shapes (`context_references.REFERENCE_PATTERN`
+        // and its plugin fallback): `@diff`, `@staged`, or `@kind:value`.
+        guard visible.range(
+            of: #"(?<![\w/])@(?:diff\b|staged\b|[A-Za-z][A-Za-z0-9_-]*:\S)"#,
+            options: .regularExpression
+        ) != nil else { return text }
+        return visible.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
+    /// One whole line holding one `@file:` reference, its value quoted the
+    /// way Hermes quotes one (`format_reference_value`) or bare.
+    private static let fileReferenceLine = try? NSRegularExpression(
+        pattern: #"^@file:(?:`([^`\r\n]+)`|"([^"\r\n]+)"|'([^'\r\n]+)'|(\S+))$"#
+    )
+
+    /// The run of `@file:` lines a prompt opens with becomes document
+    /// attachments; a reference typed inside the text stays where it is.
+    static func splitLeadingFileReferences(
+        _ text: String,
+        messageId: String
+    ) -> (content: String, attachments: [Attachment]) {
+        guard let expression = fileReferenceLine else { return (text, []) }
+        var lines = text.components(separatedBy: "\n")
         var paths: [String] = []
-        for match in matches {
+        while let first = lines.first {
+            let line = first.replacingOccurrences(of: #"\s+$"#, with: "", options: .regularExpression)
+            let range = NSRange(line.startIndex..<line.endIndex, in: line)
+            guard let match = expression.firstMatch(in: line, range: range) else { break }
+            var path: String?
             for group in 1..<match.numberOfRanges {
-                let range = match.range(at: group)
-                guard range.location != NSNotFound,
-                      let swiftRange = Range(range, in: source) else { continue }
-                let path = String(source[swiftRange])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !path.isEmpty { paths.append(path) }
+                if let valueRange = Range(match.range(at: group), in: line) {
+                    path = String(line[valueRange])
+                    break
+                }
+            }
+            guard let path, !path.isEmpty else { break }
+            paths.append(path)
+            lines.removeFirst()
+        }
+        guard !paths.isEmpty else { return (text, []) }
+        let content = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachments = paths.enumerated().map { index, path in
+            let url = URL(fileURLWithPath: path)
+            let name = url.lastPathComponent
+            let type = url.pathExtension.isEmpty ? nil : UTType(filenameExtension: url.pathExtension)
+            return Attachment(
+                id: "\(messageId)-gateway-file-\(index)",
+                name: name.isEmpty ? AppLocalization.string("Attached file") : name,
+                uri: path,
+                mimeType: AttachmentTypePolicy.mimeType(for: type),
+                kind: AttachmentTypePolicy.kind(for: type)
+            )
+        }
+        return (content, attachments)
+    }
+
+    /// `@image:` tokens, quoted the way Hermes quotes one
+    /// (`format_reference_value`) or bare.
+    private static let imageReferencePattern = try? NSRegularExpression(
+        pattern: #"@image:(?:`([^`\r\n]+)`|"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s]+))"#
+    )
+
+    /// The gateway's note for a picture that came in through a chat
+    /// platform or a bot (`agent/image_routing.py`).
+    private static let imageHintPattern = try? NSRegularExpression(
+        pattern: #"\[Image attached at: ([^\n\]]+)\]"#
+    )
+
+    /// The caption the gateway writes when a picture arrives without one.
+    private static let defaultImageCaption = "What do you see in this image?"
+
+    /// What Hermes puts in place of each picture it leaves out of a
+    /// transcript read with `inline_images=false` (#652).
+    static let inlineImageMarker = "[image]"
+
+    private static let inlineImagePartTypes: Set<String> = ["image_url", "input_image", "image"]
+
+    /// A content part carrying a picture (OpenAI `image_url`/`input_image`,
+    /// Anthropic or MCP `image`), as opposed to some other object whose
+    /// `type` happens to say image.
+    static func isInlineImagePart(_ part: [String: AnyCodable]) -> Bool {
+        guard let type = part["type"]?.stringValue, inlineImagePartTypes.contains(type) else { return false }
+        return ["image_url", "image", "source", "data", "file_id"].contains { part[$0] != nil }
+    }
+
+    /// Splits Hermes' trailing picture stand-ins off a persisted prompt.
+    /// Hermes appends one line per picture after the text, so only a
+    /// trailing run counts and a typed "[image]" inside the text stays. A
+    /// bare `data:image/…` line (a gateway that writes pictures out as text)
+    /// counts as one too and is never shown.
+    static func trailingInlineImageMarkers(_ text: String) -> (text: String, count: Int) {
+        guard text.contains(inlineImageMarker) || text.contains("data:image/") else { return (text, 0) }
+        var lines = text.components(separatedBy: "\n")
+        var count = 0
+        while let last = lines.last {
+            let line = last.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
+                lines.removeLast()
+            } else if line == inlineImageMarker
+                        || (line.hasPrefix("data:image/") && line.contains(";base64,") && !line.contains(" ")) {
+                lines.removeLast()
+                count += 1
+            } else {
                 break
             }
         }
-        guard !paths.isEmpty else { return (source, nil, nil) }
+        guard count > 0 else { return (text, 0) }
+        return (lines.joined(separator: "\n"), count)
+    }
 
-        var visibleContent = source
-        for match in matches.reversed() {
-            guard let range = Range(match.range, in: visibleContent) else { continue }
+    /// The pictures stored inside persisted row `rowId`, in order, as data
+    /// URLs (nil for one that is not a data URL). `rows` comes from a read
+    /// that keeps pictures inline.
+    static func inlineImageDataURLs(inRows rows: [Any], rowId: Int) -> [String?] {
+        for raw in rows {
+            guard let envelope = AnyCodable.from(raw).objectValue else { continue }
+            let nested = envelope["message"]?.objectValue ?? envelope["payload"]?.objectValue ?? [:]
+            let obj = envelope.merging(nested) { _, nestedValue in nestedValue }
+            guard durableRowId(in: obj) == rowId else { continue }
+            var urls: [String?] = []
+            for part in obj["content"]?.arrayValue ?? [] {
+                guard let object = part.objectValue, isInlineImagePart(object) else { continue }
+                urls.append(inlineImageDataURL(in: object))
+            }
+            return urls
+        }
+        return []
+    }
+
+    private static func inlineImageDataURL(in part: [String: AnyCodable]) -> String? {
+        let url = part["image_url"]?.objectValue?["url"]?.stringValue
+            ?? part["image_url"]?.stringValue
+            ?? part["url"]?.stringValue
+        if let url {
+            return url.lowercased().hasPrefix("data:image/") ? url : nil
+        }
+        // Anthropic `source` block, or an MCP image (`data` + `mimeType`).
+        let source = part["source"]?.objectValue
+        let media = source?["media_type"]?.stringValue ?? part["mimeType"]?.stringValue ?? part["media_type"]?.stringValue
+        let data = source?["data"]?.stringValue ?? part["data"]?.stringValue
+        guard let media, media.lowercased().hasPrefix("image/"), let data, !data.isEmpty else { return nil }
+        return "data:\(media);base64,\(data)"
+    }
+
+    /// Desktop persists uploaded images as `@image:/gateway/path/file.ext`
+    /// tokens in the user prompt, and the gateway notes a picture that came
+    /// in through a chat platform as `[Image attached at: /path]`. Both
+    /// become Conduit's regular attachments so resumed cross-client sessions
+    /// keep their previews.
+    ///
+    /// A persisted row (`rowId`) also ends with one `[image]` stand-in per
+    /// picture Hermes stored inside it (#652). Each pairs, in order, with
+    /// the picture the prompt names a file for, as its fallback when that
+    /// file is gone, or becomes an attachment of its own. The prompt is
+    /// retained, without the stand-ins, for replay/branch operations.
+    private static func splitUserImageReferences(
+        _ source: String,
+        messageId: String,
+        rowId: Int? = nil,
+        imageScope: TranscriptImageScope? = nil
+    ) -> (content: String, rawContent: String?, attachments: [Attachment]?) {
+        let markers = rowId == nil ? (text: source, count: 0) : trailingInlineImageMarkers(source)
+        let body = markers.text
+        let fullRange = NSRange(body.startIndex..<body.endIndex, in: body)
+
+        var references: [(range: NSRange, path: String)] = []
+        var foundHint = false
+        for (expression, isHint) in [(imageReferencePattern, false), (imageHintPattern, true)] {
+            guard let expression else { continue }
+            for match in expression.matches(in: body, range: fullRange) {
+                for group in 1..<match.numberOfRanges {
+                    let range = match.range(at: group)
+                    guard range.location != NSNotFound,
+                          let swiftRange = Range(range, in: body) else { continue }
+                    let path = String(body[swiftRange])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !path.isEmpty {
+                        references.append((match.range, path))
+                        foundHint = foundHint || isHint
+                    }
+                    break
+                }
+            }
+        }
+        guard !references.isEmpty || markers.count > 0 else { return (source, nil, nil) }
+        references.sort { $0.range.location < $1.range.location }
+
+        var visibleContent = body
+        for reference in references.reversed() {
+            guard let range = Range(reference.range, in: visibleContent) else { continue }
             visibleContent.removeSubrange(range)
         }
         visibleContent = visibleContent
@@ -3468,18 +4381,33 @@ enum MessageNormalizer {
                 options: .regularExpression
             )
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        if foundHint, visibleContent == defaultImageCaption {
+            visibleContent = ""
+        }
 
-        let attachments = paths.enumerated().map { index, path in
-            let name = URL(fileURLWithPath: path).lastPathComponent
+        let paths = references.map(\.path)
+        let attachments = (0..<max(paths.count, markers.count)).map { index -> Attachment in
+            let path = index < paths.count ? paths[index] : nil
+            let name = path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? ""
+            var inlineImage: InlineImageRef?
+            if index < markers.count, let rowId, let imageScope {
+                inlineImage = InlineImageRef(
+                    sessionId: imageScope.sessionId,
+                    profile: imageScope.profile,
+                    rowId: rowId,
+                    index: index
+                )
+            }
             return Attachment(
                 id: "\(messageId)-gateway-image-\(index)",
                 name: name.isEmpty ? AppLocalization.string("Attached image") : name,
-                uri: path,
-                mimeType: imageMimeType(for: path),
-                kind: .image
+                uri: path ?? "",
+                mimeType: path.flatMap { imageMimeType(for: $0) },
+                kind: .image,
+                inlineImage: inlineImage
             )
         }
-        return (visibleContent, source, attachments)
+        return (visibleContent, body, attachments)
     }
 
     private static func imageMimeType(for path: String) -> String? {
@@ -3575,6 +4503,10 @@ enum MessageNormalizer {
         case .object(let obj):
             if let text = obj["text"] { return extractContent(text) }
             if let content = obj["content"] { return extractContent(content) }
+            // A picture stored inside the message: the same stand-in Hermes
+            // writes for it with `inline_images=false`, never its base64 as
+            // JSON text.
+            if isInlineImagePart(obj) { return "\n" + inlineImageMarker }
             if let data = try? JSONSerialization.data(withJSONObject: obj.mapValues { $0.anyValue }, options: .prettyPrinted),
                let str = String(data: data, encoding: .utf8) {
                 return str
@@ -3670,6 +4602,17 @@ enum MessageNormalizer {
             if let n = candidate?.doubleValue { return String(n) }
         }
         return ""
+    }
+
+    /// A tool result's own timing, when Hermes sends one: seconds in
+    /// `duration` or `elapsed`, milliseconds in `duration_ms`.
+    private static func toolDuration(in obj: [String: AnyCodable]) -> TimeInterval? {
+        let meta = obj["metadata"]?.objectValue ?? obj["meta"]?.objectValue ?? [:]
+        for source in [obj, meta] {
+            if let ms = source["duration_ms"]?.doubleValue, ms >= 0 { return ms / 1_000 }
+            if let seconds = (source["duration"] ?? source["elapsed"])?.doubleValue, seconds >= 0 { return seconds }
+        }
+        return nil
     }
 
     private static func isDuplicateReasoning(_ reasoning: String, _ content: String) -> Bool {

@@ -132,7 +132,7 @@ struct KanbanWorkerLogScreen: View {
     /// not.
     static func renderTail(_ content: String) -> String {
         guard content.count > maxRenderedCharacters else { return content }
-        let marker = "[older output omitted]"
+        let marker = AppLocalization.string("[older output omitted]")
         // Reserve room for the marker up front so no path can exceed budget.
         // Clamped so even a hypothetical tiny budget cannot underflow.
         let suffix = String(content.suffix(max(0, maxRenderedCharacters - marker.count)))
@@ -163,11 +163,11 @@ struct KanbanWorkerLogScreen: View {
             if log == nil {
                 // Initial load failure: nothing is cached, so the full
                 // "unavailable" state applies.
-                errorMessage = error.localizedDescription
+                errorMessage = UserFacingError.message(for: error)
             } else {
                 // Refresh failure with cached content: keep the log visible
                 // and surface a small non-destructive banner instead.
-                refreshErrorMessage = error.localizedDescription
+                refreshErrorMessage = UserFacingError.message(for: error)
             }
         }
     }

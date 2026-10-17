@@ -15,20 +15,28 @@ struct ProfilePickerSheet: View {
         appState.profiles.isEmpty ? [appState.activeProfile] : appState.profiles
     }
 
+    private var photosFootnote: String {
+        appState.profilePhotosLiveOnHermes
+            ? AppLocalization.string("Sessions and settings follow the active profile. Photos are saved to Hermes, so bots and Hermes Desktop show them too.")
+            : AppLocalization.string("Sessions and settings follow the active profile. Photos stay only on this device.")
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
-                ConduitBackdrop()
+                // Shows the active profile's glow, so a picked color is seen
+                // as it is picked.
+                ConduitBackdrop(glowTint: appState.profileGlowTint(appState.activeProfile))
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         HStack(alignment: .top, spacing: 12) {
                             Text(isReordering
-                                 ? "Use the arrows to choose the order profiles appear throughout Conduit."
-                                 : "Sessions and settings follow the active profile. Photos stay only on this device.")
+                                 ? AppLocalization.string("Use the arrows to choose the order profiles appear throughout Conduit.")
+                                 : photosFootnote)
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                             Spacer(minLength: 0)
-                            Button(isReordering ? "Done" : "Reorder") {
+                            Button(isReordering ? AppLocalization.string("Done") : AppLocalization.string("Reorder")) {
                                 Haptics.selection()
                                 withAnimation(ConduitMotion.response) { isReordering.toggle() }
                             }
@@ -63,6 +71,9 @@ struct ProfilePickerSheet: View {
                     .padding(16)
                 }
             }
+            // Photos are Hermes pictures: re-read them, since Desktop or
+            // another device may have changed one.
+            .task { await appState.reloadBotRoster() }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
                 ConduitSheetHeader(title: AppLocalization.string("Profiles"), close: { dismiss() })
@@ -93,6 +104,7 @@ private struct ProfilePickerRow: View {
     @State private var showingImagePicker = false
     @State private var pickedImage: UIImage?
     @State private var saveError: String?
+    @State private var isSavingPhoto = false
     private var isCurrent: Bool { profile == appState.activeProfile }
     /// One rule for both selection paths: the text column's button and the
     /// card-sized selection surface behind the row must agree on when a
@@ -102,65 +114,11 @@ private struct ProfilePickerRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Group {
-                if isReordering {
-                    ProfileAvatarView(profile: profile, displayName: appState.profileDisplayName(profile), url: appState.profileAvatarURL(for: profile), size: 48)
-                } else {
-                    Button {
-                        Haptics.selection()
-                        showingImagePicker = true
-                    } label: {
-                ZStack(alignment: .bottomTrailing) {
-                    ProfileAvatarView(profile: profile, displayName: appState.profileDisplayName(profile), url: appState.profileAvatarURL(for: profile), size: 48)
-                    Image(systemName: "camera.fill").font(.caption2.weight(.bold)).foregroundStyle(Color.conduitBackgroundColor)
-                        .frame(width: 20, height: 20).background(Color.conduitAccent, in: Circle())
-                        .overlay { Circle().strokeBorder(.background, lineWidth: 1) }
-                }
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Choose photo for \(appState.profileDisplayName(profile))")
-                }
-            }
-
-            Button(action: select) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(appState.profileDisplayName(profile)).font(.headline).foregroundStyle(.primary)
-                    Text(profile == "default" ? AppLocalization.string("Primary Hermes profile") : AppLocalization.string("Hermes profile")).font(.caption).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-            }
-            .buttonStyle(.plain).disabled(!canSelect)
-
-            if isReordering {
-                VStack(spacing: 0) {
-                    Button(action: moveEarlier) {
-                        Image(systemName: "chevron.up").font(.caption.weight(.bold)).frame(width: 34, height: 22)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canMoveEarlier)
-                    .accessibilityLabel("Move \(appState.profileDisplayName(profile)) earlier")
-                    Button(action: moveLater) {
-                        Image(systemName: "chevron.down").font(.caption.weight(.bold)).frame(width: 34, height: 22)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canMoveLater)
-                    .accessibilityLabel("Move \(appState.profileDisplayName(profile)) later")
-                }
-            } else if isCurrent {
-                Label("Current", systemImage: "checkmark.circle.fill").font(.caption.weight(.semibold)).foregroundStyle(.conduitAccent)
-            } else {
-                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
-            }
-            if !isReordering, appState.profileAvatarURL(for: profile) != nil {
-                Button(role: .destructive) {
-                    Haptics.warning()
-                    appState.removeProfileAvatar(for: profile)
-                } label: {
-                    Image(systemName: "trash").font(.caption.weight(.semibold)).frame(width: 30, height: 30)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Remove photo for \(appState.profileDisplayName(profile))")
+        VStack(alignment: .leading, spacing: 6) {
+            profileLine
+            if !isReordering { glowLine }
+            if let saveError {
+                Text(saveError).font(.caption2).foregroundStyle(.red)
             }
         }
         .padding(12)
@@ -179,7 +137,8 @@ private struct ProfilePickerRow: View {
         // state; this surface is hidden to avoid a duplicate target. The
         // Kanban card's `.accessibilityElement(children: .combine)` treatment
         // is wrong here for the same reason the gesture is — this row carries
-        // two further controls that combining would fold into the card.
+        // further controls (photo, removal, glow color) that combining would
+        // fold into the card.
         .background {
             Button(action: select) {
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -191,22 +150,159 @@ private struct ProfilePickerRow: View {
             .accessibilityHidden(true)
         }
         .conduitGlassSurface(cornerRadius: 20, tint: isCurrent ? .conduitAccent.opacity(0.12) : .clear)
-        .overlay(alignment: .bottomLeading) {
-            if let saveError { Text(saveError).font(.caption2).foregroundStyle(.red).padding(.horizontal, 12).padding(.bottom, 4) }
-        }
         .sheet(isPresented: $showingImagePicker) {
             ImagePicker(image: $pickedImage)
         }
         .onChange(of: pickedImage) { _, newImage in
             guard let newImage else { return }
-            if let data = newImage.pngData() {
-                do {
-                    try appState.saveProfileAvatar(data, for: profile)
-                    saveError = nil
-                } catch { saveError = error.localizedDescription }
-            }
             pickedImage = nil
+            savePhoto(newImage)
         }
+    }
+
+    private var profileLine: some View {
+        HStack(spacing: 12) {
+            Group {
+                if isReordering {
+                    ProfileAvatarView(profile: profile, displayName: appState.profileDisplayName(profile), url: appState.profileAvatarURL(for: profile), size: 48)
+                } else {
+                    Button {
+                        Haptics.selection()
+                        showingImagePicker = true
+                    } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    ProfileAvatarView(profile: profile, displayName: appState.profileDisplayName(profile), url: appState.profileAvatarURL(for: profile), size: 48)
+                        .overlay {
+                            if isSavingPhoto {
+                                ProgressView().frame(width: 48, height: 48).background(.ultraThinMaterial, in: Circle())
+                            }
+                        }
+                    Image(systemName: "camera.fill").font(.caption2.weight(.bold)).foregroundStyle(Color.conduitBackgroundColor)
+                        .frame(width: 20, height: 20).background(Color.conduitAccent, in: Circle())
+                        .overlay { Circle().strokeBorder(.background, lineWidth: 1) }
+                }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSavingPhoto)
+                    .accessibilityLabel("Choose photo for \(appState.profileDisplayName(profile))")
+                    .accessibilityValue(isSavingPhoto ? AppLocalization.string("Saving…") : "")
+                }
+            }
+
+            Button(action: select) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(appState.profileDisplayName(profile)).font(.headline).foregroundStyle(.primary)
+                    Text(profile == "default" ? AppLocalization.string("Primary Hermes profile") : AppLocalization.string("Hermes profile")).font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).disabled(!canSelect)
+
+            if isReordering {
+                HStack(spacing: 2) {
+                    reorderArrow("chevron.up", enabled: canMoveEarlier, action: moveEarlier)
+                        .accessibilityLabel("Move \(appState.profileDisplayName(profile)) earlier")
+                    reorderArrow("chevron.down", enabled: canMoveLater, action: moveLater)
+                        .accessibilityLabel("Move \(appState.profileDisplayName(profile)) later")
+                }
+            } else if isCurrent {
+                Label("Current", systemImage: "checkmark.circle.fill").font(.caption.weight(.semibold)).foregroundStyle(.conduitAccent)
+            } else {
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            }
+            if !isReordering, appState.profileAvatarURL(for: profile) != nil {
+                Button(role: .destructive) {
+                    Haptics.warning()
+                    savePhoto(nil)
+                } label: {
+                    Image(systemName: "trash").font(.caption.weight(.semibold)).frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .disabled(isSavingPhoto)
+                .accessibilityLabel("Remove photo for \(appState.profileDisplayName(profile))")
+            }
+        }
+    }
+
+    /// The backdrop glow for this profile: drawn from its photo until a
+    /// color is picked here; Automatic goes back to the photo's color.
+    private var glowLine: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "sparkles")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(AppLocalization.string("Background glow"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Spacer(minLength: 0)
+            if appState.profileGlowPicks[profile] != nil {
+                Button(AppLocalization.string("Automatic")) {
+                    Haptics.selection()
+                    appState.setProfileGlowColor(nil, for: profile)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.conduitAccent)
+                .buttonStyle(.plain)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+                .accessibilityLabel("Automatic background glow for \(appState.profileDisplayName(profile))")
+            }
+            ColorPicker(selection: glowColor, supportsOpacity: false) {
+                Text(AppLocalization.string("Background glow"))
+            }
+            .labelsHidden()
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+            .accessibilityLabel("Background glow for \(appState.profileDisplayName(profile))")
+            .accessibilityIdentifier("profile-glow-color-\(profile)")
+        }
+        // Lines up with the name, past the 48 pt avatar.
+        .padding(.leading, 60)
+    }
+
+    private var glowColor: Binding<Color> {
+        Binding(
+            get: { appState.profileGlowTint(profile) ?? Color.conduitAccent },
+            set: { color in
+                guard let picked = ProfileGlowRGB(UIColor(color)) else { return }
+                appState.setProfileGlowColor(picked, for: profile)
+            }
+        )
+    }
+
+    /// Nil removes the photo.
+    private func savePhoto(_ image: UIImage?) {
+        isSavingPhoto = true
+        saveError = nil
+        Task {
+            saveError = await appState.setProfilePhoto(image, for: profile)
+            isSavingPhoto = false
+            if let saveError {
+                UIAccessibility.post(notification: .announcement, argument: saveError)
+            }
+        }
+    }
+
+    /// A reorder arrow with a full 44 pt tap target (#552). A `.plain` button
+    /// hit-tests only its label's drawn content, so without the content shape
+    /// just the small chevron glyph took taps; the space around it fell to the
+    /// disabled text button and the disabled selection surface behind the row,
+    /// which swallow taps, and the arrows looked dead on device.
+    private func reorderArrow(_ systemImage: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Color.conduitAccent)
+                .frame(width: 34, height: 34)
+                .background(Color.conduitAccent.opacity(0.12), in: Circle())
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
     }
 }
 
@@ -214,19 +310,24 @@ struct ProfileAvatarView: View {
     let profile: String
     let displayName: String
     let url: URL?
-    var size: CGFloat = 30
+    /// The one face size every identity mark in a transcript draws at; the
+    /// transcript's bot face sizes itself to it.
+    static let defaultSize: CGFloat = 30
+    var size: CGFloat = ProfileAvatarView.defaultSize
     private var initials: String {
         let letters = displayName.split(separator: " ").prefix(2).compactMap(\.first)
         return letters.isEmpty ? "H" : String(letters).uppercased()
     }
     var body: some View {
         Group {
-            if let url, let image = UIImage(contentsOfFile: url.path) {
+            if let url, let image = ProfileAvatarImageCache.image(at: url) {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
                     .frame(width: size, height: size)
                     .clipped()
+                    // Always beside the profile's name, or inside a labelled button.
+                    .accessibilityHidden(true)
             } else {
                 Text(initials).font(.system(size: max(10, size * 0.36), weight: .bold, design: .rounded))
                     .foregroundStyle(Color.conduitAccent).frame(width: size, height: size)

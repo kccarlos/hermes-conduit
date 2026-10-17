@@ -26,7 +26,6 @@ final class ProfilePickerUITests: XCTestCase {
     private enum Identity {
         static let connectedDashboard = "-CONDUIT_UI_TEST_CONNECTED_DASHBOARD"
         static let seededProfiles = "-CONDUIT_UI_TEST_PROFILES"
-        static let openSidebar = "Open sessions"
         static let workspace = "sidebar.workspace"
         static let pickerTitle = "Profiles"
         static let currentMarker = "Current"
@@ -137,6 +136,42 @@ final class ProfilePickerUITests: XCTestCase {
         )
     }
 
+    /// Reorder mode's arrows move a profile (#552). The tap lands near the top
+    /// edge of the arrow's frame, away from the chevron glyph: the arrows once
+    /// took taps only on the glyph itself, so a tap at the element's centre
+    /// passed while taps on device beside the glyph did nothing.
+    func testReorderArrowMovesTheProfileLater() throws {
+        let app = launchWithSeededProfiles()
+        openProfilePicker(app)
+        let reorder = app.buttons["Reorder"]
+        XCTAssertTrue(reorder.waitForExistence(timeout: 5), "Reorder control missing. Tree:\n\(app.debugDescription)")
+        reorder.tap()
+
+        // The top row's "later" arrow: whatever order a previous run saved,
+        // the first row can always move later.
+        let laterArrows = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@ AND label ENDSWITH %@", "Move ", " later")
+        )
+        XCTAssertTrue(laterArrows.firstMatch.waitForExistence(timeout: 5), "Reorder arrows missing. Tree:\n\(app.debugDescription)")
+        let topArrow = laterArrows.allElementsBoundByIndex.min { $0.frame.minY < $1.frame.minY }
+        let label = try XCTUnwrap(topArrow?.label)
+        let arrow = app.buttons[label]
+        XCTAssertTrue(arrow.isEnabled, "The top row must be able to move later. Tree:\n\(app.debugDescription)")
+        let before = arrow.frame.midY
+
+        arrow.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.12)).tap()
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, arrow.frame.midY <= before + 4 {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        XCTAssertGreaterThan(
+            arrow.frame.midY,
+            before + 4,
+            "Tapping the arrow must move \(label.dropFirst(5).dropLast(6)) one row down. Tree:\n\(app.debugDescription)"
+        )
+    }
+
     // MARK: - Helpers
 
     /// Launches the remembered-connected stub with the seeded profile roster.
@@ -151,12 +186,10 @@ final class ProfilePickerUITests: XCTestCase {
     }
 
     private func openProfilePicker(_ app: XCUIApplication) {
-        let drawer = app.buttons[Identity.openSidebar]
-        XCTAssertTrue(drawer.waitForExistence(timeout: 10), "Main UI did not appear. Tree:\n\(app.debugDescription)")
-        drawer.tap()
-
+        // The profile strip's selected chip opens the profile manager.
         let workspace = app.buttons[Identity.workspace]
-        XCTAssertTrue(workspace.waitForExistence(timeout: 10), "Sidebar did not appear. Tree:\n\(app.debugDescription)")
+        app.returnToV2Tabs(revealing: workspace)
+        XCTAssertTrue(workspace.waitForExistence(timeout: 10), "Profile strip did not appear. Tree:\n\(app.debugDescription)")
         workspace.tap()
 
         XCTAssertTrue(
@@ -193,12 +226,14 @@ final class ProfilePickerUITests: XCTestCase {
         return control
     }
 
-    /// The row's own selection button: the one whose label starts with the
-    /// profile's display name (the photo control above starts with "Choose").
-    /// It is disabled exactly while a switch is in flight.
+    /// The row's own selection button: the one labelled with the profile's
+    /// display name, alone or followed by its subtitle ("Work, Hermes profile";
+    /// the photo control above starts with "Choose"). The name must end at the
+    /// comma: a bare prefix match also hit the chat list's "Working" filter
+    /// chip behind the sheet. It is disabled exactly while a switch is in flight.
     private func selectButton(for displayName: String, in app: XCUIApplication) -> XCUIElement {
         let button = app.buttons.matching(
-            NSPredicate(format: "label BEGINSWITH %@", displayName)
+            NSPredicate(format: "label == %@ OR label BEGINSWITH %@", displayName, displayName + ",")
         ).firstMatch
         XCTAssertTrue(button.waitForExistence(timeout: 5), "Select button for \(displayName) missing. Tree:\n\(app.debugDescription)")
         return button

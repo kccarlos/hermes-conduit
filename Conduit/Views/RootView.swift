@@ -36,6 +36,13 @@ struct RootView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: appState.showLogin)
+        // A sign-in code link asks here, above both the sign-in screen and
+        // the app, so it survives the sign-in screen giving way to the app
+        // while a saved dashboard connects at launch.
+        .sheet(item: $appState.pendingConnectLink) { link in
+            ConnectLinkSheet(link: link)
+                .environmentObject(appState)
+        }
         .onChange(of: scenePhase) { _, newPhase in
             // Only the primary window drives the process-wide lifecycle: a
             // transient duplicate window's .background must never suspend a
@@ -51,6 +58,7 @@ struct RootView: View {
             // closes itself (the primary window releases its claim on close).
             if ConduitWindowClaimKeeper.claimPrimaryWindow() {
                 isPrimaryWindow = true
+                appState.startWakeListeningLifecycle()
             } else {
                 // Environment-scoped dismissal: close THIS duplicate window
                 // only. ID-scoped dismissal targets the WindowGroup and
@@ -69,10 +77,17 @@ struct RootView: View {
 struct MainView: View {
     @EnvironmentObject var appState: AppState
     @AppStorage("conduit.ipadPersistentSidebar") private var prefersPersistentSidebar = false
+    /// Conduit V2's tab shell (V2Shell.swift). Off brings back the drawer
+    /// shell, the fallback while V2 is on its branch.
+    @AppStorage(V2ShellPreference.key) private var useV2Shell = V2ShellPreference.defaultValue
     @AppStorage(VoiceScreenAwake.preferenceKey) private var keepScreenAwake = false
     @State private var availableWindowWidth: CGFloat = 0
     @State private var settingsPresentation: SettingsSnapshot?
     @State private var shouldPresentSettingsAfterSidebarDismissal = false
+    /// The page Settings opens at next, for an in-app settings link.
+    @State private var settingsOpensAt: ConduitAppLink.SettingsLink?
+    @State private var chatTitlePendingRename: SessionSummary?
+    @State private var chatTitlePendingDeletion: SessionSummary?
 
     private var sidebarPresentation: SidebarPresentation {
         SidebarLayoutPolicy.resolvePresentation(
@@ -82,33 +97,63 @@ struct MainView: View {
         )
     }
 
-    private var isPersistentSidebarActive: Bool { sidebarPresentation == .persistent }
+    private var isPersistentSidebarActive: Bool { !useV2Shell && sidebarPresentation == .persistent }
 
     var body: some View {
         sidebarLayoutContent
+        // Changes Hermes asked for or just made (AgentSettings.swift).
+        .overlay(alignment: .top) {
+            VStack(spacing: 0) {
+                AgentSettingsBanner(sync: appState.agentSettings)
+                // A newer Conduit plugin for this dashboard's host.
+                NotifierPluginUpdateBanner()
+                // Calendar changes Hermes asked for (AppState+PhoneSync.swift);
+                // a call's screen shows them over the call.
+                if !appState.isVoiceCallScreenPresented {
+                    PhoneChangeOverlay(engine: appState.phoneSync)
+                }
+            }
+        }
+        // Confirmations Hermes asks to present (PresentedScreens.swift); a
+        // call's screen shows its own over the call.
+        .overlay(alignment: .bottom) {
+            if !appState.isVoiceCallScreenPresented {
+                presentedConfirmOverlay(inCall: false)
+            }
+        }
         .sheet(isPresented: $appState.showModelPicker) {
             ModelPickerView()
                 .presentationDetents([.medium, .large])
                 .presentationBackground(.clear)
                 .presentationDragIndicator(.visible)
+                .environmentObject(appState)
         }
         .sheet(isPresented: $appState.showContextSheet) {
             ContextSheet()
                 .presentationDetents([.medium])
                 .presentationDragIndicator(.visible)
+                .environmentObject(appState)
         }
         .sheet(isPresented: $appState.showWorkspaceSheet) {
             WorkspaceBrowserSheet()
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+                .environmentObject(appState)
         }
         .sheet(isPresented: $appState.showGatewaySheet) {
             GatewayDiagnosticsSheet()
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+                .environmentObject(appState)
         }
         .sheet(isPresented: $appState.showAgentsSheet) {
             DelegateAgentsSheet()
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .environmentObject(appState)
+        }
+        .sheet(item: $appState.chatCallTranscript) { call in
+            VoiceChatCallTranscriptSheet(call: call)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -118,7 +163,8 @@ struct MainView: View {
             of: VoiceScreenAwake.holdsScreenAwake(
                 enabled: keepScreenAwake,
                 voiceSheetShown: appState.showVoiceSheet,
-                liveSheetShown: appState.showGeminiLiveSheet || appState.showGPTLiveSheet
+                liveSheetShown: appState.showGeminiLiveSheet || appState.showGPTLiveSheet || appState.showGrokLiveSheet
+                    || appState.showLocalLiveSheet
             ),
             initial: true
         ) { _, holds in
@@ -126,21 +172,62 @@ struct MainView: View {
         }
         // Sign-out swaps this view out with a sheet possibly still up.
         .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
-        .sheet(isPresented: $appState.showGeminiLiveSheet, onDismiss: appState.closeGeminiLiveConversation) {
+        // Swiping a running call away minimises it; End hangs up.
+        .sheet(isPresented: $appState.showGeminiLiveSheet, onDismiss: { appState.liveVoiceSheetDismissed(.geminiLive) }) {
             GeminiLiveVoiceSheet(
                 controller: appState.geminiLiveController,
+                jobs: appState.voiceBackgroundJobSupervisor,
+                appState: appState,
+                waitsToStart: appState.waitingCall?.engine == .geminiLive,
                 onClose: appState.closeGeminiLiveConversation,
                 onRetry: { Task { await appState.geminiLiveController.start() } }
             )
+            .safeAreaInset(edge: .top, spacing: 0) { callTopBanners }
+            .overlay(alignment: .bottom) { presentedConfirmOverlay(inCall: true) }
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
         }
-        .sheet(isPresented: $appState.showGPTLiveSheet, onDismiss: appState.closeGPTLiveConversation) {
+        .sheet(isPresented: $appState.showGrokLiveSheet, onDismiss: { appState.liveVoiceSheetDismissed(.grokLive) }) {
+            GeminiLiveVoiceSheet(
+                controller: appState.grokLiveController,
+                jobs: appState.voiceBackgroundJobSupervisor,
+                appState: appState,
+                engine: .grok,
+                waitsToStart: appState.waitingCall?.engine == .grokLive,
+                onClose: appState.closeGrokLiveConversation,
+                onRetry: { Task { await appState.grokLiveController.start() } }
+            )
+            .safeAreaInset(edge: .top, spacing: 0) { callTopBanners }
+            .overlay(alignment: .bottom) { presentedConfirmOverlay(inCall: true) }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $appState.showLocalLiveSheet, onDismiss: { appState.liveVoiceSheetDismissed(.localLive) }) {
+            GeminiLiveVoiceSheet(
+                controller: appState.localLiveController,
+                jobs: appState.voiceBackgroundJobSupervisor,
+                appState: appState,
+                engine: .local,
+                waitsToStart: appState.waitingCall?.engine == .localLive,
+                onClose: appState.closeLocalLiveConversation,
+                onRetry: { Task { await appState.localLiveController.start() } }
+            )
+            .safeAreaInset(edge: .top, spacing: 0) { callTopBanners }
+            .overlay(alignment: .bottom) { presentedConfirmOverlay(inCall: true) }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $appState.showGPTLiveSheet, onDismiss: { appState.liveVoiceSheetDismissed(.gptLive) }) {
             GPTLiveVoiceSheet(
                 controller: appState.gptLiveController,
+                jobs: appState.voiceBackgroundJobSupervisor,
+                appState: appState,
+                waitsToStart: appState.waitingCall?.engine == .gptLive,
                 onClose: appState.closeGPTLiveConversation,
                 onRetry: { Task { await appState.gptLiveController.start() } }
             )
+            .safeAreaInset(edge: .top, spacing: 0) { callTopBanners }
+            .overlay(alignment: .bottom) { presentedConfirmOverlay(inCall: true) }
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
         }
@@ -149,9 +236,13 @@ struct MainView: View {
                 controller: appState.voiceConversationController,
                 backgroundJobs: appState.voiceBackgroundJobSupervisor,
                 profile: appState.activeProfile,
+                chatTitle: appState.activeChatSessionSummary?.title,
+                appState: appState,
                 onClose: appState.closeVoiceConversation,
-                shouldAutoListen: { appState.consumeVoiceSheetAutoListen() }
+                shouldAutoListen: { appState.consumeVoiceSheetAutoListenIfPresenting() }
             )
+                .safeAreaInset(edge: .top, spacing: 0) { callTopBanners }
+                .overlay(alignment: .bottom) { presentedConfirmOverlay(inCall: true) }
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
@@ -180,7 +271,13 @@ struct MainView: View {
                 disconnect: { appState.disconnect() }
             )
                 .presentationDetents([.large])
+                .environmentObject(appState)
         }
+        // Settings can go with this screen (switching or adding a dashboard
+        // swaps in sign-in), and SwiftUI doesn't promise the sheet's
+        // onDismiss then. Its flag must not outlive it: it holds back the
+        // return surface while it claims a sheet is up.
+        .onDisappear { appState.isSettingsSheetPresented = false }
         .background(windowWidthReader)
         .onPreferenceChange(MainViewWindowWidthKey.self) { availableWindowWidth = $0 }
         .onChange(of: isPersistentSidebarActive) { _, persistentActive in
@@ -204,6 +301,58 @@ struct MainView: View {
         .onChange(of: appState.preferredReturnSurfaceRequest) { _, _ in
             presentPreferredReturnSurfaceIfNeeded()
         }
+        // A widget's New Chat or Talk asks Settings out of the way
+        // (revealChatForWidgetLaunch); the chat it opens must end up on top.
+        .onChange(of: appState.settingsDismissRequest) { _, _ in
+            // A drawer closing on its way to Settings doesn't open it either.
+            shouldPresentSettingsAfterSidebarDismissal = false
+            settingsOpensAt = nil
+            settingsPresentation = nil
+        }
+        .onChange(of: appState.settingsLinkRequest) { _, page in
+            // V2 opens the page in its Settings tab (V2Shell).
+            guard !useV2Shell, let page else { return }
+            appState.settingsLinkRequest = nil
+            openSettings(at: page)
+        }
+    }
+
+    /// An in-app settings link (`conduit://settings/calls` or `/voice`, in a reply):
+    /// Settings opens at that page. Settings already open stays as it is,
+    /// and so does a voice or other sheet: closing a voice sheet ends its
+    /// call, and only one sheet shows at a time.
+    private func openSettings(at page: ConduitAppLink.SettingsLink) {
+        guard settingsPresentation == nil else { return }
+        let otherSheetUp = appState.showModelPicker || appState.showContextSheet || appState.showWorkspaceSheet
+            || appState.showGatewaySheet || appState.showAgentsSheet || appState.showVoiceSheet
+            || appState.showGeminiLiveSheet || appState.showGrokLiveSheet || appState.showGPTLiveSheet
+            || appState.showLocalLiveSheet
+        guard !otherSheetUp else { return }
+        // A host without calls (or not heard from yet) has no such page:
+        // Settings opens at its start.
+        switch page {
+        case .calls: settingsOpensAt = appState.supportsHermesCalls ? page : nil
+        case .voice, .plugin: settingsOpensAt = page
+        case .health: settingsOpensAt = appState.showsHealthSettings ? page : nil
+        case .location: settingsOpensAt = appState.showsLocationSettings ? page : nil
+        case .phone: settingsOpensAt = appState.showsPhoneSettings ? page : nil
+        }
+        if appState.showSidebar, !isPersistentSidebarActive {
+            presentSettingsFromDrawer()
+        } else {
+            presentSettings()
+        }
+    }
+
+    /// Ask Hermes About Screen: the screenshot the voice will ask about.
+    private var voiceScreenshotBanner: some View {
+        ScreenQuestionVoiceBanner(
+            screenshot: appState.voiceScreenshot,
+            onDiscard: appState.discardVoiceScreenshot,
+            onNewChat: appState.canMoveVoiceScreenshotToNewChat
+                ? { Task { await appState.moveVoiceScreenshotToNewChat() } }
+                : nil
+        )
     }
 
     /// Routes the sidebar between its two presentations: the existing chat
@@ -212,7 +361,11 @@ struct MainView: View {
     /// column beside the chat.
     @ViewBuilder
     private var sidebarLayoutContent: some View {
-        if isPersistentSidebarActive {
+        if useV2Shell {
+            // V2 always opens on the Chats list (Eric, 2026-10-15); a chat
+            // a notification or widget opens is pushed over it.
+            V2Shell()
+        } else if isPersistentSidebarActive {
             HStack(spacing: 0) {
                 SidebarView(
                     onRequestSettings: presentSettingsFromPersistentSidebar,
@@ -240,7 +393,7 @@ struct MainView: View {
     private var chatNavigationContent: some View {
         NavigationStack {
             ZStack {
-                ConduitBackdrop()
+                ConduitBackdrop(drifts: true)
                 if appState.activeRoomSurface != nil {
                     // Keyed by room: another room starts with its own draft.
                     GroupChatView()
@@ -282,19 +435,10 @@ struct MainView: View {
                 // conversation behind it.
                 if appState.activeRoomSurface == nil {
                     ToolbarItem(placement: .principal) {
-                        Button {
-                            appState.requestChatScrollToTop()
-                        } label: {
-                            Text(appState.displayedChatTitle)
-                                .font(.subheadline.weight(.semibold))
-                                .lineLimit(1)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 7)
-                                .conduitGlassSurface(cornerRadius: 16, tint: .conduitAccent.opacity(0.06))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(appState.displayedChatTitle)
-                        .accessibilityHint("Scroll to top of conversation")
+                        ChatTitleControl(
+                            onRename: { chatTitlePendingRename = $0 },
+                            onDelete: { chatTitlePendingDeletion = $0 }
+                        )
                     }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {
@@ -312,7 +456,8 @@ struct MainView: View {
                                 .frame(width: 40, height: 40)
                         }
                         .conduitGlassControl(cornerRadius: 20, tint: .conduitAccent.opacity(0.10))
-                        .disabled(!appState.isConnected || appState.isChatRefreshing)
+                        // A New Chat on its way has nothing to refresh yet.
+                        .disabled(!appState.isConnected || appState.isChatRefreshing || appState.showsPendingNewChat)
                         .accessibilityLabel("Refresh conversation")
                     }
                 }
@@ -321,12 +466,34 @@ struct MainView: View {
                 }
             }
         }
+        // The chat title's menu needs host-owned rename and delete prompts,
+        // like the session list's rows.
+        .sheet(item: $chatTitlePendingRename) { session in
+            RenameSheet.conversation(session) { title in
+                Task { await appState.renameSession(session, to: title) }
+            }
+        }
+        .alert("Delete conversation?", isPresented: Binding(
+            get: { chatTitlePendingDeletion != nil },
+            set: { if !$0 { chatTitlePendingDeletion = nil } }
+        )) {
+            Button("Delete", role: .destructive) {
+                guard let session = chatTitlePendingDeletion else { return }
+                chatTitlePendingDeletion = nil
+                Task { await appState.deleteSession(session) }
+            }
+            Button("Cancel", role: .cancel) { chatTitlePendingDeletion = nil }
+        } message: {
+            Text("This permanently deletes the conversation and cannot be undone.")
+        }
         .sheet(isPresented: $appState.showSidebar, onDismiss: presentSettingsAfterSidebarDismissal) {
             SidebarView(onRequestSettings: presentSettingsFromDrawer)
+                .environmentObject(appState)
+                // No blanket .transaction animation here: forcing one onto
+                // every update made the drawer's first layout passes animate,
+                // so the glass header and tab bar visibly grew across the
+                // screen as the sheet opened. Rows animate via withAnimation.
                 .presentationDetents([.large])
-                .transaction { transaction in
-                    transaction.animation = .easeInOut(duration: 0.15)
-                }
         }
     }
 
@@ -338,15 +505,25 @@ struct MainView: View {
     /// Persistent mode keeps the sidebar visible, so Settings opens directly
     /// instead of waiting for the drawer sheet to dismiss first.
     private func presentSettingsFromPersistentSidebar() {
-        appState.isSettingsSheetPresented = true
-        settingsPresentation = appState.makeSettingsSnapshot()
+        presentSettings()
     }
 
     private func presentSettingsAfterSidebarDismissal() {
-        guard shouldPresentSettingsAfterSidebarDismissal else { return }
+        guard shouldPresentSettingsAfterSidebarDismissal else {
+            // A link's page belongs to the Settings it opened, not a later one.
+            settingsOpensAt = nil
+            return
+        }
         shouldPresentSettingsAfterSidebarDismissal = false
+        presentSettings()
+    }
+
+    private func presentSettings() {
         appState.isSettingsSheetPresented = true
-        settingsPresentation = appState.makeSettingsSnapshot()
+        var snapshot = appState.makeSettingsSnapshot()
+        snapshot.opensAt = settingsOpensAt
+        settingsOpensAt = nil
+        settingsPresentation = snapshot
     }
 
     /// Presents the sessions drawer for a preferred-return-surface request.
@@ -362,6 +539,31 @@ struct MainView: View {
             drawerPresented: appState.showSidebar
         ) else { return }
         appState.showSidebar = true
+    }
+
+    /// A call screen's top: the screenshot banner, then calendar changes
+    /// Hermes asked for (under the call screen, they were hidden until the
+    /// call was minimised).
+    private var callTopBanners: some View {
+        VStack(spacing: 0) {
+            voiceScreenshotBanner
+            PhoneChangeOverlay(engine: appState.phoneSync)
+                .environmentObject(appState)
+        }
+    }
+
+    /// The confirmation Hermes is waiting on, answered by tap.
+    private func presentedConfirmOverlay(inCall: Bool) -> some View {
+        PresentedConfirmOverlay(
+            sync: appState.presentedScreens,
+            inCall: inCall,
+            onAnswer: { prompt, outcome in
+                Task { await appState.answerPresentedConfirm(prompt, outcome: outcome, via: .tap) }
+            },
+            onEdit: inCall ? nil : { prompt in
+                Task { await appState.editPresentedConfirm(prompt) }
+            }
+        )
     }
 
     private var windowWidthReader: some View {
@@ -385,6 +587,81 @@ private struct MainViewWindowWidthKey: PreferenceKey {
     }
 }
 
+// MARK: - Chat Title
+
+/// The open chat's title. A tap scrolls to the top of the conversation;
+/// touch and hold opens the session list's actions for this chat (Rename,
+/// Pin, Move to Project, Archive, Delete), so it can be fixed without
+/// leaving the chat (#446), cron runs included (#512). A chat without a row of
+/// its own (a new chat, a Bot Chat, an offline copy) keeps the plain tap-only
+/// title.
+struct ChatTitleControl: View {
+    @EnvironmentObject var appState: AppState
+    let onRename: (SessionSummary) -> Void
+    let onDelete: (SessionSummary) -> Void
+    /// Plain title without its capsule, for a header that also carries a
+    /// subtitle line (V2's link back to a child session's parent).
+    var compact = false
+
+    var body: some View {
+        if let session = appState.activeChatSessionSummary {
+            Menu {
+                SessionActionMenuItems(
+                    session: session,
+                    onRename: { onRename(session) },
+                    onDelete: { onDelete(session) }
+                )
+            } label: {
+                titleLabel
+            } primaryAction: {
+                appState.requestChatScrollToTop()
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            // No large content viewer here: its touch and hold would take
+            // the one that opens the conversation actions.
+            .accessibilityLabel(appState.displayedChatTitle)
+            .accessibilityHint(AppLocalization.string("Scroll to top of conversation. Touch and hold for conversation actions."))
+            // VoiceOver may open the menu on activation; the scroll stays
+            // reachable as a named action.
+            .accessibilityAction(named: Text(AppLocalization.string("Scroll to top of conversation"))) {
+                appState.requestChatScrollToTop()
+            }
+        } else {
+            Button {
+                appState.requestChatScrollToTop()
+            } label: {
+                titleLabel
+            }
+            .buttonStyle(.plain)
+            .accessibilityShowsLargeContentViewer { Text(appState.displayedChatTitle) }
+            .accessibilityLabel(appState.displayedChatTitle)
+            .accessibilityHint(AppLocalization.string("Scroll to top of conversation"))
+        }
+    }
+
+    @ViewBuilder
+    private var titleLabel: some View {
+        if compact {
+            Text(appState.displayedChatTitle)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+        } else {
+            Text(appState.displayedChatTitle)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .conduitGlassSurface(cornerRadius: 16, tint: .conduitAccent.opacity(0.06))
+                // The navigation bar doesn't grow; touch and hold shows it large.
+                .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+        }
+    }
+}
+
 // MARK: - Connection Status
 
 struct ConnectionStatusIndicator: View {
@@ -394,7 +671,7 @@ struct ConnectionStatusIndicator: View {
     private var color: Color {
         if appState.isConnected {
             return .green
-        } else if appState.isConnecting {
+        } else if appState.isRecoveringConnection {
             return .orange
         } else {
             return .red
@@ -418,7 +695,9 @@ struct ConnectionStatusIndicator: View {
         }
         .conduitGlassControl(cornerRadius: 20, tint: color.opacity(0.10))
         .animation(ConduitMotion.response, value: appState.isConnected)
-        .accessibilityLabel(appState.isConnected ? AppLocalization.string("Gateway connected") : AppLocalization.string("Gateway disconnected"))
+        .accessibilityLabel(appState.isConnected
+            ? AppLocalization.string("Gateway connected")
+            : (appState.isRecoveringConnection ? AppLocalization.string("Reconnecting…") : AppLocalization.string("Gateway disconnected")))
     }
 }
 

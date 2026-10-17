@@ -34,7 +34,7 @@ struct ConduitProfileEntityQuery: EntityQuery {
             if !normalized.isEmpty, !result.contains(normalized) { result.append(normalized) }
         }
         return (unique.isEmpty ? ["default"] : unique).map {
-            ConduitProfileEntity(id: $0, displayName: $0 == "default" ? "Default" : $0)
+            ConduitProfileEntity(id: $0, displayName: $0 == "default" ? AppLocalization.string("Default") : $0)
         }
     }
 }
@@ -100,10 +100,33 @@ struct ConduitVoiceShortcuts: AppShortcutsProvider {
                 "Voice chat in \(.applicationName)",
                 "Start a voice conversation in \(.applicationName)",
                 "\(.applicationName) voice",
-                "Talk to \(.applicationName)"
+                "Talk to \(.applicationName)",
+                // Profile phrases ("Start Fam voice in Conduit"). Siri can
+                // only match profiles it has been told about, so AppState
+                // calls updateAppShortcutParameters() when the list changes.
+                "Start \(\.$profile) voice in \(.applicationName)",
+                "\(.applicationName) voice with \(\.$profile)"
             ],
             shortTitle: "Talk to Conduit",
             systemImageName: "mic.fill"
         )
+        // Siri asks what to send, and speaks Hermes's answer.
+        AppShortcut(
+            intent: SendToHermesIntent(),
+            phrases: [
+                "Ask Hermes in \(.applicationName)",
+                "Send to Hermes in \(.applicationName)"
+            ],
+            shortTitle: "Ask Hermes",
+            systemImageName: "paperplane.fill"
+        )
+    }
+}
+
+/// Tells Siri the profile list changed. Lives here so callers need not
+/// import AppIntents for the provider's static method.
+enum SiriProfileShortcuts {
+    static func refresh() {
+        ConduitVoiceShortcuts.updateAppShortcutParameters()
     }
 }
