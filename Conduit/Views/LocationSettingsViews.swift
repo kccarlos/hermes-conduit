@@ -84,6 +84,8 @@ struct LocationSettingsPage: View {
     @ObservedObject var controller: LocationSharingController
     @ObservedObject var engine: LocationSyncEngine
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    @ObservedObject private var notifications = PushNotificationService.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private enum PendingLayer: Identifiable {
         case talking, background
@@ -91,6 +93,9 @@ struct LocationSettingsPage: View {
     }
 
     @State private var consentFor: PendingLayer?
+    /// Whether the host offered sharing with its other profiles when the
+    /// consent sheet opened: what the sheet says is what turning on records.
+    @State private var consentOffersProfiles = false
     @State private var editingPlace: LocationPlaceDraft?
     @State private var showsWipe = false
     @State private var isWorking = false
@@ -109,6 +114,9 @@ struct LocationSettingsPage: View {
     private var settings: LocationSharingSettings { controller.settings }
     private var pluginServesLocation: Bool { appState.notifierPlugin.reports(LocationSharingController.capability) }
     private var canTurnOn: Bool { pluginServesLocation && appState.locationDestination != nil }
+    /// The host lets its other profiles paired with this iPhone read the
+    /// location (notifier #287).
+    private var pluginSharesProfiles: Bool { appState.notifierPlugin.reports(LocationSharingController.profilesCapability) }
 
     var body: some View {
         SettingsDetailContainer {
@@ -120,6 +128,7 @@ struct LocationSettingsPage: View {
                 if settings.isOn { pauseSection }
                 retentionSection
                 mapsSection
+                if settings.isOn, controller.binding != nil, pluginSharesProfiles || settings.otherProfiles { profilesSection }
             }
             // Kept while a mode is allowed, even on an older plugin, so it can
             // still be turned off.
@@ -133,6 +142,11 @@ struct LocationSettingsPage: View {
                 actionSection
             }
         }
+        // A layer turns on or off after the consent sheet or the host's
+        // answer, so the rows it reveals animate on the value, page-wide so
+        // the sections below move with them.
+        .animation(ConduitMotion.ease(reduceMotion: reduceMotion), value: settings.talking)
+        .animation(ConduitMotion.ease(reduceMotion: reduceMotion), value: settings.background)
         .navigationTitle("Location")
         .task {
             // Once per appearance, not on every body re-evaluation.
@@ -147,7 +161,11 @@ struct LocationSettingsPage: View {
             LocationSharingConsentSheet(
                 profile: appState.activeProfile,
                 host: hostLabel,
-                isHermesCloud: LocationSettingsText.isHermesCloud(host: hostLabel)
+                isHermesCloud: LocationSettingsText.isHermesCloud(host: hostLabel),
+                otherProfiles: !settings.isOn
+                    && LocationSharingController.otherProfiles(turningOn: settings, bound: controller.binding,
+                                                                to: appState.locationDestination,
+                                                                offered: consentOffersProfiles)
             ) {
                 consentFor = nil
                 turnOn(layer == .talking ? .talking : .background)
@@ -200,29 +218,29 @@ struct LocationSettingsPage: View {
     private var introSection: some View {
         ConduitSettingsSection(title: AppLocalization.string("Location for Hermes"), symbol: "location", tint: .blue) {
             Text("Let Hermes know where you are, so it can answer “what's near me”, work out travel times and remind you at places. Your location goes straight from this iPhone to your Hermes host, sealed end to end, and never through Conduit's notification relay.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
             Text("Maps lookups use Apple Maps on this iPhone, so Apple sees the start and destination.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
             if !pluginServesLocation, !settings.isOn {
                 Text("Update the Conduit plugin on your Hermes host to share your location.")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.orange)
             }
             if controller.configSaveFailed {
                 Text("Couldn't save your location settings on this iPhone. Your changes apply while Conduit is open, and Conduit tries saving them again when you next change something or open the app.")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.red)
             }
             if controller.configUnreadable {
                 Text("Conduit can't read its location settings right now. Unlock your iPhone and open this page again. If this keeps happening, start over: your saved places and choices are reset.")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.orange)
                 Button(AppLocalization.string("Start over"), role: .destructive) {
                     controller.startOver()
                 }
-                .font(.subheadline)
+                .scaledFont(.subheadline)
             } else if settings.isOn {
                 statusRows
             }
@@ -233,31 +251,31 @@ struct LocationSettingsPage: View {
     private var statusRows: some View {
         if let binding = controller.binding {
             Label(AppLocalization.string("Sharing with \(binding.profile) on \(binding.host)"), systemImage: "checkmark.shield")
-                .font(.subheadline)
+                .scaledFont(.subheadline)
         }
         if let until = settings.pausedUntil, settings.isPaused(at: Date()) {
             Text(until == .distantFuture
                 ? AppLocalization.string("Paused until you turn it back on.")
                 : AppLocalization.string("Paused until \(until.formatted(date: .abbreviated, time: .shortened))."))
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.orange)
         } else if let pause = engine.state.pause {
             Text(pause.message)
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.orange)
         } else if let last = engine.state.lastFixSent {
             Text(AppLocalization.string("Last sent \(last.formatted(.relative(presentation: .named)))"))
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         } else {
             Text("Nothing sent yet.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
         permissionRow
         if let error = engine.lastError, engine.state.pause == nil {
             Text(error)
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.red)
         }
     }
@@ -267,12 +285,12 @@ struct LocationSettingsPage: View {
         switch controller.authorization {
         case .denied, .restricted:
             Text("Location access is off for Conduit. Allow it in the Settings app.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.orange)
             openSettingsButton
         case .authorizedWhenInUse where settings.background:
             Text("Sharing in the background needs location access set to Always. Change it in the Settings app.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.orange)
             openSettingsButton
         default:
@@ -280,7 +298,7 @@ struct LocationSettingsPage: View {
         }
         if controller.approximate {
             Text("Precise Location is off for Conduit, so saved places and Precise aren't available. Area still works.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.orange)
         }
     }
@@ -290,7 +308,7 @@ struct LocationSettingsPage: View {
             guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
             UIApplication.shared.open(url)
         }
-        .font(.subheadline)
+        .scaledFont(.subheadline)
     }
 
     // MARK: Layers
@@ -304,7 +322,7 @@ struct LocationSettingsPage: View {
             // Conduit doesn't declare the `location` background mode (see
             // LocationSharingController.voiceCallStarted), so say so.
             Text("A position is sent when you send a message or start a voice call in Conduit, and as you move during a call while Conduit is open. Needs location access While Using the App.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
             precisionPicker(.talking, value: settings.talkingPrecision)
         }
@@ -316,14 +334,22 @@ struct LocationSettingsPage: View {
                 .disabled(isWorking || (!settings.background && !canTurnOn))
                 .accessibilityIdentifier("settings.location.background")
             Text("Arriving at and leaving your saved places, places where you spend time, and longer moves. Lets Hermes run place rules and check where you are when it needs to. Needs location access Always.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
             precisionPicker(.background, value: settings.backgroundPrecision)
             if settings.background,
                !appState.notifierPlugin.reports(LocationSharingController.locateCapability) || hostStatus?.locateAvailable == false {
                 Text("Hermes can't ask this iPhone for a fresh position yet; it uses the last one sent.")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
+            } else if settings.background, controller.authorization == .authorizedAlways, notifications.isEnabled,
+                      notifications.authorizationStatus != .denied,
+                      notifications.relayMeta?.supportsLocationPush == true, !notifications.relayHasLocationToken {
+                // The token goes with the next registration update; until
+                // the relay has it, a locate finds nothing to wake (#287).
+                Text("Hermes can't ask this iPhone for a fresh position: the notification relay doesn't have its location token yet. Keep notifications on and open Conduit again in a moment.")
+                    .scaledFont(.caption)
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -338,7 +364,7 @@ struct LocationSettingsPage: View {
                 Text("Detail").foregroundStyle(.secondary)
             }
             Text(LocationSettingsText.precisionSummary(value))
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
@@ -349,6 +375,7 @@ struct LocationSettingsPage: View {
             set: { on in
                 if on {
                     Haptics.selection()
+                    consentOffersProfiles = pluginSharesProfiles
                     consentFor = layer
                 } else {
                     Task { await controller.turnOff(layer == .talking ? .talking : .background); await loadFromHost() }
@@ -373,7 +400,7 @@ struct LocationSettingsPage: View {
                             Text(verbatim: place.name)
                                 .foregroundStyle(.primary)
                             Text(LocationSettingsText.kindTitle(place.kind) + " · " + LocationSettingsText.radius(place.radius))
-                                .font(.caption)
+                                .scaledFont(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
@@ -396,7 +423,7 @@ struct LocationSettingsPage: View {
             .disabled(controller.places.count >= LocationSharingController.maxPlaces)
             .accessibilityIdentifier("settings.location.add-place")
             Text("Up to 20. Where they are stays on this iPhone: Hermes gets only their names, and at a private place only “at a private place”. Saved places need background sharing to report arriving and leaving.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
@@ -422,7 +449,7 @@ struct LocationSettingsPage: View {
                 .accessibilityIdentifier("settings.location.pause")
             }
             Text("While paused nothing is sent, Hermes is told sharing is paused, and place rules don't run.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
@@ -455,7 +482,7 @@ struct LocationSettingsPage: View {
                 Text("Keep places visited for").foregroundStyle(.secondary)
             }
             Text("How long the host keeps the places you've been. Your latest position is always kept until you delete it; there is never a record of every position.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
@@ -474,7 +501,24 @@ struct LocationSettingsPage: View {
             .disabled(isWorking)
             .accessibilityIdentifier("settings.location.maps-on-iphone")
             Text("Hermes looks up places and routes only through this iPhone, never from your Hermes server. Lookups don't work while the iPhone can't be reached.")
-                .font(.caption)
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var profilesSection: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Other profiles"), symbol: "person.2", tint: .conduitAccent) {
+            Toggle("Share with this host's other profiles", isOn: Binding(
+                get: { settings.otherProfiles },
+                set: { on in
+                    Haptics.selection()
+                    Task { await controller.setOtherProfiles(on) }
+                }
+            ))
+            .disabled(isWorking)
+            .accessibilityIdentifier("settings.location.other-profiles")
+            Text(AppLocalization.string("When this is on, other Hermes profiles on \(hostLabel) that are paired with this iPhone can read your location and ask for a fresh one. Place rules stay with \(controller.binding?.profile ?? appState.activeProfile)."))
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
@@ -493,11 +537,11 @@ struct LocationSettingsPage: View {
             }
             if controller.isPaused() {
                 Text("Nothing reads your location by voice while sharing is paused.")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.orange)
             }
             Text("Let a live voice call read your location when you ask about it, straight from your Hermes host: the saved place you're at, your area and distances to your saved places, never coordinates. What it reads goes to the company that runs that voice mode, under its terms. Each read is listed under When Hermes read your location. Classic voice is Hermes itself and needs nothing here.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
@@ -526,34 +570,34 @@ struct LocationSettingsPage: View {
         ConduitSettingsSection(title: AppLocalization.string("When Hermes read your location"), symbol: "eye", tint: .conduitAccent) {
             if let hostStatus, !hostUnreachable {
                 Text(AppLocalization.string("Reads in the last 24 hours: \(String(hostStatus.readsToday))"))
-                    .font(.subheadline)
+                    .scaledFont(.subheadline)
             }
             if hostUnreachable {
                 // Shown over older rows too, so they don't pass as current.
                 Text(AppLocalization.string("Couldn't reach the host."))
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             }
             if displayedReads.isEmpty {
                 if !hostUnreachable {
                     Text("Hermes hasn't read your location yet.")
-                        .font(.caption)
+                        .scaledFont(.caption)
                         .foregroundStyle(.secondary)
                 }
             } else {
                 ForEach(displayedReads.prefix(50)) { read in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(LocationSettingsText.readAction(read.action))
-                            .font(.subheadline)
+                            .scaledFont(.subheadline)
                         Text(readDetail(read))
-                            .font(.caption)
+                            .scaledFont(.caption)
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             Text("Every time Hermes reads your location it's listed here, for 30 days. The list never holds the location itself.")
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
@@ -588,16 +632,16 @@ struct LocationSettingsPage: View {
         ConduitSettingsSection(title: AppLocalization.string("Place rules"), symbol: "list.bullet.rectangle", tint: .conduitAccent) {
             if rules.isEmpty {
                 Text("No place rules. Teach Hermes what to do at your places, for example: “When I get to the gym, remind me to log my workout.”")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(rules) { rule in
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(verbatim: rule.what)
-                                .font(.subheadline)
+                                .scaledFont(.subheadline)
                             Text(ruleDetail(rule))
-                                .font(.caption)
+                                .scaledFont(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
@@ -655,7 +699,7 @@ struct LocationSettingsPage: View {
             .accessibilityIdentifier("settings.location.wipe")
             if let errorMessage {
                 Text(errorMessage)
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -695,18 +739,25 @@ struct LocationSettingsPage: View {
         errorMessage = nil
         Task {
             do {
-                try await controller.turnOn(layer, destination: destination)
+                try await controller.turnOn(layer, destination: destination, otherProfiles: consentOffersProfiles)
                 // A first turn-on was just bound: store the host pass now, so
                 // a locate or background send doesn't wait for a reconnect.
                 await appState.locationHostConnected()
                 Haptics.success()
                 await loadFromHost()
             } catch {
-                errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                errorMessage = Self.bannerMessage(for: error)
                 Haptics.error()
             }
             isWorking = false
         }
+    }
+
+    /// The banner under the settings when turning sharing on, deleting a
+    /// rule or deleting location data fails: what happened and what to do,
+    /// never NSURLErrorDomain text.
+    static func bannerMessage(for error: Error) -> String {
+        UserFacingError.message(for: error)
     }
 
     private func deleteRule(_ rule: LocationRule) {
@@ -714,12 +765,15 @@ struct LocationSettingsPage: View {
         deletingRules.insert(rule.id)
         Task {
             defer { deletingRules.remove(rule.id) }
-            guard let request = await controller.hostRequest() else { return }
+            guard let request = await controller.hostRequest() else {
+                errorMessage = LocationSharingError.noDashboard.errorDescription
+                return
+            }
             do {
                 try await controller.engine.deleteRule(rule.id, request: request)
                 rules.removeAll { $0.id == rule.id }
             } catch {
-                errorMessage = LocationSyncEngine.describe(error)
+                errorMessage = Self.bannerMessage(for: error)
             }
         }
     }
@@ -735,7 +789,7 @@ struct LocationSettingsPage: View {
                 Haptics.success()
                 await loadFromHost()
             } catch {
-                errorMessage = LocationSyncEngine.describe(error)
+                errorMessage = Self.bannerMessage(for: error)
             }
             isWorking = false
         }
@@ -748,6 +802,9 @@ struct LocationSharingConsentSheet: View {
     let profile: String
     let host: String
     let isHermesCloud: Bool
+    /// Turning on also shares with the host's other profiles paired with
+    /// this iPhone.
+    let otherProfiles: Bool
     let accept: () -> Void
     let cancel: () -> Void
 
@@ -760,8 +817,11 @@ struct LocationSharingConsentSheet: View {
                         .foregroundStyle(.blue)
                         .accessibilityHidden(true)
                     Text("Share your location with Hermes?")
-                        .font(.title2.weight(.semibold))
+                        .scaledFont(.title2.weight(.semibold))
                     Label(AppLocalization.string("Conduit sends your location, at the detail you choose, to the \(profile) profile on \(host), sealed end to end. It never goes through Conduit's notification relay, and Conduit's developer can't see it."), systemImage: "lock.shield")
+                    if otherProfiles {
+                        Label(AppLocalization.string("Other Hermes profiles on \(host) that are paired with this iPhone can read it too. You can turn this off in Settings > Location."), systemImage: "person.2")
+                    }
                     Label("Your iPhone's time zone is always sent too, at every level of detail, so Hermes knows your local time. At Area and Precise, so are distances to your saved places, except private ones.", systemImage: "clock")
                     Label("Your agent reads it when you ask, or when a task or place rule needs it. Whatever it reads goes to the AI model provider your Hermes uses, under that provider's terms.", systemImage: "sparkles")
                     if isHermesCloud {
@@ -773,7 +833,7 @@ struct LocationSharingConsentSheet: View {
                     Label("Every read is listed in Settings > Location. You can pause sharing, turn it off and delete what was sent at any time.", systemImage: "eye")
                     Label("Your location is never used for advertising and isn't stored in iCloud by Conduit.", systemImage: "hand.raised")
                 }
-                .font(.subheadline)
+                .scaledFont(.subheadline)
                 .padding(20)
             }
             .safeAreaInset(edge: .bottom) {
@@ -861,29 +921,35 @@ struct LocationPlaceEditor: View {
         self.cancel = cancel
         self.locate = locate
         if let coordinate = draft.coordinate {
-            _camera = State(initialValue: .region(MKCoordinateRegion(center: coordinate, latitudinalMeters: 1_200, longitudinalMeters: 1_200)))
+            _camera = State(initialValue: .region(MKCoordinateRegion(center: MapDatum.toMap(coordinate), latitudinalMeters: 1_200, longitudinalMeters: 1_200)))
         }
     }
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
+            // Settings' own page, as Location settings that opens it (Eric 2026-11-05).
+            SettingsDetailContainer {
+                ConduitSettingsSection(title: AppLocalization.string("Name"), symbol: "mappin.and.ellipse", tint: .red) {
                     TextField("Name", text: $draft.name)
+                        .textFieldStyle(.roundedBorder)
                         .onChange(of: draft.name) { _, name in
                             if name.count > LocationSavedPlace.maxNameLength { draft.name = String(name.prefix(LocationSavedPlace.maxNameLength)) }
                         }
-                    Picker("Kind", selection: $draft.kind) {
-                        ForEach(LocationPlaceKind.allCases) { kind in
-                            Text(LocationSettingsText.kindTitle(kind)).tag(kind)
-                        }
+                    ConduitMenuPicker(
+                        value: draft.kind,
+                        choices: LocationPlaceKind.allCases.map { (id: $0, title: LocationSettingsText.kindTitle($0)) },
+                        onSelect: { draft.kind = $0 }
+                    ) {
+                        Text("Kind").foregroundStyle(.secondary)
                     }
                     Toggle("Private", isOn: $draft.isPrivate)
-                } footer: {
+                        .tint(.conduitAccent)
                     Text("At a private place Hermes hears only “at a private place”, never its name or where it is, and your visits there aren't kept.")
+                        .settingsCaption()
                 }
-                Section {
-                    if let coordinate = draft.coordinate {
+                ConduitSettingsSection(title: AppLocalization.string("Where"), symbol: "map", tint: .blue) {
+                    if let coordinate = draft.coordinate.map(MapDatum.toMap) {
+                        // The draft is WGS-84 like the fixes; the map draws it where Apple Maps puts it.
                         Map(position: $camera) {
                             MapCircle(center: coordinate, radius: draft.radius)
                                 .foregroundStyle(Color.blue.opacity(0.2))
@@ -891,7 +957,7 @@ struct LocationPlaceEditor: View {
                             Marker(draft.name, coordinate: coordinate)
                         }
                         .frame(height: 180)
-                        .listRowInsets(EdgeInsets())
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         // The caption below says the radius; the map adds nothing for VoiceOver.
                         .accessibilityHidden(true)
                     }
@@ -901,9 +967,11 @@ struct LocationPlaceEditor: View {
                         } label: {
                             Label(isLocating ? AppLocalization.string("Finding you…") : AppLocalization.string("Use my current location"), systemImage: "location.fill")
                         }
+                        .buttonStyle(.settings)
                         .disabled(isLocating)
                     }
                     TextField("Search for an address", text: $query)
+                        .textFieldStyle(.roundedBorder)
                         .textInputAutocapitalization(.words)
                         .onSubmit(search)
                     if isSearching { ProgressView() }
@@ -914,31 +982,34 @@ struct LocationPlaceEditor: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(verbatim: item.name ?? "")
                                 Text(verbatim: item.placemark.title ?? "")
-                                    .font(.caption)
+                                    .scaledFont(.caption)
                                     .foregroundStyle(.secondary)
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                     }
                     if let message {
-                        Text(message).font(.caption).foregroundStyle(.secondary)
+                        Text(message).scaledFont(.caption).foregroundStyle(.secondary)
                     }
-                } header: {
-                    Text("Where")
                 }
-                Section {
+                ConduitSettingsSection(title: AppLocalization.string("Radius"), symbol: "circle.dashed", tint: .blue) {
                     Slider(value: $draft.radius, in: LocationSavedPlace.minRadius...LocationSavedPlace.maxRadius, step: 25)
                         .accessibilityLabel(Text("Radius"))
                         .accessibilityValue(Text(verbatim: LocationSettingsText.radius(draft.radius)))
                     Text(AppLocalization.string("Radius: \(LocationSettingsText.radius(draft.radius))"))
-                        .font(.caption)
+                        .scaledFont(.caption)
                         .foregroundStyle(.secondary)
-                } footer: {
                     Text("Arriving and leaving count once you cross this circle. A larger circle notices you sooner but can miss short visits.")
+                        .settingsCaption()
                 }
                 if !draft.isNew {
-                    Section {
-                        Button("Delete place", role: .destructive) { delete(draft.id) }
-                    }
+                    Button("Delete place", role: .destructive) { delete(draft.id) }
+                        .scaledFont(.subheadline.weight(.semibold))
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .settingsCard()
                 }
             }
             .navigationTitle(draft.isNew ? AppLocalization.string("Add a place") : AppLocalization.string("Edit place"))
@@ -959,7 +1030,7 @@ struct LocationPlaceEditor: View {
 
     private func setCoordinate(_ coordinate: CLLocationCoordinate2D) {
         draft.coordinate = coordinate
-        camera = .region(MKCoordinateRegion(center: coordinate, latitudinalMeters: 1_200, longitudinalMeters: 1_200))
+        camera = .region(MKCoordinateRegion(center: MapDatum.toMap(coordinate), latitudinalMeters: 1_200, longitudinalMeters: 1_200))
     }
 
     private func useCurrentLocation() {
@@ -988,14 +1059,15 @@ struct LocationPlaceEditor: View {
                 if results.isEmpty { message = AppLocalization.string("No matches.") }
             } catch {
                 results = []
-                message = AppLocalization.string("No matches.")
+                message = AppLocalization.string("Couldn't search Apple Maps. Try again.")
             }
             isSearching = false
         }
     }
 
     private func choose(_ item: MKMapItem) {
-        setCoordinate(item.placemark.coordinate)
+        // In mainland China Apple Maps answers in GCJ-02; the place is kept in WGS-84 like the fixes (#1122).
+        setCoordinate(MapDatum.fromMap(item.placemark.coordinate))
         if draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let name = item.name {
             draft.name = String(name.prefix(LocationSavedPlace.maxNameLength))
         }

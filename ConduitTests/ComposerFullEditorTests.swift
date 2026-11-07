@@ -17,6 +17,34 @@ final class ComposerFullEditorTests: XCTestCase {
         XCTAssertFalse(ComposerBar.hidesMinimisedCallBar(restsWhenIdle: false, isFocused: true), "the classic layout always shows it")
     }
 
+    /// #1527: on a Mac or an iPad with a hardware keyboard the field keeps focus
+    /// after a send; the bar comes back until words are typed again.
+    func testFocusKeptAfterASendShowsTheMinimisedCallBarUntilTyping() {
+        XCTAssertFalse(ComposerBar.hidesMinimisedCallBar(restsWhenIdle: true, isFocused: true, hasText: false, keepsFocusAfterSend: true))
+        XCTAssertTrue(ComposerBar.hidesMinimisedCallBar(restsWhenIdle: true, isFocused: true, hasText: true, keepsFocusAfterSend: true))
+        XCTAssertTrue(ComposerBar.hidesMinimisedCallBar(restsWhenIdle: true, isFocused: true, hasText: false, keepsFocusAfterSend: false), "the on-screen keyboard still hides it")
+    }
+
+    /// #762: V2 keeps Stop in the resting bar, so the big voice button
+    /// beside it stays; steering still needs the controls row.
+    func testStopAloneKeepsTheV2ComposerResting() {
+        XCTAssertFalse(ComposerBar.turnControlExpandsComposer(action: .stop, restsWhenIdle: true))
+        XCTAssertTrue(ComposerBar.turnControlExpandsComposer(action: .stop, restsWhenIdle: false), "the classic layout keeps Stop in its row")
+        XCTAssertTrue(ComposerBar.turnControlExpandsComposer(action: .steer, restsWhenIdle: true))
+        XCTAssertTrue(ComposerBar.turnControlExpandsComposer(action: .interrupt, restsWhenIdle: true))
+        XCTAssertTrue(ComposerBar.turnControlExpandsComposer(action: .queue, restsWhenIdle: true))
+        XCTAssertFalse(ComposerBar.turnControlExpandsComposer(action: .unavailable, restsWhenIdle: true))
+        XCTAssertEqual(ComposerBar.trailingControl(action: .stop, showsVoiceButton: true), .action, "the resting bar's slot holds Stop, not voice")
+    }
+
+    /// #762: a live call can start while Hermes replies; classic voice waits.
+    func testOnlyClassicVoiceWaitsForARunningReply() {
+        XCTAssertFalse(AppState.voiceWaitsForRunningTurn(isBusy: true, liveEngine: .geminiLive))
+        XCTAssertFalse(AppState.voiceWaitsForRunningTurn(isBusy: true, liveEngine: .localLive))
+        XCTAssertTrue(AppState.voiceWaitsForRunningTurn(isBusy: true, liveEngine: nil))
+        XCTAssertFalse(AppState.voiceWaitsForRunningTurn(isBusy: false, liveEngine: nil))
+    }
+
     func testShortDraftsHaveNoExpandButton() {
         XCTAssertFalse(ComposerBar.showsFullEditorButton(measuredHeight: ComposerPasteTextView.minimumHeight))
         XCTAssertFalse(ComposerBar.showsFullEditorButton(measuredHeight: 60), "two lines read fine in place")
@@ -25,6 +53,13 @@ final class ComposerFullEditorTests: XCTestCase {
     func testLongDraftsOfferTheFullEditor() {
         XCTAssertTrue(ComposerBar.showsFullEditorButton(measuredHeight: ComposerBar.fullEditorThreshold))
         XCTAssertTrue(ComposerBar.showsFullEditorButton(measuredHeight: ComposerPasteTextView.maximumHeight))
+        // A wide Mac column grows the text: a single line there waits too.
+        let grown = ComposerPasteTextView.minimumHeight(for: ComposerPasteTextView.bodyFont(in: .large, from: ColumnText(base: .large, scale: 2.2)))
+        XCTAssertFalse(ComposerBar.showsFullEditorButton(measuredHeight: grown, restingHeight: grown))
+        XCTAssertTrue(ComposerBar.showsFullEditorButton(measuredHeight: grown + 20, restingHeight: grown))
+        // Before it measures, the field already stands one grown line tall.
+        XCTAssertEqual(ComposerBar.textFrameHeight(measured: ComposerPasteTextView.minimumHeight, resting: grown), grown)
+        XCTAssertEqual(ComposerBar.textFrameHeight(measured: grown + 30, resting: grown), grown + 30)
     }
 
     func testTheFullEditorTellsDictationFromTyping() {

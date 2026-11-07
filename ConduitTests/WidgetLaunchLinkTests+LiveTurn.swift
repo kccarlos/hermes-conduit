@@ -35,6 +35,15 @@ extension WidgetLaunchLinkTests {
         XCTAssertNil(LiveTurnProgress.applying(.messageDelta(sessionId: "s", text: "lo"), to: writing))
     }
 
+    func testLiveTurnInterimCommentaryIsWriting() throws {
+        // On the Codex runtime commentary arrives only as message.interim.
+        let writing = try XCTUnwrap(LiveTurnProgress.applying(
+            .messageInterim(sessionId: "s", text: "Looking at the logs", alreadyStreamed: false),
+            to: State(phase: .thinking)
+        ))
+        XCTAssertEqual(writing.turnPhase, .writing)
+    }
+
     func testLiveTurnContextIsAWholeBoundedPercent() throws {
         let state = try XCTUnwrap(LiveTurnProgress.applying(.contextUpdate(sessionId: "s", percent: 41.6, used: 41_600, max: 100_000), to: State(phase: .thinking)))
         XCTAssertEqual(state.context, 42)
@@ -119,5 +128,198 @@ extension WidgetLaunchLinkTests {
         XCTAssertEqual(older.chatTitle, "Chat")
         XCTAssertNil(older.profileName)
         XCTAssertNil(older.glowColor)
+    }
+
+    /// A turn that ended while Conduit was closed (or in a chat not on
+    /// screen, with no relay to end it) may be over once the live registry
+    /// shows its chat isn't running, but only on its own dashboard and
+    /// profile, and not in the first moments of the turn.
+    func testLiveTurnEndsWhenTheRegistryNoLongerRunsItsChat() throws {
+        let start = now
+        let link = try XCTUnwrap(URL(string: "conduit://session/rt?profile=default"))
+        let attributes = HermesTurnAttributes(chatTitle: "Chat", startedAt: start, language: "system", link: link, sessionIDs: ["rt", "stored"], dashboardID: "D1")
+        let running = HermesTurnAttributes.ContentState(phase: .thinking)
+        func verdict(_ live: Set<String>, profile: String = "default", dashboard: String? = "D1", after seconds: TimeInterval = 120, state: HermesTurnAttributes.ContentState? = nil, attributes a: HermesTurnAttributes? = nil) -> LiveTurnProgress.RegistryVerdict {
+            LiveTurnProgress.registryVerdict(attributes: a ?? attributes, state: state ?? running, liveSessionIDs: live, profile: profile, dashboardID: dashboard, now: start.addingTimeInterval(seconds), grace: LiveTurnActivities.registryGrace)
+        }
+        XCTAssertEqual(verdict([]), .absent, "Its chat isn't running any more")
+        XCTAssertEqual(verdict(["other"]), .absent)
+        XCTAssertEqual(verdict(["stored"]), .running, "Still running under its stored id")
+        XCTAssertEqual(verdict(["rt"], after: 10), .running)
+        XCTAssertEqual(verdict([], after: 10), .unknown, "A snapshot right after the prompt can predate the turn")
+        XCTAssertEqual(verdict([], profile: "work"), .unknown, "Another profile's snapshot says nothing about it")
+        XCTAssertEqual(verdict([], dashboard: "D2"), .unknown, "Another dashboard's snapshot says nothing about it")
+        XCTAssertEqual(verdict([], state: LiveTurnProgress.finished(running, .done, now: start)), .unknown, "Already ended")
+
+        var older = attributes
+        older.dashboardID = nil
+        XCTAssertEqual(verdict([], dashboard: "D2", attributes: older), .absent, "An older build's activity goes by its chat ids")
+
+        let rows = [
+            LiveSessionStatus(runtimeSessionId: "a", storedSessionId: "a-stored", status: "working"),
+            LiveSessionStatus(runtimeSessionId: "b", storedSessionId: "", status: "waiting"),
+            LiveSessionStatus(runtimeSessionId: "c", storedSessionId: "c-stored", status: "starting"),
+            LiveSessionStatus(runtimeSessionId: "d", storedSessionId: "d-stored", status: "idle"),
+        ]
+        XCTAssertEqual(AppState.liveTurnSessionIDs(rows), ["a", "a-stored", "b", "c", "c-stored"], "Idle sessions have no turn")
+
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(attributes)) as? [String: Any])
+        object["dashboardID"] = nil
+        XCTAssertNil(try JSONDecoder().decode(HermesTurnAttributes.self, from: JSONSerialization.data(withJSONObject: object)).dashboardID, "An older build's activity decodes")
+    }
+
+    /// One snapshot without the chat (a gateway restarting can serve an
+    /// empty registry) doesn't end the turn: the absence has to last from
+    /// one snapshot to another `registryAbsenceSpan` later, with none in
+    /// between that runs it.
+    func testLiveTurnEndsOnlyWhenItsChatStaysOutOfTheRegistry() {
+        let span = LiveTurnActivities.registryAbsenceSpan
+        func at(_ seconds: TimeInterval) -> Date { now.addingTimeInterval(seconds) }
+
+        var absences = LiveTurnProgress.RegistryAbsences()
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(0), span: span), .started, "Absent once: still running, a recheck is due")
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(span), span: span), .over, "Absent twice: over")
+
+        absences = LiveTurnProgress.RegistryAbsences()
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(0), span: span), .started)
+        XCTAssertEqual(absences.record(.running, for: "a", at: at(4), span: span), .none)
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(span), span: span), .started, "Absent, running, absent: still running")
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(2 * span), span: span), .over)
+
+        absences = LiveTurnProgress.RegistryAbsences()
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(0), span: span), .started)
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(1), span: span), .none, "Reads at the same moment count once")
+        XCTAssertEqual(absences.record(.unknown, for: "a", at: at(4), span: span), .none)
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(span), span: span), .over, "Another profile's snapshot in between changes nothing")
+        XCTAssertEqual(absences.record(.absent, for: "b", at: at(span), span: span), .started, "Counted per activity")
+
+        absences.forget("b")
+        XCTAssertEqual(absences.record(.absent, for: "b", at: at(3 * span), span: span), .started, "An ended activity's absence is gone")
+
+        absences = LiveTurnProgress.RegistryAbsences()
+        let long = span * LiveTurnProgress.RegistryAbsences.staleSpans + 1
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(0), span: span), .started)
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(long), span: span), .started, "An absence seen long ago starts over")
+        XCTAssertEqual(absences.record(.absent, for: "a", at: at(long + span), span: span), .over)
+    }
+
+    /// Which turns ending a dashboard's activities ends: its own and an
+    /// older build's, except, when asked, those whose token the relay
+    /// installation still in use took.
+    func testEndingADashboardsTurnsKeepsOnlyThoseTheRelayCanEnd() {
+        func ends(_ own: String?, token: String?, keeping: Bool, current: String? = "I1") -> Bool {
+            LiveTurnActivities.endsTurn(activityDashboardID: own, tokenInstallationID: token, ofDashboard: "D1", keepingThoseOnRelay: keeping, currentInstallationID: current)
+        }
+        XCTAssertTrue(ends("D1", token: nil, keeping: false))
+        XCTAssertTrue(ends("D1", token: "I1", keeping: false), "Disconnect and Sign Out end them all")
+        XCTAssertFalse(ends("D2", token: nil, keeping: false), "Another dashboard's stay")
+        XCTAssertTrue(ends(nil, token: nil, keeping: false), "An older build's activity names no dashboard")
+        XCTAssertFalse(ends("D1", token: "I1", keeping: true), "The plugin still ends it by push")
+        XCTAssertTrue(ends("D1", token: nil, keeping: true), "The relay never took its token")
+        XCTAssertTrue(ends("D1", token: "I1", keeping: true, current: nil), "Notifications turned off: the installation is gone")
+        XCTAssertTrue(ends("D1", token: "I1", keeping: true, current: "I2"), "Moved to another relay: its token isn't there")
+        XCTAssertFalse(ends("D2", token: nil, keeping: true))
+    }
+
+    /// A token no relay installation took yet is sent again when Conduit is
+    /// back on screen (#1361); one without a token waits for it.
+    func testOnlyATokenNoRelayTookIsRegisteredAgain() {
+        XCTAssertTrue(LiveTurnActivities.needsRegistration(pushToken: "aa", tokenInstallationID: nil))
+        XCTAssertFalse(LiveTurnActivities.needsRegistration(pushToken: "aa", tokenInstallationID: "I1"))
+        XCTAssertFalse(LiveTurnActivities.needsRegistration(pushToken: nil, tokenInstallationID: nil))
+    }
+
+    /// The relay hears how long ago the activity started, so it can end one
+    /// whose turn ended first (#1361): never negative or unreadable.
+    func testLiveActivityStartedAgoIsNeverNegativeOrUnreadable() {
+        XCTAssertEqual(PushNotificationService.liveActivityStartedAgo(12.5), 12.5)
+        XCTAssertEqual(PushNotificationService.liveActivityStartedAgo(-3), 0, "The clock moved back")
+        XCTAssertEqual(PushNotificationService.liveActivityStartedAgo(.nan), 0)
+        XCTAssertEqual(PushNotificationService.liveActivityStartedAgo(.infinity), 0)
+    }
+
+    /// Only a relay that took a Live Activity token counts as a route the
+    /// plugin can end activities through; an error or no answer settles
+    /// nothing.
+    func testLiveActivityRouteIsConfirmedOnlyByASuccessfulRegistration() {
+        XCTAssertEqual(PushNotificationService.liveActivityRouteExists(registrationStatus: 200), true)
+        XCTAssertEqual(PushNotificationService.liveActivityRouteExists(registrationStatus: 204), true)
+        XCTAssertEqual(PushNotificationService.liveActivityRouteExists(registrationStatus: 404), false)
+        XCTAssertNil(PushNotificationService.liveActivityRouteExists(registrationStatus: 500))
+        XCTAssertNil(PushNotificationService.liveActivityRouteExists(registrationStatus: 401))
+    }
+    /// A card's tap opens the chat by its stored id: the runtime id the
+    /// turn was sent on stops resolving once Hermes reaps that runtime, and
+    /// the chat then read "That chat is no longer available".
+    @MainActor
+    func testLiveTurnCardLinksTheChatByItsStoredID() {
+        let suite = "WidgetLaunchLinkTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { return XCTFail("No test defaults") }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        appState.sessions = [SessionSummary(
+            id: "rt", storedSessionId: "stored", alternateIds: ["stored"], title: "Chat", model: "Hermes",
+            updatedLabel: "now", profile: "default", source: .chat, isActive: true, isArchived: false,
+            lineageRootId: nil
+        )]
+        XCTAssertEqual(appState.liveActivityLinkSessionID(for: "rt"), "stored")
+        XCTAssertEqual(appState.liveActivityLinkSessionID(for: "unknown"), "unknown", "Nothing known: the id it was sent on")
+    }
+
+    /// A card an older build left up names the runtime id; the other ids it
+    /// carries find the chat once the list no longer knows that runtime.
+    @MainActor
+    func testLiveTurnCardOffersItsOtherIDsForAReapedRuntime() throws {
+        let link = try XCTUnwrap(URL(string: "conduit://session/rt?profile=default"))
+        let card = HermesTurnAttributes(chatTitle: "Chat", startedAt: now, language: "system", link: link, sessionIDs: ["rt", "stored"], dashboardID: "D1")
+        let other = HermesTurnAttributes(chatTitle: "Other", startedAt: now, language: "system", link: try XCTUnwrap(URL(string: "conduit://session/x")), sessionIDs: ["x", "y"])
+        func ids(_ id: String, profile: String = "default", dashboard: String? = "D1", in cards: [HermesTurnAttributes]) -> [String] {
+            LiveTurnActivities.sessionIDs(linkedTo: id, profile: profile, dashboardID: dashboard, in: cards)
+        }
+        XCTAssertEqual(ids("rt", in: [other, card]), ["stored"])
+        XCTAssertEqual(ids("nope", in: [other, card]), [])
+        XCTAssertEqual(ids("", in: [card]), [])
+        XCTAssertEqual(ids("rt", dashboard: "D2", in: [card]), [], "Another dashboard's card says nothing here")
+        XCTAssertEqual(ids("rt", profile: "work", in: [card]), [], "Nor another profile's")
+        XCTAssertEqual(ids("rt", profile: "Default ", in: [card]), ["stored"], "Profiles match as they do elsewhere")
+        XCTAssertEqual(ids("x", profile: "work", dashboard: nil, in: [other]), ["y"], "An older card naming neither counts")
+        // The reaped runtime is in no row; its stored id is.
+        let row = SessionSummary(
+            id: "stored", alternateIds: [], title: "Chat", model: "Hermes", updatedLabel: "now",
+            profile: "default", source: .chat, isActive: false, isArchived: false, lineageRootId: nil
+        )
+        XCTAssertNil(AppState.linkedSessionTarget("rt", rows: [row], aliases: VoiceSessionAliases()))
+        XCTAssertEqual(AppState.linkedSessionTarget("stored", rows: [row], aliases: VoiceSessionAliases()), "stored")
+        // A list read before the reaping still names the dead runtime: the
+        // open resumes the row's stored id, which Hermes always knows.
+        let stale = SessionSummary(
+            id: "rt", storedSessionId: "stored", alternateIds: ["stored"], title: "Chat", model: "Hermes",
+            updatedLabel: "now", profile: "default", source: .chat, isActive: true, isArchived: false,
+            lineageRootId: nil
+        )
+        let target = try XCTUnwrap(AppState.linkedSessionTarget("stored", rows: [stale], aliases: VoiceSessionAliases()))
+        XCTAssertEqual(target, "rt")
+        XCTAssertEqual(AppState.linkedResumeID(target, matching: "stored", rows: [stale]), "stored")
+        XCTAssertEqual(AppState.linkedResumeID("stored", matching: "stored", rows: [row]), "stored", "A row without a stored id resumes by its own")
+        // Another profile's row with the same runtime id doesn't lend its stored id.
+        let foreignRow = SessionSummary(
+            id: "rt", storedSessionId: "elsewhere", alternateIds: [], title: "Other", model: "Hermes",
+            updatedLabel: "now", profile: "work", source: .chat, isActive: true, isArchived: false,
+            lineageRootId: nil
+        )
+        XCTAssertEqual(AppState.linkedResumeID("rt", matching: "stored", rows: [foreignRow, stale]), "stored")
+        // A card's runtime id Hermes has since given another chat loses to
+        // the link's stored id.
+        XCTAssertEqual(AppState.linkedSessionCandidates(["rt", "stored", "rt", ""], rows: [foreignRow, stale]), ["stored", "rt"])
+        XCTAssertEqual(AppState.linkedSessionCandidates(["rt", "stored"], rows: []), ["rt", "stored"], "No row to tell them apart keeps the order")
+        XCTAssertEqual(AppState.linkedSessionCandidates(["rt", "stored"], rows: [row]), ["stored", "rt"], "A row without a stored id is durable by its own")
+        // A voice alias found the row: its stored id still resumes it.
+        let aliasedRow = SessionSummary(
+            id: "rt2", storedSessionId: "stored", alternateIds: [], title: "Chat", model: "Hermes",
+            updatedLabel: "now", profile: "default", source: .chat, isActive: true, isArchived: false,
+            lineageRootId: nil
+        )
+        XCTAssertEqual(AppState.linkedResumeID("rt2", matching: "rt", "stored", rows: [aliasedRow]), "stored")
+        XCTAssertEqual(AppState.linkedResumeID("rt2", matching: "rt", rows: [aliasedRow]), "rt2", "Nothing ties the row to the id")
     }
 }

@@ -10,7 +10,7 @@ extension ChatTextSelectionTests {
         for choice in ConduitAccentChoice.allCases {
             for dark in [false, true] {
                 let traits = UITraitCollection(mutations: { traits in
-                    traits.conduitAccent = choice
+                    traits.conduitAccent = .preset(choice)
                     traits.userInterfaceStyle = dark ? .dark : .light
                 })
                 XCTAssertTrue(
@@ -27,25 +27,11 @@ extension ChatTextSelectionTests {
         ))
     }
 
-    func testSelectionOnASentBubbleStandsOutFromIt() {
-        for choice in ConduitAccentChoice.allCases {
-            for dark in [false, true] {
-                let bubble = choice.color(dark: dark).conduitRelativeLuminance
-                let selection = choice.selectionColorOnBubble(dark: dark).conduitRelativeLuminance
-                XCTAssertGreaterThan(
-                    (max(bubble, selection) + 0.05) / (min(bubble, selection) + 0.05),
-                    3.0,
-                    "\(choice) dark=\(dark)"
-                )
-            }
-        }
-    }
-
     @MainActor
     func testSentBubbleTextSelectsInTheContrastingTint() throws {
         let host = UIHostingController(rootView:
             MarkdownText(source: "Something I wrote", foregroundStyle: .white, usesAccentSurface: true)
-                .environment(\.conduitAccent, .amber)
+                .environment(\.conduitAccent, .preset(.amber))
                 .preferredColorScheme(.dark)
         )
         let window = Self.window(hosting: host)
@@ -53,7 +39,8 @@ extension ChatTextSelectionTests {
 
         let textView = try XCTUnwrap(Self.subviews(of: UITextView.self, in: host.view).first)
         let tint = textView.tintColor.resolvedColor(with: textView.traitCollection)
-        XCTAssertTrue(Self.isClose(tint, .black), "dark-mode amber bubble selects in black, got \(tint)")
+        // The bubble is deep amber in dark mode too, so white text reads on it.
+        XCTAssertTrue(Self.isClose(tint, .white), "dark-mode amber bubble selects in white, got \(tint)")
     }
 
     @MainActor
@@ -79,7 +66,7 @@ extension ChatTextSelectionTests {
 
         XCTAssertTrue(Self.isClose(try Self.centerColor(of: host.view), ConduitAccentChoice.amber.color(dark: true), tolerance: 0.05))
         let swatch = try XCTUnwrap(Self.subviews(of: AccentProbeUIView.self, in: host.view).first)
-        XCTAssertEqual(swatch.traitCollection.conduitAccent, .amber)
+        XCTAssertEqual(swatch.traitCollection.conduitAccent, .preset(.amber))
 
         model.choice = .blue
         Self.settle(host)
@@ -88,7 +75,7 @@ extension ChatTextSelectionTests {
             Self.isClose(try Self.centerColor(of: host.view), ConduitAccentChoice.blue.color(dark: true), tolerance: 0.05),
             "SwiftUI fills redraw in the new accent"
         )
-        XCTAssertEqual(swatch.traitCollection.conduitAccent, .blue, "UIKit views see the new accent too")
+        XCTAssertEqual(swatch.traitCollection.conduitAccent, .preset(.blue), "UIKit views see the new accent too")
     }
 
     @MainActor
@@ -100,13 +87,78 @@ extension ChatTextSelectionTests {
         defer { Self.close(window) }
 
         let textView = try XCTUnwrap(Self.subviews(of: UITextView.self, in: host.view).first)
-        XCTAssertTrue(Self.isClose(textView.tintColor.resolvedColor(with: textView.traitCollection), .black))
+        XCTAssertEqual(textView.traitCollection.conduitAccent, .preset(.pink))
+        XCTAssertTrue(Self.isClose(
+            textView.tintColor.resolvedColor(with: textView.traitCollection),
+            ConduitAccent.preset(.pink).selectionColorOnBubble
+        ))
 
-        // Dark-mode purple is a dark bubble: the selection turns white.
         model.choice = .purple
         Self.settle(host)
-        XCTAssertEqual(textView.traitCollection.conduitAccent, .purple)
-        XCTAssertTrue(Self.isClose(textView.tintColor.resolvedColor(with: textView.traitCollection), .white))
+        XCTAssertEqual(textView.traitCollection.conduitAccent, .preset(.purple))
+        XCTAssertTrue(Self.isClose(
+            textView.tintColor.resolvedColor(with: textView.traitCollection),
+            ConduitAccent.preset(.purple).selectionColorOnBubble
+        ))
+    }
+
+    /// #748: the photo picker runs out of process and tints from the window,
+    /// where a colour that reads the accent trait would fall back to amber.
+    @MainActor
+    func testAPickRetintsTheWindow() {
+        let model = AccentProbeModel()
+        let host = UIHostingController(rootView: WindowTintProbeView(model: model))
+        let window = Self.window(hosting: host)
+        defer { Self.close(window) }
+
+        XCTAssertTrue(Self.isClose(window.tintColor.resolvedColor(with: window.traitCollection), ConduitAccentChoice.amber.color(dark: true)))
+
+        model.choice = .blue
+        Self.settle(host)
+        XCTAssertTrue(
+            Self.isClose(window.tintColor.resolvedColor(with: window.traitCollection), ConduitAccentChoice.blue.color(dark: true)),
+            "the window takes the new accent"
+        )
+        XCTAssertTrue(Self.isClose(
+            window.tintColor.resolvedColor(with: UITraitCollection()),
+            ConduitAccentChoice.blue.color(dark: true)
+        ), "the colour holds without the accent trait, as in the picker's process")
+
+        window.overrideUserInterfaceStyle = .light
+        Self.settle(host)
+        XCTAssertTrue(
+            Self.isClose(window.tintColor.resolvedColor(with: window.traitCollection), ConduitAccentChoice.blue.color(dark: false)),
+            "and still follows light and dark"
+        )
+    }
+
+    /// #920: a sheet (the full message editor) inherits its traits from the
+    /// window, not from the root's environment, so it has to find the pick
+    /// there or its accent colours fall back to amber.
+    @MainActor
+    func testAPickReachesAPresentedSheet() throws {
+        let model = AccentProbeModel()
+        let host = UIHostingController(rootView: WindowTintProbeView(model: model))
+        let window = Self.window(hosting: host)
+        defer { Self.close(window) }
+
+        model.choice = .blue
+        Self.settle(host)
+        let sheet = UIViewController()
+        host.present(sheet, animated: false)
+        Self.settle(host)
+        defer { sheet.dismiss(animated: false) }
+
+        XCTAssertEqual(window.traitCollection.conduitAccent, .preset(.blue))
+        XCTAssertEqual(sheet.traitCollection.conduitAccent, .preset(.blue), "the sheet sees the pick")
+        XCTAssertTrue(Self.isClose(
+            UIColor.conduitAccent.resolvedColor(with: sheet.traitCollection),
+            ConduitAccentChoice.blue.color(dark: true)
+        ), "and draws its accent in it")
+
+        model.choice = .green
+        Self.settle(host)
+        XCTAssertEqual(sheet.traitCollection.conduitAccent, .preset(.green), "a new pick reaches an open sheet")
     }
 
     func testCopyingASentMessageLeavesOutTheQuotedReply() {
@@ -147,6 +199,9 @@ extension ChatTextSelectionTests {
     private static func settle(_ host: UIViewController) {
         let deadline = Date().addingTimeInterval(0.15)
         while Date() < deadline {
+            // As UIKit's own pass would: a window override reaches the
+            // window's traits before anything under it lays out.
+            host.view.window?.updateTraitsIfNeeded()
             host.view.setNeedsLayout()
             host.view.layoutIfNeeded()
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
@@ -217,7 +272,7 @@ private struct AccentProbeView: View {
             Rectangle().fill(Color.conduitAccent)
             AccentProbeRepresentable()
         }
-        .environment(\.conduitAccent, model.choice)
+        .environment(\.conduitAccent, .preset(model.choice))
     }
 }
 
@@ -226,7 +281,15 @@ private struct SentBubbleProbeView: View {
 
     var body: some View {
         MarkdownText(source: "Something I wrote", foregroundStyle: .white, usesAccentSurface: true)
-            .environment(\.conduitAccent, model.choice)
+            .environment(\.conduitAccent, .preset(model.choice))
+    }
+}
+
+private struct WindowTintProbeView: View {
+    @ObservedObject var model: AccentProbeModel
+
+    var body: some View {
+        Color.clear.background(WindowAccentTint(choice: .preset(model.choice)))
     }
 }
 

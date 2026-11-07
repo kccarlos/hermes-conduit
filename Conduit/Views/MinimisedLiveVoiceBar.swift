@@ -4,7 +4,8 @@
 //
 //  A live call whose sheet was swiped away keeps running. This bar sits
 //  above the composer while it does: tap it or swipe it up to bring the
-//  sheet back, or mute or end the call from here.
+//  sheet back, or mute or end the call from here. A reply being read aloud
+//  shows its player here too (#759).
 //
 
 import SwiftUI
@@ -13,9 +14,19 @@ struct MinimisedLiveVoiceBar: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
+        VStack(spacing: 0) {
+            callBar
+            ReadAloudPlayerBar(controller: appState.messageReadAloudController)
+        }
+    }
+
+    @ViewBuilder
+    private var callBar: some View {
         switch appState.minimisedLiveVoice {
         case .geminiLive?:
             GeminiLiveBarContent(controller: appState.geminiLiveController, jobs: appState.voiceBackgroundJobSupervisor, name: "Gemini Live")
+        case .qwenLive?:
+            GeminiLiveBarContent(controller: appState.qwenLiveController, jobs: appState.voiceBackgroundJobSupervisor, name: AppLocalization.string("Qwen Live"))
         case .grokLive?:
             GeminiLiveBarContent(controller: appState.grokLiveController, jobs: appState.voiceBackgroundJobSupervisor, name: "Grok Live")
         case .localLive?:
@@ -188,20 +199,20 @@ private struct LiveVoiceBarRow: View {
                             .accessibilityHidden(true)
                     } else {
                         Image(systemName: symbol)
-                            .font(.body.weight(.semibold))
+                            .scaledFont(.body.weight(.semibold))
                             .foregroundStyle(Color.conduitAura)
                             .frame(width: iconWidth)
                             .accessibilityHidden(true)
                     }
                     VStack(alignment: .leading, spacing: 1) {
                         Text(verbatim: thread.map { "\(name) · \($0)" } ?? name)
-                            .font(.subheadline.weight(.semibold))
+                            .scaledFont(.subheadline.weight(.semibold))
                             .lineLimit(1)
                         if usesV2, let startedAt, !isFailed {
                             // The state and how long the call has run.
                             TimelineView(.animation(minimumInterval: 1)) { context in
                                 Text(verbatim: "\(status) · \(V2CallHeaderTitle.clock(max(0, context.date.timeIntervalSince(startedAt))))")
-                                    .font(.caption.monospacedDigit())
+                                    .scaledFont(.caption.monospacedDigit())
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
                                     // VoiceOver reads the state without the
@@ -210,7 +221,7 @@ private struct LiveVoiceBarRow: View {
                             }
                         } else {
                             Text(status)
-                                .font(.caption)
+                                .scaledFont(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                         }
@@ -229,7 +240,7 @@ private struct LiveVoiceBarRow: View {
 
             Button(action: onToggleMute) {
                 Image(systemName: isMuted ? "mic.slash.fill" : "mic.fill")
-                    .font(.body.weight(.semibold))
+                    .scaledFont(.body.weight(.semibold))
                     .frame(minWidth: 44, minHeight: 44)
                     .contentShape(Rectangle())
             }
@@ -238,7 +249,7 @@ private struct LiveVoiceBarRow: View {
 
             Button(action: onEnd) {
                 Image(systemName: "phone.down.fill")
-                    .font(.body.weight(.semibold))
+                    .scaledFont(.body.weight(.semibold))
                     .foregroundStyle(.white)
                     .frame(minWidth: 36, minHeight: 36)
                     .background(Circle().fill(Color.red))

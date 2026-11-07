@@ -277,6 +277,28 @@ final class AppStateVoiceCapabilityTests: XCTestCase {
         XCTAssertTrue(appState.showsComposerVoiceButton)
     }
 
+    /// Settings > Voice shows the saved switch: a reconnect resets
+    /// `isVoiceEnabled`, and a switch shown off then reads as turned off.
+    func testVoiceSettingsShowTheSavedSwitchThroughAReconnectReset() async {
+        let appState = makeAppState(snapshot: readySnapshot, isVoiceEnabled: false)
+        XCTAssertTrue(appState.activeProfileVoiceSwitch, "on out of the box")
+        _ = await appState.setVoiceEnabled(true)
+        appState.installVoiceCapabilityStateForTesting(
+            bridge: DashboardTicketBridge(baseURL: "https://example.com"),
+            snapshot: .unavailable,
+            isVoiceEnabled: false
+        )
+        XCTAssertTrue(appState.activeProfileVoiceSwitch)
+
+        _ = await appState.setVoiceEnabled(false)
+        XCTAssertFalse(appState.activeProfileVoiceSwitch)
+
+        // No server to read the saved switch for: it reads as isVoiceEnabled,
+        // never the default of an unwritten key.
+        appState.connection = nil
+        XCTAssertEqual(appState.activeProfileVoiceSwitch, appState.isVoiceEnabled)
+    }
+
     /// Switching away from a voice-enabled profile must not leak its state
     /// while `isVoiceEnabled` still holds the previous profile's value.
     func testSwitchingToProfileWithVoiceOffHidesVoiceButton() async {
@@ -317,10 +339,27 @@ final class AppStateVoiceCapabilityTests: XCTestCase {
         )
     }
 
-    /// Dictation has its own button (#335): once dictated words make the
-    /// draft sendable, Send takes the slot even while still listening.
+    /// Dictation has its own button (#335): once the draft is sendable,
+    /// Send takes the slot from voice.
     func testSendableDraftTakesTheSlotFromVoice() {
         XCTAssertEqual(ComposerBar.trailingControl(action: .send, showsVoiceButton: true), .action)
+    }
+
+    /// #1309: while dictating, the slot is dictation's Stop, whatever the
+    /// draft or the turn would offer, so the words are read before they go.
+    func testDictationHoldsTheSlotUntilItsWordsAreIn() {
+        for action in [ComposerAction.send, .steer, .interrupt, .queue, .stop, .unavailable] {
+            XCTAssertEqual(
+                ComposerBar.trailingControl(action: action, showsVoiceButton: true, holdsDictation: true),
+                .dictation,
+                "\(action)"
+            )
+        }
+        XCTAssertEqual(
+            ComposerBar.trailingControl(action: .send, showsVoiceButton: true, holdsDictation: false),
+            .action,
+            "Send is back once the dictation is over"
+        )
     }
 
     func testDictatedTextGoesAfterTheDraftAndReplacesOnlyItsOwnSpan() {
@@ -466,6 +505,7 @@ final class AppStateVoiceCapabilityTests: XCTestCase {
             sceneIsActive: true,
             reduceMotion: false,
             lowPowerMode: false,
+            idle: false,
             thermalState: .nominal
         ))
         XCTAssertTrue(ConduitBackdropMotionPolicy.shouldAnimate(
@@ -473,6 +513,7 @@ final class AppStateVoiceCapabilityTests: XCTestCase {
             sceneIsActive: true,
             reduceMotion: false,
             lowPowerMode: false,
+            idle: false,
             thermalState: .fair
         ))
 
@@ -482,22 +523,25 @@ final class AppStateVoiceCapabilityTests: XCTestCase {
             sceneIsActive: true,
             reduceMotion: false,
             lowPowerMode: false,
+            idle: false,
             thermalState: .nominal
         ))
 
-        let pausedConditions: [(Bool, Bool, Bool, ProcessInfo.ThermalState)] = [
-            (false, false, false, .nominal), // app inactive/background
-            (true, true, false, .nominal),  // Reduce Motion
-            (true, false, true, .nominal),  // Low Power Mode
-            (true, false, false, .serious),  // serious thermal pressure
-            (true, false, false, .critical)
+        let pausedConditions: [(Bool, Bool, Bool, Bool, ProcessInfo.ThermalState)] = [
+            (false, false, false, false, .nominal), // app inactive/background
+            (true, true, false, false, .nominal),  // Reduce Motion
+            (true, false, true, false, .nominal),  // Low Power Mode
+            (true, false, false, true, .nominal),  // nobody has used the app for a while
+            (true, false, false, false, .serious),  // serious thermal pressure
+            (true, false, false, false, .critical)
         ]
-        for (sceneIsActive, reduceMotion, lowPowerMode, thermalState) in pausedConditions {
+        for (sceneIsActive, reduceMotion, lowPowerMode, idle, thermalState) in pausedConditions {
             XCTAssertFalse(ConduitBackdropMotionPolicy.shouldAnimate(
                 drifts: true,
                 sceneIsActive: sceneIsActive,
                 reduceMotion: reduceMotion,
                 lowPowerMode: lowPowerMode,
+                idle: idle,
                 thermalState: thermalState
             ))
         }
@@ -665,6 +709,43 @@ final class AppStateVoiceCapabilityTests: XCTestCase {
         XCTAssertEqual(LiveVoiceCallSheet.captionLines(from: Array(lines.prefix(1))).map(\.text), ["one"])
     }
 
+    /// Both call sheets (Classic voice and the live calls) caption through
+    /// `LiveVoiceCallSheet.captionLines`.
+    func testCallCaptionsShowRepliesWithoutMarkdownMarks() {
+        let question = VoiceConversationTranscriptEntry(speaker: .user, text: "Quelle est la capitale du Québec ?")
+        let reply = VoiceConversationTranscriptEntry(speaker: .assistant, text: "La capitale du Québec est **Québec** (la ville de Québec).")
+        let shown = LiveVoiceCallSheet.captionLines(from: [question, reply])
+        XCTAssertEqual(shown.map(\.text), ["Quelle est la capitale du Québec ?", "La capitale du Québec est Québec (la ville de Québec)."])
+        XCTAssertEqual(shown.map(\.id), [question.id, reply.id], "the lines keep their identity, so the captions don't re-animate")
+
+        // A reply still streaming in, cut inside a bold span.
+        let streaming = VoiceConversationTranscriptEntry(speaker: .assistant, text: "La capitale du Québec est **Qué")
+        XCTAssertEqual(LiveVoiceCallSheet.captionLines(from: [streaming]).map(\.text), ["La capitale du Québec est Qué"])
+
+        let marked = VoiceConversationTranscriptEntry(speaker: .assistant, text: "## Plan\n- *Pack* the `tent`\n- See [the map](https://x.y)")
+        XCTAssertEqual(LiveVoiceCallSheet.captionLines(from: [marked]).map(\.text), ["Plan Pack the tent See the map"])
+
+        // What the user said is never rewritten.
+        let said = VoiceConversationTranscriptEntry(speaker: .user, text: "what is 5 ** 3 and **this**")
+        XCTAssertEqual(LiveVoiceCallSheet.captionLines(from: [said]).map(\.text), ["what is 5 ** 3 and **this**"])
+    }
+
+    func testCallCaptionsNameChatLinksButNotOnesWrittenAsCode() {
+        defer { HermesSessionReference.updateTitles([:]) }
+        HermesSessionReference.updateTitles(["abc": "GPU setup"])
+        let reply = VoiceConversationTranscriptEntry(
+            speaker: .assistant,
+            text: "It's in **@session:default/abc**. Type `@session:default/abc` to open it."
+        )
+        XCTAssertEqual(
+            LiveVoiceCallSheet.captionLines(from: [reply]).map(\.text),
+            ["It's in GPU setup. Type @session:default/abc to open it."],
+            "the link is named, the one in inline code stays as written without its backticks"
+        )
+        let said = VoiceConversationTranscriptEntry(speaker: .user, text: "open @session:default/abc")
+        XCTAssertEqual(LiveVoiceCallSheet.captionLines(from: [said]).map(\.text), ["open @session:default/abc"])
+    }
+
     func testTheV2CallClockShowsMinutesThenHours() {
         XCTAssertEqual(V2CallHeaderTitle.clock(0), "0:00")
         XCTAssertEqual(V2CallHeaderTitle.clock(12.9), "0:12")
@@ -746,13 +827,7 @@ final class AppStateVoiceCapabilityTests: XCTestCase {
         appleSpeechAvailability: AppleSpeechRecognitionAvailability = .ready(localeIdentifier: "en-US"),
         isVoiceEnabled: Bool = true
     ) -> AppState {
-        let suite = "AppStateVoiceCapabilityTests.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suite) else {
-            fatalError("Failed to create test UserDefaults suite")
-        }
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suite)
-        }
+        let defaults = makeScratchDefaults("AppStateVoiceCapabilityTests")
 
         let appState = AppState(defaults: defaults, loadSavedConnection: false)
         appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")

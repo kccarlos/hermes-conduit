@@ -2,15 +2,16 @@
 //  NativeOAuth.swift
 //  Conduit
 //
-//  Hermes brokered OAuth for native iOS clients: SFSafariViewController,
+//  Hermes brokered OAuth for native iOS clients: ASWebAuthenticationSession,
 //  loopback callback, PKCE, Keychain tokens, refresh, and bearer REST.
 //
 
+import AuthenticationServices
 import CryptoKit
 import Foundation
 import Network
 import OSLog
-import SafariServices
+import os
 import Security
 import SwiftUI
 import UIKit
@@ -60,6 +61,7 @@ enum NativeOAuthError: LocalizedError, Equatable {
     case tokenResponseMalformed
     case tokenStorageFailed
     case timedOut
+    case browserFailed
     case requestFailed(status: Int)
 
     var errorDescription: String? {
@@ -73,6 +75,7 @@ enum NativeOAuthError: LocalizedError, Equatable {
         case .tokenResponseMalformed: return AppLocalization.string("The dashboard returned invalid authentication tokens.")
         case .tokenStorageFailed: return AppLocalization.string("Could not save this dashboard.")
         case .timedOut: return AppLocalization.string("Sign-in timed out. Please try again.")
+        case .browserFailed: return AppLocalization.string("The sign-in page couldn’t open. Please try again.")
         case .requestFailed(let status): return AppLocalization.string("Dashboard sign-in failed (HTTP \(String(status))).")
         }
     }
@@ -174,6 +177,41 @@ enum NativeOAuthFlow {
         components.query = nil
         return code
     }
+
+    /// A relayed callback's parameters (MCP sign-in, where Hermes holds the
+    /// PKCE secret and Conduit only carries the redirect back): the right
+    /// path and state, and a `code` or an `error`.
+    static func callbackValues(
+        requestTarget: String,
+        expectedState: String,
+        expectedPort: UInt16
+    ) throws -> [String: String] {
+        guard let components = URLComponents(string: "http://127.0.0.1:\(expectedPort)\(requestTarget)"),
+              components.path == "/callback" else {
+            throw NativeOAuthError.callbackMalformed
+        }
+        var values: [String: String] = [:]
+        for item in components.queryItems ?? [] {
+            guard values[item.name] == nil else { throw NativeOAuthError.callbackMalformed }
+            values[item.name] = item.value ?? ""
+        }
+        guard values["state"] == expectedState else { throw NativeOAuthError.stateMismatch }
+        guard values["code"]?.isEmpty == false || values["error"]?.isEmpty == false else {
+            throw NativeOAuthError.callbackMalformed
+        }
+        return values
+    }
+
+    /// `values` as one string, the form a relayed callback travels in.
+    static func encodedQuery(_ values: [String: String]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.sortedKeys]) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// `encodedQuery`'s values back.
+    static func queryValues(_ query: String) -> [String: String] {
+        (try? JSONSerialization.jsonObject(with: Data(query.utf8))) as? [String: String] ?? [:]
+    }
 }
 
 final class NativeOAuthAPIClient {
@@ -181,6 +219,12 @@ final class NativeOAuthAPIClient {
     let cloudflareAccess: CloudflareAccessCredentials?
     private let session: URLSession
     private let redirectDelegate: SecureRedirectDelegate
+    /// Set by `invalidate()`. The URLSession itself is invalidated only in
+    /// deinit: a task created on an invalidated URLSession raises an
+    /// Objective-C exception, and a refresh Task that started after
+    /// `invalidate()` cancelled it still reaches `session.bytes(for:)`
+    /// (TestFlight crash reports, tokenRequest abort on builds 223 and 244).
+    private let invalidated = OSAllocatedUnfairLock(initialState: false)
 
     init(
         baseURL: String,
@@ -202,8 +246,23 @@ final class NativeOAuthAPIClient {
         session.invalidateAndCancel()
     }
 
+    /// Stops every request: those in flight are cancelled, and later ones
+    /// fail with `URLError(.cancelled)` before they reach the URLSession.
     func invalidate() {
-        session.invalidateAndCancel()
+        invalidated.withLock { $0 = true }
+        session.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+    }
+
+    var isInvalidated: Bool { invalidated.withLock { $0 } }
+
+    /// `session.bytes(for:)`, unless the client was invalidated.
+    private func bytes(for request: URLRequest) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        guard !isInvalidated else { throw URLError(.cancelled) }
+        let result = try await session.bytes(for: request)
+        // A request that slipped in beside `invalidate()` missed its
+        // getAllTasks sweep; cancel it here instead.
+        guard !isInvalidated else { result.0.task.cancel(); throw URLError(.cancelled) }
+        return result
     }
 
     func exchange(code: String, verifier: String) async throws -> NativeOAuthTokenSet {
@@ -241,7 +300,7 @@ final class NativeOAuthAPIClient {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
-        let (bytes, response) = try await session.bytes(for: request)
+        let (bytes, response) = try await self.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw DashboardTicketBridgeError.http(status: 0, detail: "No response from the dashboard.")
         }
@@ -290,7 +349,7 @@ final class NativeOAuthAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (bytes, response) = try await session.bytes(for: request)
+        let (bytes, response) = try await self.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw NativeOAuthError.requestFailed(status: 0) }
         let maximumTokenResponseBytes = 64 * 1024
         if let length = http.value(forHTTPHeaderField: "Content-Length").flatMap(Int.init),
@@ -326,6 +385,7 @@ final class NativeOAuthAPIClient {
     private static func errorDetail(_ data: Data) -> String? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return json["detail"] as? String ?? json["error"] as? String ?? json["message"] as? String
+            ?? DashboardTicketBridgeError.structuredDetail(json["detail"])
     }
 }
 
@@ -336,6 +396,9 @@ final class NativeOAuthSession {
     private var tokens: NativeOAuthTokenSet
     private var refreshTask: Task<NativeOAuthTokenSet, Error>?
     private var isInvalidated = false
+    /// The Keychain copy a refresh couldn't overwrite. The server has
+    /// rotated past it, so the live tokens stay the session's grant.
+    private var unsavedOver: NativeOAuthTokenSet?
 
     init?(baseURL: String, dashboardID: UUID, cloudflareAccess: CloudflareAccessCredentials?) {
         guard let tokens = KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID) else { return nil }
@@ -351,8 +414,10 @@ final class NativeOAuthSession {
     }
 
     /// Compares the live grant without exposing it to callers or diagnostics.
+    /// A Keychain copy left behind by a refresh whose save failed still
+    /// matches: rebuilding from it would bring back a retired grant.
     func matchesStoredTokens(_ storedTokens: NativeOAuthTokenSet) -> Bool {
-        !isInvalidated && tokens == storedTokens
+        !isInvalidated && (tokens == storedTokens || unsavedOver == storedTokens)
     }
 
     func invalidate() {
@@ -439,6 +504,18 @@ final class NativeOAuthSession {
         return request
     }
 
+    /// The access token a dashboard WebSocket upgrade presents, refreshed
+    /// first once it has expired. Not earlier, unlike a REST request: the
+    /// upgrade's ticket was minted a moment ago (refreshing first if
+    /// needed) with the current token, and a server may bind the ticket to
+    /// it. The caller sends it only to this dashboard.
+    func upgradeBearer() async throws -> String {
+        guard !isInvalidated else { throw CancellationError() }
+        if tokens.needsRefresh(skewSeconds: 0) { try await refresh() }
+        guard !isInvalidated else { throw CancellationError() }
+        return tokens.accessToken
+    }
+
     /// Forgets a grant the server rejected again right after a refresh, as
     /// `requestJSON`'s replay does.
     func discardRejectedGrant() {
@@ -476,11 +553,22 @@ final class NativeOAuthSession {
         let current = tokens
         let task = Task { @MainActor in
             defer { self.refreshTask = nil }
+            let signposter = ResponsivenessSignposts.signposter
+            let refreshing = signposter.beginInterval("OAuth refresh", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("OAuth refresh", refreshing) }
             do {
                 let refreshed = try await self.client.refresh(current)
                 guard !self.isInvalidated else { throw CancellationError() }
+                // The server rotated the grant: the new tokens are the only
+                // live ones whether or not they reach the Keychain.
                 self.tokens = refreshed
-                KeychainHelper.saveNativeOAuthTokens(refreshed, dashboardID: self.dashboardID)
+                if KeychainHelper.saveNativeOAuthTokens(refreshed, dashboardID: self.dashboardID)
+                    || KeychainHelper.saveNativeOAuthTokens(refreshed, dashboardID: self.dashboardID) {
+                    self.unsavedOver = nil
+                } else {
+                    self.unsavedOver = self.unsavedOver ?? current
+                    nativeOAuthLogger.error("OAuth refresh: rotated tokens not saved; kept for this run")
+                }
                 return refreshed
             } catch NativeOAuthError.requestFailed(let status) where status == 400 || status == 401 {
                 guard !self.isInvalidated else { throw CancellationError() }
@@ -498,7 +586,13 @@ final class NativeOAuthSession {
 
 final class NativeOAuthLoopbackServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.milim.conduit.native-oauth-loopback")
-    private let expectedState: String
+    /// Nil until a relayed flow learns it from Hermes' authorization URL;
+    /// a callback before then is turned away.
+    private var expectedState: String?
+    /// MCP sign-in: the callback's parameters are the result (as
+    /// `NativeOAuthFlow.encodedQuery`), an `error` included, for Hermes to
+    /// finish the flow with.
+    private let relaysCallback: Bool
     private var listener: NWListener?
     private var startContinuation: CheckedContinuation<UInt16, Error>?
     private var callbackContinuation: CheckedContinuation<String, Error>?
@@ -510,14 +604,20 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
     /// withholding the end of its headers, which also releases its read Task.
     private var activeConnections: [ObjectIdentifier: NWConnection] = [:]
 
-    init(expectedState: String) {
+    init(expectedState: String?, relaysCallback: Bool = false) {
         self.expectedState = expectedState
+        self.relaysCallback = relaysCallback
+    }
+
+    /// The state the callback must carry, once known.
+    func expect(state: String) {
+        queue.async { self.expectedState = state }
     }
 
     func start(timeout: TimeInterval = 5 * 60) async throws -> UInt16 {
         try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
-                queue.async {
+                queue.async { [self] in
                     if let result = self.terminalResult {
                         switch result {
                         case .failure(let error): continuation.resume(throwing: error)
@@ -653,6 +753,14 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
             finish(.failure(NativeOAuthError.listenerFailed))
             return
         }
+        guard let expectedState else {
+            sendResponse(on: connection, status: "503 Service Unavailable", message: AppLocalization.string("The sign-in callback is not ready."))
+            return
+        }
+        if relaysCallback {
+            processRelayedCallback(target: String(parts[1]), expectedState: expectedState, port: port, on: connection)
+            return
+        }
         do {
             let code = try NativeOAuthFlow.callbackCode(
                 requestTarget: String(parts[1]),
@@ -671,6 +779,27 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
         } catch {
             // Ignore malformed probes and keep listening for the real browser
             // callback until cancellation or the bounded timeout.
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid."))
+        }
+    }
+
+    private func processRelayedCallback(target: String, expectedState: String, port: UInt16, on connection: NWConnection) {
+        do {
+            let values = try NativeOAuthFlow.callbackValues(
+                requestTarget: target,
+                expectedState: expectedState,
+                expectedPort: port
+            )
+            if values["error"]?.isEmpty == false {
+                sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("Sign-in was not completed. You can return to Conduit."))
+            } else {
+                sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("Finishing the sign-in. You can return to Conduit."))
+            }
+            finish(.success(NativeOAuthFlow.encodedQuery(values)))
+        } catch NativeOAuthError.stateMismatch {
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response failed its security check."))
+        } catch {
+            // A favicon or other probe: keep listening.
             sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid."))
         }
     }
@@ -727,7 +856,7 @@ final class NativeOAuthLoginModel: ObservableObject {
     ) async throws -> NativeOAuthLoginResult {
         // A previous exchange may already have succeeded while its first
         // ticket mint failed transiently. Reuse that durable grant before
-        // opening Safari and only reauthorize after confirmed rejection.
+        // opening the browser and only reauthorize after confirmed rejection.
         if let existing = KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID),
            let existingSession = NativeOAuthSession(
             baseURL: baseURL,
@@ -770,6 +899,9 @@ final class NativeOAuthLoginModel: ObservableObject {
         )
         let code = try await server.waitForCallback()
         nativeOAuthLogger.notice("OAuth stage: callback validated")
+        // The browser has done its part; let the sheet close it now rather
+        // than leave the loopback page up through the token exchange.
+        authorizeURL = nil
         let client = NativeOAuthAPIClient(baseURL: baseURL, cloudflareAccess: cloudflareAccess)
         let previousTokens = KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID)
         let tokens = try await client.exchange(code: code, verifier: pkce.verifier)
@@ -795,6 +927,18 @@ final class NativeOAuthLoginModel: ObservableObject {
     }
 }
 
+/// Whether the native sign-in browser starts private (ephemeral) each time.
+/// A remembered identity-provider session can show only a re-authentication
+/// page (Pocket ID offers just the passkey there); a private page shows the
+/// full sign-in page, with a login code for example.
+enum NativeOAuthBrowserPreference {
+    static let privateSignInKey = "conduit.nativeOAuth.privateSignIn"
+
+    static var privateSignIn: Bool {
+        UserDefaults.standard.bool(forKey: privateSignInKey)
+    }
+}
+
 struct NativeOAuthSignInSheet: View {
     let baseURL: String
     let cloudflareAccess: CloudflareAccessCredentials?
@@ -806,10 +950,11 @@ struct NativeOAuthSignInSheet: View {
     @StateObject private var model = NativeOAuthLoginModel()
 
     var body: some View {
-        // Keep one representable alive while authorizeURL changes and Safari
-        // covers this sheet. Visibility changes are not OAuth cancellation.
-        SafariAuthenticationView(
+        // Keep one representable alive while authorizeURL changes and the
+        // browser covers this sheet. Visibility changes are not OAuth cancellation.
+        WebAuthenticationView(
             url: model.authorizeURL,
+            privateSignIn: NativeOAuthBrowserPreference.privateSignIn,
             operation: {
                 try await model.run(
                     baseURL: baseURL,
@@ -833,7 +978,7 @@ struct NativeOAuthSignInSheet: View {
 }
 
 /// Owns the operation until the representable is actually dismantled, not
-/// merely covered by Safari or its password UI.
+/// merely covered by the browser or its password UI.
 @MainActor
 final class NativeOAuthPresentationTask {
     private var task: Task<Void, Never>?
@@ -871,8 +1016,9 @@ final class NativeOAuthPresentationTask {
     deinit { task?.cancel() }
 }
 
-private struct SafariAuthenticationView: UIViewControllerRepresentable {
+private struct WebAuthenticationView: UIViewControllerRepresentable {
     let url: URL?
+    let privateSignIn: Bool
     let operation: @MainActor () async throws -> NativeOAuthLoginResult
     let onSuccess: @MainActor (NativeOAuthLoginResult) -> Void
     let onError: @MainActor (Error) -> Void
@@ -882,35 +1028,60 @@ private struct SafariAuthenticationView: UIViewControllerRepresentable {
         NativeOAuthPresentationTask()
     }
 
-    func makeUIViewController(context: Context) -> SafariPresenterViewController {
-        let controller = SafariPresenterViewController(onCancel: {
+    func makeUIViewController(context: Context) -> WebAuthenticationPresenterViewController {
+        let controller = WebAuthenticationPresenterViewController(privateSignIn: privateSignIn, onCancel: {
             nativeOAuthLogger.notice("OAuth stage: user cancelled browser")
             context.coordinator.cancel()
             onCancel()
+        }, onFailure: { error in
+            context.coordinator.cancel()
+            onError(error)
         })
         context.coordinator.start(operation: operation, onSuccess: onSuccess, onError: onError)
         return controller
     }
 
-    func updateUIViewController(_ controller: SafariPresenterViewController, context: Context) {
+    func updateUIViewController(_ controller: WebAuthenticationPresenterViewController, context: Context) {
         controller.setAuthorizeURL(url)
     }
 
     static func dismantleUIViewController(
-        _ controller: SafariPresenterViewController,
+        _ controller: WebAuthenticationPresenterViewController,
         coordinator: NativeOAuthPresentationTask
     ) {
         nativeOAuthLogger.notice("OAuth stage: sign-in view removed")
         coordinator.cancel()
+        controller.closeBrowser()
     }
 
-    final class SafariPresenterViewController: UIViewController, SFSafariViewControllerDelegate {
-        private var url: URL?
-        private let onCancel: () -> Void
-        private var safariViewController: SFSafariViewController?
+    /// Shows the authorize URL in an ASWebAuthenticationSession. By default it
+    /// is not ephemeral, so it keeps the identity provider's session (shared
+    /// with Safari where iOS allows) and its passkeys work, unlike the
+    /// sign-in WebView; NativeOAuthBrowserPreference.privateSignIn makes it
+    /// ephemeral for a fresh page with every sign-in method. Hermes only
+    /// accepts a loopback redirect, so the code still arrives through NativeOAuthLoopbackServer;
+    /// the session's callback scheme never matches, and Conduit closes the
+    /// browser itself once the callback arrives or the sign-in sheet goes away.
+    final class WebAuthenticationPresenterViewController: UIViewController,
+        ASWebAuthenticationPresentationContextProviding {
+        /// A scheme Hermes never redirects to, so the session only finishes
+        /// when the user cancels or Conduit closes it.
+        static let unusedCallbackScheme = "conduit-native-oauth-loopback"
 
-        init(onCancel: @escaping () -> Void) {
+        private var url: URL?
+        private let privateSignIn: Bool
+        private let onCancel: () -> Void
+        private let onFailure: (Error) -> Void
+        private var session: ASWebAuthenticationSession?
+        /// Set once the browser has closed for any reason (Conduit closed
+        /// it, the user cancelled, or it failed), so a late update or
+        /// appearance never opens a second one.
+        private var ended = false
+
+        init(privateSignIn: Bool, onCancel: @escaping () -> Void, onFailure: @escaping (Error) -> Void) {
+            self.privateSignIn = privateSignIn
             self.onCancel = onCancel
+            self.onFailure = onFailure
             super.init(nibName: nil, bundle: nil)
         }
 
@@ -933,32 +1104,70 @@ private struct SafariAuthenticationView: UIViewControllerRepresentable {
         }
 
         func setAuthorizeURL(_ url: URL?) {
+            guard let url else {
+                // The model clears the URL once the loopback callback has
+                // arrived: the browser is no longer needed.
+                if self.url != nil { closeBrowser() }
+                return
+            }
             self.url = url
-            presentSafariIfReady()
+            startSessionIfReady()
         }
 
         override func viewDidAppear(_ animated: Bool) {
             super.viewDidAppear(animated)
-            presentSafariIfReady()
+            startSessionIfReady()
         }
 
-        private func presentSafariIfReady() {
-            guard let url, viewIfLoaded?.window != nil,
-                  safariViewController == nil, presentedViewController == nil else { return }
-            let configuration = SFSafariViewController.Configuration()
-            configuration.entersReaderIfAvailable = false
-            configuration.barCollapsingEnabled = false
-            let safari = SFSafariViewController(url: url, configuration: configuration)
-            safari.delegate = self
-            safari.modalPresentationStyle = .fullScreen
-            safariViewController = safari
-            present(safari, animated: true) {
-                nativeOAuthLogger.notice("OAuth stage: Safari presented")
+        func closeBrowser() {
+            ended = true
+            guard let session else { return }
+            session.cancel()
+            self.session = nil
+        }
+
+        func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+            view.window ?? ASPresentationAnchor()
+        }
+
+        private func startSessionIfReady() {
+            guard let url, viewIfLoaded?.window != nil, session == nil, !ended else { return }
+            let session = ASWebAuthenticationSession(
+                url: url,
+                callbackURLScheme: Self.unusedCallbackScheme
+            ) { [weak self] _, error in
+                DispatchQueue.main.async {
+                    guard let self, !self.ended else { return }
+                    self.ended = true
+                    self.session = nil
+                    if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin {
+                        self.onCancel()
+                    } else if let error {
+                        nativeOAuthLogger.error("OAuth stage: browser session failed: \(error.localizedDescription, privacy: .public)")
+                        self.onFailure(NativeOAuthError.browserFailed)
+                    } else {
+                        // Hermes never redirects to the session's callback
+                        // scheme, so an end without an error is the page
+                        // going away: treat it as the user closing it.
+                        self.onCancel()
+                    }
+                }
             }
-        }
-
-        func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
-            onCancel()
+            session.presentationContextProvider = self
+            session.prefersEphemeralWebBrowserSession = privateSignIn
+            self.session = session
+            if session.start() {
+                nativeOAuthLogger.notice("OAuth stage: browser session presented")
+            } else {
+                nativeOAuthLogger.error("OAuth stage: browser session did not start")
+                ended = true
+                self.session = nil
+                // This can run inside SwiftUI's update pass (setAuthorizeURL),
+                // so report it on the next turn, as the completion does.
+                DispatchQueue.main.async { [onFailure] in
+                    onFailure(NativeOAuthError.browserFailed)
+                }
+            }
         }
     }
 }

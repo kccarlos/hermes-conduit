@@ -20,6 +20,7 @@
 //
 
 import CarPlay
+import os
 import UIKit
 
 /// Handlers the template's buttons invoke. MainActor-facing; the coordinator
@@ -34,17 +35,21 @@ struct CarPlayVoiceActionHandlers {
     var toggleMicrophone: () -> Void
     /// End the conversation through the authoritative Close teardown.
     var endConversation: () -> Void
+    /// Stop Hermes' spoken reply and listen (Stop).
+    var stopReply: () -> Void
 
     init(
         startListening: @escaping () -> Void,
         startNewChat: @escaping () -> Void = {},
         toggleMicrophone: @escaping () -> Void = {},
-        endConversation: @escaping () -> Void
+        endConversation: @escaping () -> Void,
+        stopReply: @escaping () -> Void = {}
     ) {
         self.startListening = startListening
         self.startNewChat = startNewChat
         self.toggleMicrophone = toggleMicrophone
         self.endConversation = endConversation
+        self.stopReply = stopReply
     }
 }
 
@@ -63,6 +68,10 @@ struct CarPlayVoiceControls: Equatable {
     /// Listen starts a new one. Fixed like the other titles, so a different
     /// chat also needs a new template.
     var chatTitle: String? = nil
+    /// Hermes' spoken reply can be stopped with one tap (Stop): classic
+    /// Voice, Gemini Live and Grok Live. GPT-Live stops when the driver
+    /// speaks.
+    var canStopReply = true
 
     /// The classic mode's Listen continues the current chat, so a new chat
     /// is its own button. A live call always starts fresh.
@@ -78,6 +87,8 @@ enum CarPlayVoiceButton: Equatable {
     case unmute
     /// Reopens the classic mode's paused microphone.
     case resume
+    /// Stops Hermes' spoken reply and listens.
+    case stop
     case end
 
     /// The buttons for one state, in display order.
@@ -85,6 +96,10 @@ enum CarPlayVoiceButton: Equatable {
         switch state {
         case .ready, .error:
             return controls.offersNewChat ? [.listen, .newChat] : [.listen]
+        case .responding where !controls.isMicrophoneMuted && controls.canStopReply:
+            // The microphone is closed while Hermes speaks in the car, so
+            // the useful button is the one that stops it.
+            return [.stop, .end]
         case .listening, .processing, .responding:
             guard controls.isMicrophoneMuted else { return [.mute, .end] }
             // The classic microphone also pauses itself after a long
@@ -101,6 +116,7 @@ enum CarPlayVoiceButton: Equatable {
         case .mute: return AppLocalization.string("Mute")
         case .unmute: return AppLocalization.string("Unmute")
         case .resume: return AppLocalization.string("Listen")
+        case .stop: return AppLocalization.string("Stop")
         case .end: return AppLocalization.string("End")
         }
     }
@@ -113,8 +129,37 @@ enum CarPlayVoiceButton: Equatable {
         case .mute: return "mic.fill"
         case .unmute: return "mic.slash.fill"
         case .resume: return "mic.slash.fill"
+        case .stop: return "stop.fill"
         case .end: return "xmark.circle"
         }
+    }
+}
+
+/// Runs a CarPlay template handler on the main thread. CarPlay can call
+/// handlers from its connection's queue rather than the main thread: the
+/// voice template's End came on a 512 KB dispatch worker on iOS 26, where
+/// ending the call ran SwiftUI's update off the main thread and overflowed
+/// that stack (eight crash reports, builds 223 to 246). Every template
+/// handler, voice and browse, goes through here. On the main thread with
+/// nothing queued it runs at once, so a tap acts in the same turn it always
+/// did; otherwise it waits its turn on the main queue, so taps keep the
+/// order they came in (a main-thread Listen never overtakes a queued End).
+enum CarPlayMainThread {
+    private static let queued = OSAllocatedUnfairLock(initialState: 0)
+
+    nonisolated static func run(_ action: @escaping @MainActor () -> Void) {
+        // Counting and queueing are one step under the lock, so a tap that
+        // has entered here is ordered before any that check after it.
+        let runsNow = queued.withLockUnchecked { count -> Bool in
+            if Thread.isMainThread, count == 0 { return true }
+            count += 1
+            DispatchQueue.main.async {
+                queued.withLock { $0 -= 1 }
+                action()
+            }
+            return false
+        }
+        if runsNow { MainActor.assumeIsolated { action() } }
     }
 }
 
@@ -165,6 +210,7 @@ enum CarPlayVoiceTemplateFactory {
                 case .listen: handlers.startListening()
                 case .newChat: handlers.startNewChat()
                 case .mute, .unmute, .resume: handlers.toggleMicrophone()
+                case .stop: handlers.stopReply()
                 case .end: handlers.endConversation()
                 }
             }
@@ -178,7 +224,7 @@ enum CarPlayVoiceTemplateFactory {
     ) -> CPButton {
         let button = CPButton(
             image: UIImage(systemName: symbol) ?? UIImage(systemName: "circle.fill") ?? UIImage(),
-            handler: handler
+            handler: { button in CarPlayMainThread.run { handler(button) } }
         )
         button.title = title
         return button

@@ -20,8 +20,9 @@ enum MessageRole: String, Codable, Equatable {
     case tool
     case clarify
     case approval
-    /// A masked single-value prompt from a Hermes server→client request:
-    /// sudo password, skill/setup secret, or password-manager unlock.
+    /// A private-input prompt from a Hermes server→client request: sudo
+    /// password, skill/setup secret, password-manager unlock, a website's
+    /// login or its one-time code.
     case inputPrompt
 }
 
@@ -34,6 +35,34 @@ enum SessionSource: String, Codable, CaseIterable {
     case voiceJob = "voice_job"
     case discord
     case telegram
+    /// Hermes' other gateway platforms (`gateway.config.Platform` and the
+    /// bundled platform plugins), each under its own name and filter
+    /// (#1561). Two-backend platforms share one: WhatsApp and WhatsApp
+    /// Cloud, iMessage over BlueBubbles or Photon, WeCom and its callback
+    /// app. A plugin platform Conduit doesn't know yet stays Other.
+    case slack
+    case whatsapp
+    case signal
+    case imessage
+    case matrix
+    case mattermost
+    case teams
+    case googleChat = "google_chat"
+    case email
+    case sms
+    case irc
+    case line
+    case simplex
+    case wechat = "weixin"
+    case wecom
+    case feishu
+    case dingtalk
+    case qq = "qqbot"
+    case yuanbao
+    case buzz
+    case raft
+    case ntfy
+    case a2a
     case api
     case webhook
     case cron
@@ -46,6 +75,29 @@ enum SessionSource: String, Codable, CaseIterable {
         case .voiceJob: return AppLocalization.string("Voice Jobs")
         case .discord: return "Discord"
         case .telegram: return "Telegram"
+        case .slack: return "Slack"
+        case .whatsapp: return "WhatsApp"
+        case .signal: return "Signal"
+        case .imessage: return "iMessage"
+        case .matrix: return "Matrix"
+        case .mattermost: return "Mattermost"
+        case .teams: return "Microsoft Teams"
+        case .googleChat: return "Google Chat"
+        case .email: return AppLocalization.string("Email")
+        case .sms: return "SMS"
+        case .irc: return "IRC"
+        case .line: return "LINE"
+        case .simplex: return "SimpleX"
+        case .wechat: return "WeChat"
+        case .wecom: return "WeCom"
+        case .feishu: return "Feishu"
+        case .dingtalk: return "DingTalk"
+        case .qq: return "QQ"
+        case .yuanbao: return "Yuanbao"
+        case .buzz: return "Buzz"
+        case .raft: return "Raft"
+        case .ntfy: return "ntfy"
+        case .a2a: return "A2A"
         case .api: return "API"
         case .webhook: return AppLocalization.string("Webhook")
         case .cron: return AppLocalization.string("Cron")
@@ -60,6 +112,29 @@ enum SessionSource: String, Codable, CaseIterable {
         case .voiceJob: return "bolt.horizontal.circle.fill"
         case .discord: return "person.2.fill"
         case .telegram: return "paperplane.fill"
+        case .slack: return "number"
+        case .whatsapp: return "phone.bubble.left.fill"
+        case .signal: return "lock.shield.fill"
+        case .imessage: return "message.fill"
+        case .matrix: return "square.grid.3x3.fill"
+        case .mattermost: return "bubble.left.and.bubble.right.fill"
+        case .teams: return "person.3.fill"
+        case .googleChat: return "text.bubble.fill"
+        case .email: return "envelope.fill"
+        case .sms: return "iphone.gen3"
+        case .irc: return "number.square.fill"
+        case .line: return "bubble.right.fill"
+        case .simplex: return "lock.fill"
+        case .wechat: return "bubble.left.and.bubble.right"
+        case .wecom: return "building.2.fill"
+        case .feishu: return "bird.fill"
+        case .dingtalk: return "bell.fill"
+        case .qq: return "person.crop.circle.fill"
+        case .yuanbao: return "sparkles"
+        case .buzz: return "dot.radiowaves.left.and.right"
+        case .raft: return "rectangle.3.group.fill"
+        case .ntfy: return "bell.badge.fill"
+        case .a2a: return "arrow.left.arrow.right"
         case .api: return "globe"
         case .webhook: return "link"
         case .cron: return "clock.fill"
@@ -74,12 +149,88 @@ enum SessionSource: String, Codable, CaseIterable {
         case .voiceJob: return .indigo
         case .discord: return .purple
         case .telegram: return .cyan
+        case .slack: return .purple
+        case .whatsapp: return .green
+        case .signal: return .blue
+        case .imessage: return .green
+        case .matrix: return .mint
+        case .mattermost: return .blue
+        case .teams: return .indigo
+        case .googleChat: return .green
+        case .email: return .orange
+        case .sms: return .green
+        case .irc: return .gray
+        case .line: return .green
+        case .simplex: return .indigo
+        case .wechat: return .green
+        case .wecom: return .blue
+        case .feishu: return .blue
+        case .dingtalk: return .blue
+        case .qq: return .cyan
+        case .yuanbao: return .teal
+        case .buzz: return .orange
+        case .raft: return .brown
+        case .ntfy: return .teal
+        case .a2a: return .gray
         case .api: return .green
         case .webhook: return .orange
         case .cron: return .pink
         case .other: return .gray
         }
     }
+}
+
+extension SessionSource {
+    /// Hermes' gateway platforms after Discord and Telegram, in the Chats
+    /// filter's default order (#1561).
+    static let gatewayPlatforms: [SessionSource] = [
+        .slack, .whatsapp, .signal, .imessage, .matrix, .mattermost, .teams, .googleChat,
+        .email, .sms, .irc, .line, .simplex, .wechat, .wecom, .feishu, .dingtalk, .qq,
+        .yuanbao, .buzz, .raft, .ntfy, .a2a
+    ]
+
+    /// Hermes' source for a Kanban worker's transcript. Hermes refuses to
+    /// reopen one as a chat (`session.resume` 4132): the board runs it, and
+    /// the task's Worker Log shows it.
+    static let hermesKanbanSource = "kanban"
+
+    /// Sessions that aren't conversations, which every Hermes picker hides
+    /// (Hermes' `INTERNAL_LISTING_SOURCES`): Kanban workers, third-party
+    /// tool integrations (`hermes chat --source tool`) and finite one-shot
+    /// runs (`chat -q`, `-z`). Lowercased, as Hermes stores them.
+    static let hermesInternalSources: Set<String> = [hermesKanbanSource, "tool", "oneshot"]
+
+    /// `exclude_sources` for search: the sessions that aren't conversations.
+    static let nonChatExcludedSources = hermesInternalSources.sorted().joined(separator: ",")
+
+    /// `exclude_sources` for the chat lists: cron runs have a list of their
+    /// own, and the sessions that aren't conversations stay out, as Hermes
+    /// Desktop's sidebar leaves them out.
+    static let chatListExcludedSources = "cron,\(nonChatExcludedSources)"
+
+    /// Whether a Hermes session row's `source` is one that isn't a chat.
+    static func isHermesInternalSource(_ source: String?) -> Bool {
+        guard let source else { return false }
+        return hermesInternalSources.contains(source.lowercased())
+    }
+
+    /// Whether a session row is a Kanban worker that Hermes stored before it
+    /// tagged workers `kanban`. Those ran as `cli` sessions on the
+    /// dispatcher's one-line prompt, which is the row's preview; Hermes only
+    /// retags the ones whose folder is under the board's workspaces, so the
+    /// rest still list as chats (#1459).
+    static func isLegacyKanbanWorker(source: String?, preview: String?) -> Bool {
+        guard legacyKanbanWorkerSources.contains(source?.lowercased() ?? ""),
+              let preview = preview?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              preview.hasPrefix(legacyKanbanWorkerPrompt) else { return false }
+        let taskID = preview.dropFirst(legacyKanbanWorkerPrompt.count)
+        return !taskID.isEmpty && !taskID.contains(where: \.isWhitespace)
+    }
+
+    private static let legacyKanbanWorkerPrompt = "work kanban task "
+    /// Where Hermes kept those workers: `cli`, which a peer refresh rewrites
+    /// to `local`. A Telegram or cron row that only reads the same is a chat.
+    private static let legacyKanbanWorkerSources: Set<String> = ["cli", "local"]
 }
 
 struct Attachment: Codable, Identifiable, Equatable {
@@ -92,6 +243,10 @@ struct Attachment: Codable, Identifiable, Equatable {
     /// without those copies (#652); this says where to fetch one when its
     /// file is gone from the server.
     var inlineImage: InlineImageRef? = nil
+    /// What Hermes' vision saw in a picture, from history saved before
+    /// Hermes kept the picture's reference instead (#887). Shown on a long
+    /// press and read by VoiceOver.
+    var imageDescription: String? = nil
 
     enum Kind: String, Codable {
         case image
@@ -197,6 +352,11 @@ struct ClarifyQuestion: Codable, Equatable, Identifiable {
     /// Whether this question can accept an answer or retry.
     var isAnswerable: Bool { status == .pending || status == .error }
 
+    /// Left blank: a form's field the user didn't fill in, which Hermes
+    /// reads as skipped. Its answer is empty, where one answered on another
+    /// device has none.
+    var isSkipped: Bool { status == .answered && answer?.isEmpty == true }
+
     init(
         id: String,
         question: String,
@@ -265,6 +425,17 @@ struct ClarifyQuestion: Codable, Equatable, Identifiable {
     static func multiSelectAnswer(_ values: [String]) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: values) else { return "" }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// A form field's answer from what the user filled in: the picked
+    /// choice, or the typed text; a multi-select's picks in choice order,
+    /// with any typed text after them. Empty when the field was left blank.
+    func formAnswer(picked: Set<String>, typed: String) -> String {
+        let typed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let values = choices.map(\.value).filter { picked.contains($0) }
+        guard multiSelect else { return values.first ?? typed }
+        let all = typed.isEmpty ? values : values + [typed]
+        return all.isEmpty ? "" : Self.multiSelectAnswer(all)
     }
 }
 
@@ -373,6 +544,13 @@ struct ClarifyActivity: Codable, Equatable {
         return .expired
     }
 
+    /// Several questions, at least one typed: shown as a form whose fields
+    /// are sent together, any of them left blank. A question on its own,
+    /// or a batch of choices only, keeps the card that answers each one.
+    var isForm: Bool {
+        questions.count > 1 && questions.contains(where: \.isFreeText)
+    }
+
     /// Visible question text for the transcript row: the joined question
     /// texts, identical to the legacy scalar text for one-question batches.
     var displayQuestion: String {
@@ -390,6 +568,7 @@ struct ClarifyActivity: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
+        case legacyRequestId = "requestId"
         case questions
         case isExpired
         case error
@@ -399,7 +578,11 @@ struct ClarifyActivity: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        requestId = try container.decode(String.self, forKey: .requestId)
+        if let currentID = try container.decodeIfPresent(String.self, forKey: .requestId) {
+            requestId = currentID
+        } else {
+            requestId = try container.decode(String.self, forKey: .legacyRequestId)
+        }
         isExpired = try container.decodeIfPresent(Bool.self, forKey: .isExpired) ?? false
         error = try container.decodeIfPresent(String.self, forKey: .error)
         if let questions = try? container.decode([ClarifyQuestion].self, forKey: .questions), !questions.isEmpty {
@@ -409,11 +592,14 @@ struct ClarifyActivity: Codable, Equatable {
         // Migration: presentation caches written by older builds stored the
         // legacy single-question fields. Decode what is still usable instead
         // of failing the whole cache load; a degenerate empty-text record
-        // yields an empty question list rather than a phantom question.
+        // yields an empty question list rather than a phantom question, and
+        // is expired because a card with nothing to answer would otherwise
+        // derive pending and render an inert "needs your input" prompt.
         let question = (try? container.decode(String.self, forKey: .question)) ?? ""
         let choices = (try? container.decode([ClarifyChoice].self, forKey: .choices)) ?? []
         let status = (try? container.decode(ClarifyQuestion.Status.self, forKey: .status)) ?? .pending
         let answer = try? container.decode(String.self, forKey: .answer)
+        if question.isEmpty { isExpired = true }
         questions = question.isEmpty
             ? []
             : [
@@ -461,11 +647,28 @@ struct ApprovalActivity: Codable, Equatable {
         case expired
         case error
     }
+
+    /// Whether this card still asks what `shown` asked: the same request,
+    /// command, explanation and offered choices. A legacy (request-less)
+    /// card is updated in place when Hermes announces the next command, so
+    /// a tap must only answer the card the person actually read. Status,
+    /// the chosen answer and the error are progress, not the question; the
+    /// session id is not shown and moves to the durable id on its own.
+    func asksSameAs(_ shown: ApprovalActivity) -> Bool {
+        requestId == shown.requestId
+            && command == shown.command
+            && description == shown.description
+            && choices == shown.choices
+            && allowPermanent == shown.allowPermanent
+            && smartDenied == shown.smartDenied
+    }
 }
 
-/// One masked single-value prompt Hermes asks through a server→client
-/// request (`tui_gateway/contracts/server_requests.py`): `sudo`, `secret`
-/// or `vault.unlock_prompt`, each answered with `{value}` ('' = skip).
+/// One private-input prompt Hermes asks through a server→client request
+/// (`tui_gateway/contracts/server_requests.py`): `sudo`, `secret`,
+/// `vault.unlock_prompt`, `vault.save_login` (a website's login, answered
+/// as JSON `{identifier, password}`) or `vault.code` (a website's one-time
+/// code), each answered with `{value}` ('' = skip).
 ///
 /// Deliberately NOT Codable: the card is live-only (a resume re-announces
 /// it from `open_requests`), so it can never reach the presentation or
@@ -476,6 +679,8 @@ struct InputPromptActivity: Equatable {
         case sudo
         case secret
         case vaultUnlock = "vault.unlock_prompt"
+        case vaultSaveLogin = "vault.save_login"
+        case vaultCode = "vault.code"
     }
 
     enum Status: Equatable {
@@ -498,11 +703,21 @@ struct InputPromptActivity: Equatable {
     var prompt: String = ""
     /// vault.unlock_prompt: the password manager's name.
     var displayName: String = ""
+    /// vault.save_login: the sign-in page's origin (`https://host`), which
+    /// the login is saved for.
+    var origin: String = ""
+    /// vault.save_login and vault.code: the site, by host.
+    var site: String = ""
     var status: Status = .pending
     var error: String?
+    /// The profile whose chat showed the card (AppState sets it), so an
+    /// answer typed after a profile switch never goes out on the new
+    /// profile's connection. Empty until shown.
+    var profile: String = ""
 
     /// Parses a server request (live frame or `open_requests` entry).
-    /// Returns nil for any other method or a request without a session.
+    /// Returns nil for any other method, a request without a session, or
+    /// a login request without the origin it is saved for.
     static func from(requestId: String, method: String, params: [String: AnyCodable]) -> InputPromptActivity? {
         guard let kind = Kind(rawValue: method), !requestId.isEmpty else { return nil }
         let sessionId = params["session_id"]?.stringValue?
@@ -520,12 +735,21 @@ struct InputPromptActivity: Equatable {
             activity.prompt = text("prompt")
         case .vaultUnlock:
             activity.displayName = text("display_name").isEmpty ? text("backend") : text("display_name")
+        case .vaultSaveLogin:
+            // A login is bound to the origin it is saved for; without one
+            // the card could not say which site gets it. The title names
+            // the origin's own host, so it can never name another site.
+            activity.origin = text("origin")
+            guard !activity.origin.isEmpty else { return nil }
+            activity.site = URL(string: activity.origin)?.host ?? activity.origin
+        case .vaultCode:
+            activity.site = text("site")
         }
         return activity
     }
 
-    /// Every sudo / secret / vault-unlock entry of a resume's
-    /// `open_requests`, oldest first as the gateway lists them.
+    /// Every input-prompt entry of a resume's `open_requests`, oldest first
+    /// as the gateway lists them.
     static func pending(inOpenRequests openRequests: AnyCodable?) -> [InputPromptActivity] {
         (openRequests?.arrayValue ?? []).compactMap { entry in
             guard let object = entry.objectValue,
@@ -546,7 +770,34 @@ struct InputPromptActivity: Equatable {
             return displayName.isEmpty
                 ? AppLocalization.string("Unlock your password manager")
                 : AppLocalization.string("Unlock \(displayName)")
+        case .vaultSaveLogin:
+            return AppLocalization.string("Save your \(site) login?")
+        case .vaultCode:
+            return site.isEmpty
+                ? AppLocalization.string("Verification code")
+                : AppLocalization.string("Verification code for \(site)")
         }
+    }
+
+    /// The `vault.save_login` answer: the JSON Hermes hands to its vault
+    /// store. Nil when either part is missing, which is not an answer
+    /// (Hermes reads that as declined). A password of spaces alone is
+    /// missing too, as on the other cards; one containing spaces goes as
+    /// typed.
+    static func loginAnswer(identifier: String, password: String) -> String? {
+        let identifier = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !identifier.isEmpty, !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let data = try? JSONSerialization.data(
+                  withJSONObject: ["identifier": identifier, "password": password],
+                  options: [.sortedKeys]
+              ) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// The `vault.code` answer: the code as typed, without the spaces and
+    /// dashes a site groups it with ("123 456"), as Hermes types it.
+    static func codeAnswer(_ typed: String) -> String {
+        typed.filter { !$0.isWhitespace && $0 != "-" }
     }
 
     var isAnswerable: Bool { status == .pending || status == .error }
@@ -627,6 +878,31 @@ struct ChatMessage: Identifiable, Equatable {
         self.reactions = reactions
     }
 
+    /// The same message under another id.
+    func withID(_ id: String) -> ChatMessage {
+        var copy = ChatMessage(
+            id: id,
+            role: role,
+            content: content,
+            rawContent: rawContent,
+            timestamp: timestamp,
+            author: author,
+            reasoning: reasoning,
+            tool: tool,
+            review: review,
+            clarify: clarify,
+            approval: approval,
+            inputPrompt: inputPrompt,
+            attachments: attachments,
+            code: code,
+            displayKind: displayKind,
+            rowId: rowId,
+            reactions: reactions
+        )
+        copy.stepDuration = stepDuration
+        return copy
+    }
+
     /// Hermes' `display_kind` for a mid-turn steer row, also used for the
     /// local row Conduit shows the moment a steer is accepted (issue #337).
     static let steerDisplayKind = "steer"
@@ -673,10 +949,14 @@ struct MessageReaction: Codable, Equatable, Hashable {
     }
 }
 
-struct WorkspaceEntry: Identifiable, Equatable {
+struct WorkspaceEntry: Identifiable, Equatable, Hashable {
     var name: String
     var path: String
     var isDirectory: Bool
+    /// A file's size; nil for a folder, and where the listing has none
+    /// (Hermes' own folder listing).
+    var size: Int64? = nil
+    var modified: Date? = nil
 
     var id: String { path }
 }
@@ -829,6 +1109,12 @@ struct SessionSummary: Identifiable, Equatable, Codable {
     /// `session.list` RPC, hosts older than the flag).
     var isPinned: Bool? = nil
     var lineageRootId: String?
+    /// Hermes' `auto_archived` stamp: the row was archived by a sweep, not
+    /// by someone, and comes back by itself once it's used again. Nil when
+    /// the listing didn't carry it.
+    var isAutoArchived: Bool? = nil
+    /// Hermes' `end_reason` for an ended row, when the listing carried one.
+    var endReason: String? = nil
     /// The listing's one-line `preview` (the opening message), when the row
     /// carried one apart from its title. The V2 session list's second line.
     var preview: String? = nil
@@ -917,10 +1203,40 @@ enum CronJobAction: String {
     case pause, resume, trigger
 }
 
+/// Hermes' parsed schedule: `cron` carries `expr`, `interval` its
+/// `minutes`, `once` its `run_at`; `display` is Hermes' own wording (for a
+/// cron job, the expression itself).
 struct CronSchedule: Codable {
     var display: String?
     var expr: String?
     var kind: String?
+    var minutes: Int?
+    var runAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case display, expr, kind, minutes
+        case runAt = "run_at"
+    }
+
+    init(display: String? = nil, expr: String? = nil, kind: String? = nil, minutes: Int? = nil, runAt: String? = nil) {
+        self.display = display
+        self.expr = expr
+        self.kind = kind
+        self.minutes = minutes
+        self.runAt = runAt
+    }
+
+    /// Lenient: a field of an unexpected type is dropped rather than
+    /// dropping the whole job from the list.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        display = try? container.decodeIfPresent(String.self, forKey: .display)
+        expr = try? container.decodeIfPresent(String.self, forKey: .expr)
+        kind = try? container.decodeIfPresent(String.self, forKey: .kind)
+        minutes = (try? container.decodeIfPresent(Int.self, forKey: .minutes))
+            ?? (try? container.decodeIfPresent(Double.self, forKey: .minutes)).flatMap { Int(exactly: $0.rounded()) }
+        runAt = try? container.decodeIfPresent(String.self, forKey: .runAt)
+    }
 }
 
 struct CronRun: Codable, Identifiable {
@@ -931,12 +1247,67 @@ struct CronRun: Codable, Identifiable {
     var profile: String?
     var startedAt: Int?
     var title: String?
+    /// The job the gateway says ran it (`job_id` or `cron_job_id`), when it says.
+    var jobID: String?
 
     enum CodingKeys: String, CodingKey {
         case id, model, preview, profile
         case lastActive = "last_active"
         case startedAt = "started_at"
         case title
+        case jobID = "job_id"
+        case cronJobID = "cron_job_id"
+    }
+
+    init(id: String, lastActive: Int?, model: String?, preview: String?, profile: String?, startedAt: Int?, title: String?, jobID: String? = nil) {
+        self.id = id
+        self.lastActive = lastActive
+        self.model = model
+        self.preview = preview
+        self.profile = profile
+        self.startedAt = startedAt
+        self.title = title
+        self.jobID = jobID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        lastActive = try container.decodeIfPresent(Int.self, forKey: .lastActive)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        preview = try container.decodeIfPresent(String.self, forKey: .preview)
+        profile = try container.decodeIfPresent(String.self, forKey: .profile)
+        startedAt = try container.decodeIfPresent(Int.self, forKey: .startedAt)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        // The first that names a job: an empty or non-string one doesn't.
+        jobID = [CodingKeys.jobID, .cronJobID].lazy
+            .compactMap { try? container.decodeIfPresent(String.self, forKey: $0) }
+            .first { !$0.isEmpty }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(lastActive, forKey: .lastActive)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encodeIfPresent(preview, forKey: .preview)
+        try container.encodeIfPresent(profile, forKey: .profile)
+        try container.encodeIfPresent(startedAt, forKey: .startedAt)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(jobID, forKey: .jobID)
+    }
+
+    /// Whether this is a run of the job (#1707): the job the gateway names,
+    /// else Hermes' run session id, `cron_<job id>_<YYYYMMDD>_<HHMMSS>` (the
+    /// only form Hermes writes, cron/scheduler.py). A run
+    /// that says neither is no job's, so a list of every job's runs never
+    /// lends one to a job that didn't make it.
+    func isRun(ofJob job: String) -> Bool {
+        if let jobID, !jobID.isEmpty { return jobID == job }
+        let prefix = "cron_\(job)_"
+        guard !job.isEmpty, id.hasPrefix(prefix) else { return false }
+        let stamp = id.dropFirst(prefix.count).split(separator: "_", omittingEmptySubsequences: false)
+        return stamp.map(\.count) == [8, 6] && stamp.allSatisfy { part in part.allSatisfy { $0.isASCII && $0.isNumber } }
     }
 }
 
@@ -979,10 +1350,12 @@ enum TurnState: Equatable {
         case .idle:
             return hasText || hasAttachments ? .send : .unavailable
         case .running:
-            // Attachments do not have steering semantics. With no typed text,
-            // keep Stop available even if an attachment was drafted earlier.
+            // Attachments go only as Queue (#1146): Hermes' steer takes
+            // text alone, and a busy prompt.submit carrying staged images
+            // always queues them as their own turn, whatever the mode.
+            if hasAttachments { return .queue }
             guard hasText else { return .stop }
-            return busyInputMode == .interrupt ? .interrupt : .steer
+            return busyInputMode.composerAction
         }
     }
 }
@@ -993,12 +1366,85 @@ enum ComposerAction: Equatable {
     case stop
     case steer
     case interrupt
+    /// Waits as the next message until the running turn finishes.
+    case queue
+}
+
+/// What a long-press on the composer's action button offers for this
+/// message only; a plain tap keeps the action it shows (#816, #817, #842,
+/// #962).
+enum ComposerSendChoice: String, CaseIterable, Identifiable {
+    case steer
+    case interrupt
+    case queue
+    /// `/background`: a separate agent takes the message.
+    case background
+    /// `/btw`: a side question over a snapshot of the chat.
+    case btw
+
+    var id: String { rawValue }
+
+    /// The busy mode this choice stands for, if it is one.
+    var busyInputMode: BusyInputMode? {
+        switch self {
+        case .steer: return .steer
+        case .interrupt: return .interrupt
+        case .queue: return .queue
+        case .background, .btw: return nil
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .steer, .interrupt, .queue: return busyInputMode?.title ?? ""
+        case .background: return AppLocalization.string("Background")
+        case .btw: return AppLocalization.string("Side question")
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .steer, .interrupt, .queue: return busyInputMode?.symbol ?? ""
+        case .background: return "square.stack.3d.up"
+        case .btw: return "bubble.left.and.text.bubble.right"
+        }
+    }
+
+    /// The slash command a side-agent choice sends the message as.
+    var slashCommand: String? {
+        switch self {
+        case .background: return "background"
+        case .btw: return "btw"
+        case .steer, .interrupt, .queue: return nil
+        }
+    }
+
+    /// The other ways to send a typed message, in menu order. While Hermes
+    /// works: the busy modes the tap doesn't use, then the side agents.
+    /// While idle: the side agents. None for attachments (only Queue takes
+    /// them, and the tap already does) or a slash command (it runs as
+    /// typed).
+    static func choices(for action: ComposerAction, hasAttachments: Bool, isSlashCommand: Bool) -> [ComposerSendChoice] {
+        guard !hasAttachments, !isSlashCommand else { return [] }
+        switch action {
+        case .send:
+            return [.background, .btw]
+        case .steer, .interrupt, .queue:
+            let busyModes: [ComposerSendChoice] = [.steer, .queue, .interrupt]
+            return busyModes.filter { $0.busyInputMode?.composerAction != action } + [.background, .btw]
+        case .stop, .unavailable:
+            return []
+        }
+    }
 }
 
 /// Profile-scoped Hermes setting (`display.busy_input_mode`).
 enum BusyInputMode: String, CaseIterable, Codable, Identifiable {
     case steer
     case interrupt
+    /// The message waits and goes as the next turn once the running one
+    /// finishes (#842). Held on the phone, so it works on any Hermes.
+    case queue
 
     var id: String { rawValue }
 
@@ -1006,6 +1452,16 @@ enum BusyInputMode: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .steer: return AppLocalization.string("Steer")
         case .interrupt: return AppLocalization.string("Interrupt")
+        case .queue: return AppLocalization.string("Queue")
+        }
+    }
+
+    /// The composer action a typed message takes in this mode.
+    var composerAction: ComposerAction {
+        switch self {
+        case .steer: return .steer
+        case .interrupt: return .interrupt
+        case .queue: return .queue
         }
     }
 
@@ -1016,25 +1472,87 @@ enum BusyInputMode: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .steer: return "steeringwheel"
         case .interrupt: return "hand.raised.fill"
+        case .queue: return "text.line.last.and.arrowtriangle.forward"
         }
     }
 
+    /// Unset or unknown is interrupt, as Hermes reads it.
     static func fromGatewayValue(_ value: String?) -> BusyInputMode {
-        value?.lowercased() == BusyInputMode.interrupt.rawValue ? .interrupt : .steer
+        switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case BusyInputMode.steer.rawValue: return .steer
+        case BusyInputMode.queue.rawValue: return .queue
+        default: return .interrupt
+        }
     }
 }
 
 /// Display preferences are owned by the active Hermes profile, not this
 /// device. Keeping them together ensures chat and Settings render the same
 /// source of truth after a profile switch or reconnect.
-struct ProfileDisplayPreferences: Equatable {
+struct ProfileDisplayPreferences: Equatable, Codable {
     var showReasoning = true
+    /// `display.conduit_thinking_on_request` isn't false: with thinking
+    /// hidden, a run's menu and its reply's ⋯ still offer Show thinking
+    /// (ReasoningDisplayMode).
+    var thinkingOnRequest = true
     var showToolProgress = true
     var expandToolsByDefault = false
+    /// `display.memory_notifications` isn't "off": the self-improvement
+    /// review rows draw, the ones a chat already has included.
+    var showReviews = true
+
+    /// Hermes' reading of `display.memory_notifications`: a YAML bool is
+    /// on or off, anything else but "off" (unset, "default", "verbose")
+    /// shows them.
+    static func showsReviews(_ value: Any?) -> Bool {
+        if let bool = value as? Bool { return bool }
+        guard let string = value as? String else { return true }
+        return string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "off"
+    }
+
+    var reasoningMode: ReasoningDisplayMode {
+        ReasoningDisplayMode(showReasoning: showReasoning, onRequest: thinkingOnRequest)
+    }
+
+    /// Thinking is hidden and Show thinking is offered.
+    var offersShowThinking: Bool { reasoningMode == .onRequest }
+}
+
+/// The Thinking choice in Settings > Chat. Hermes' own `display.show_reasoning`
+/// stays a switch other clients read too, so Show is that switch on, and
+/// Conduit's `display.conduit_thinking_on_request` tells On request from Off
+/// while it is off. Unset reads as On request, so an install that had the
+/// switch off keeps its Show thinking menus.
+enum ReasoningDisplayMode: String, CaseIterable {
+    case show
+    case onRequest = "on_request"
+    case off
+
+    /// The settings row's own key: no config value of that name is kept.
+    static let settingKey = "conduit.reasoning_display"
+    static let onRequestConfigKey = "conduit_thinking_on_request"
+
+    init(showReasoning: Bool, onRequest: Bool) {
+        self = showReasoning ? .show : (onRequest ? .onRequest : .off)
+    }
+
+    /// Read from the profile's `display` block, Hermes' defaults applied.
+    init(display: [String: Any]) {
+        self.init(
+            showReasoning: display["show_reasoning"] as? Bool ?? true,
+            onRequest: display[Self.onRequestConfigKey] as? Bool ?? true
+        )
+    }
+
+    /// Written into the `display` block. Show leaves Conduit's own key as
+    /// it is, so turning Show off again goes back to the last of the two.
+    func write(into display: inout [String: Any]) {
+        display["show_reasoning"] = self == .show
+        if self != .show { display[Self.onRequestConfigKey] = self == .onRequest }
+    }
 }
 
 enum DisplayPreferenceKey: CaseIterable, Identifiable {
-    case reasoning
     case toolProgress
     case expandTools
 
@@ -1074,6 +1592,24 @@ enum ProfileSettingValue: Equatable {
     /// are counts, seconds, or characters.
     static func numberText(_ value: Double) -> String {
         value.rounded() == value && abs(value) < 1e15 ? String(Int64(value)) : String(value)
+    }
+
+    /// What someone typed in a number field. The decimal pad shows a comma in
+    /// locales like fr-CA, so "0,8" reads as 0.8 as well as "0.8"; spaces
+    /// around the number are ignored. "nan" and "inf" (or an overflow) are
+    /// refused: the config goes out as JSON, which has neither, and
+    /// JSONSerialization raises on them.
+    static func parseNumber(_ raw: String) -> Double? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value: Double?
+        if let plain = Double(trimmed) {
+            value = plain
+        } else {
+            guard !trimmed.contains("."), trimmed.filter({ $0 == "," }).count == 1 else { return nil }
+            value = Double(trimmed.replacingOccurrences(of: ",", with: "."))
+        }
+        guard let value, value.isFinite else { return nil }
+        return value
     }
 }
 
@@ -1202,6 +1738,14 @@ struct ProfileModelDefaults: Equatable {
         return (row?.name ?? savedProvider, savedModel)
     }
 
+    /// Whether the saved main model offers Ultrafast, which Hermes' config
+    /// schema leaves out of the Fast mode choices (Desktop adds it the same
+    /// way, from the catalog row's capabilities).
+    var mainModelOffersUltrafast: Bool {
+        let (rowName, model) = selection
+        return providers.first { $0.matches(rowName) }?.offersUltrafast(model) ?? false
+    }
+
     private func uniqueRow(listing model: String) -> ProviderInfo? {
         guard !model.isEmpty else { return nil }
         let rows = providers.filter { $0.models.contains(where: { $0.id == model }) }
@@ -1245,6 +1789,9 @@ struct RuntimeState: Equatable {
     var contextMax: Int = 0
     var cwd: String = ""
     var fast: Bool = false
+    /// The tier behind `fast`: "priority", "ultrafast", "auto", "cold", or
+    /// empty for normal. Empty on gateways that only report `fast`.
+    var serviceTier: String = ""
     var model: String = ""
     var provider: String = ""
     var reasoningEffort: String = ""
@@ -1258,7 +1805,9 @@ struct RuntimeState: Equatable {
 // MARK: - Capabilities
 
 struct CapabilitySkill: Identifiable, Equatable {
-    let id = UUID()
+    /// By name, as Hermes keys them: a list read again (or the kept one
+    /// Hermes' answer replaces) draws only the rows that changed.
+    var id: String { name }
     let name: String
     var description: String?
     var category: String?
@@ -1268,7 +1817,7 @@ struct CapabilitySkill: Identifiable, Equatable {
 }
 
 struct CapabilityToolset: Identifiable, Equatable {
-    let id = UUID()
+    var id: String { name }
     let name: String
     var description: String?
     var enabled: Bool

@@ -8,16 +8,21 @@
 //  goes through the composer so it shows and streams like a typed message.
 //
 
+import Combine
 import Foundation
 
 @MainActor
 extension AppState {
     func sendFromShortcut(_ request: ShortcutSendRequest, deadline: Date) async throws -> ShortcutSendOutcome {
-        try await ShortcutSender(backend: makeShortcutSendBackend()).send(request, deadline: deadline)
+        releaseLaunchDashboardChoice(for: "a shortcut")
+        return try await ShortcutSender(backend: makeShortcutSendBackend()).send(request, deadline: deadline)
     }
 
-    private func makeShortcutSendBackend() -> ShortcutSendBackend {
-        ShortcutSendBackend(
+    func makeShortcutSendBackend() -> ShortcutSendBackend {
+        // The error a failed composer try left, for the run to clear once
+        // its retry lands.
+        let failedTry = ShortcutFailedTry()
+        return ShortcutSendBackend(
             connect: { [weak self] deadline in
                 guard let self else { return false }
                 // Leave time to send once connected.
@@ -29,16 +34,9 @@ extension AppState {
             createChat: { [weak self] profile, title in
                 guard let self, let client = self.client else { throw HermesError.notConnected }
                 let inUse = self.profilesMatch(profile, self.activeProfile)
-                let created: (sessionId: String, storedSessionId: String?, profile: String?)
-                if inUse {
-                    // The same model as a chat started from the composer.
-                    created = try await client.createSession(
-                        model: self.runtime.model.isEmpty ? nil : self.runtime.model,
-                        provider: self.runtime.provider.isEmpty ? nil : self.runtime.provider
-                    )
-                } else {
-                    created = try await client.createSession(inProfile: profile)
-                }
+                // As a chat started from the composer: the profile's default
+                // model, not the open chat's (#916).
+                let created = try await client.createSession(inProfile: inUse ? nil : profile)
                 if let returned = created.profile, !self.profilesMatch(returned, profile) {
                     throw HermesError.invalidResponse
                 }
@@ -50,26 +48,66 @@ extension AppState {
                 guard let self else { throw HermesError.notConnected }
                 return try await self.liveVoiceThreadRuntime(self.scopedShortcutChat(chat))
             },
+            reopenChat: { [weak self] chat in
+                guard let self else { throw HermesError.notConnected }
+                return try await self.reopenVoiceThreadRuntime(self.scopedShortcutChat(chat))
+            },
             submit: { [weak self] chat, runtimeID, text in
-                guard let self, let client = self.client else { throw HermesError.notConnected }
+                guard let self, self.client != nil else { throw HermesError.notConnected }
+                let scoped = self.scopedShortcutChat(chat)
                 // Shortcut text is literal: "/…" never runs a composer command.
-                if self.isOpenChat(self.scopedShortcutChat(chat)), !self.isBusy, Self.parseSlashCommand(text) == nil {
+                if self.isOpenChat(scoped), self.activeSessionId == runtimeID,
+                   !self.isBusy, Self.parseSlashCommand(text) == nil {
+                    // Right after a cold launch the open chat's id is the one
+                    // from before, until the chat's own resume. The composer
+                    // only gets a runtime Hermes still has: a dead one would
+                    // leave a failed send on screen and the text back in the
+                    // composer. The run reopens the chat and sends again.
+                    guard await self.voiceThreadRuntimeIsLive(runtimeID, profile: scoped.profile) else {
+                        throw RpcError(code: 4001, message: "session not found")
+                    }
                     // A turn the composer finds running is never steered or
                     // interrupted from here: it declines and the gateway queues.
-                    if await self.submitComposer(text: text, onBusy: {}) { return .accepted }
+                    self.submissionTurnSurface = (text, .shortcut)
+                    defer { self.submissionTurnSurface = nil }
+                    // Whether the composer wrote the error, even one reading
+                    // the same as a banner already on screen.
+                    var wroteError = false
+                    let errorWrites = self.$errorMessage.dropFirst().sink { wroteError = $0 != nil }
+                    let sent = await self.submitComposer(text: text, onBusy: {})
+                    errorWrites.cancel()
+                    if sent { return .accepted }
+                    // A runtime that died after the check (or a check that
+                    // couldn't read): the composer showed "Failed to send".
+                    if wroteError, let error = self.errorMessage { failedTry.error = error }
                 }
                 // Off screen, a turn running there, or a composer that couldn't
                 // take it (still synchronizing): Hermes takes it, queues it or
                 // joins the turn running.
-                return try await client.sendPrompt(runtimeID, text: text)
+                await self.reportTurnSurface(.shortcut, runtimeSessionID: runtimeID, text: text)?.value
+                do {
+                    return try await self.sendShortcutPrompt(runtimeID, text: text)
+                } catch {
+                    self.discardTurnSurface(runtimeSessionID: runtimeID, text: text, after: error)
+                    throw error
+                }
             },
             liveSessions: { [weak self] profile in
                 guard let self, let client = self.client else { throw HermesError.notConnected }
                 return try await client.activeSessions(inProfile: self.profilesMatch(profile, self.activeProfile) ? nil : profile)
             },
             latestReply: { [weak self] chat in
-                guard let self else { return nil }
-                return await self.latestLiveVoiceThreadReply(self.scopedShortcutChat(chat))
+                guard let self,
+                      let latest = await self.latestLiveVoiceThreadReplyMessage(self.scopedShortcutChat(chat)) else { return nil }
+                return ShortcutReply(text: latest.message.content, rowID: latest.message.rowId,
+                                     openChatID: latest.inOpenChat ? latest.message.id : nil,
+                                     prompt: latest.prompt)
+            },
+            retryLanded: { [weak self] in
+                // The text went in after all: the failed try's error goes.
+                guard let self, let error = failedTry.error else { return }
+                failedTry.error = nil
+                if self.errorMessage == error { self.errorMessage = nil }
             }
         )
     }
@@ -81,4 +119,10 @@ extension AppState {
         if let profile = chat.profile, profilesMatch(profile, activeProfile) { scoped.profile = nil }
         return scoped
     }
+}
+
+/// The "Failed to send" a run's first composer try left on screen.
+@MainActor
+private final class ShortcutFailedTry {
+    var error: String?
 }

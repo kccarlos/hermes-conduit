@@ -108,6 +108,21 @@ extension NotificationE2ETests {
 
     // MARK: Precision
 
+    func testAreaNamesFitWhatTheHostTakes() {
+        // location_store MAX_AREA_CHARS: a longer field refuses the whole batch.
+        let long = String(repeating: "Ä", count: 120)
+        let area = LocationArea(name: long, locality: "London", region: long + "🇬🇧", country: "United Kingdom", countryCode: "GB")
+        let json = area.json
+        for key in ["name", "region"] {
+            let value = json[key] as? String ?? ""
+            XCTAssertEqual(value.unicodeScalars.count, 80, key)
+            XCTAssertTrue(long.hasPrefix(value), key)
+        }
+        XCTAssertEqual(json["locality"] as? String, "London")
+        XCTAssertEqual(json["country"] as? String, "United Kingdom")
+        XCTAssertEqual(json["country_code"] as? String, "GB")
+    }
+
     func testPlacesPrecisionNamesThePlaceAndNothingElse() {
         let json = LocationFixtures.json(LocationFixtures.fix(latitude: 51.5322, longitude: -0.0754), .places)
         XCTAssertEqual(json["place_id"] as? String, "p_home")
@@ -374,6 +389,102 @@ extension NotificationE2ETests {
         XCTAssertFalse(LocationSyncEngine.needsNewKey("layer_off"))
     }
 
+    /// The notifier sends its message, not its code, as the 409's detail
+    /// (`location_store.py`, `health_store.py`): key loss is recognized from
+    /// those messages too, and its other 409s are not key loss.
+    func testTheNotifiersKeyLossMessagesAreRecognized() {
+        for detail in [
+            "This device's location key isn't on this profile; set it up again",
+            "The body didn't open with this device's key; set up location sharing again",
+            "This device's health key isn\u{2019}t on this profile; set it up again",
+            "The body didn't open with this device's key; set up health sync again",
+        ] {
+            XCTAssertTrue(LocationSyncEngine.needsNewKey(detail), detail)
+        }
+        for detail in [
+            "This profile already keeps location from 8 devices; delete one from Conduit first",
+            "This location store was written by a newer plugin; update the plugin",
+            "This health store was written by a newer plugin; update the plugin",
+            "A gps fix needs precise sharing on",
+            "That place rule was just deleted",
+        ] {
+            XCTAssertFalse(LocationSyncEngine.needsNewKey(detail), detail)
+        }
+        // A store from a newer plugin (`schema`) asks for a plugin update.
+        for detail in [
+            "This calendar store was written by a newer plugin; update the plugin",
+            "This location store was written by a newer plugin; update the plugin",
+            "This health store was written by a newer plugin; update the plugin",
+            "schema",
+        ] {
+            XCTAssertTrue(HostKeyConflict.isNewerPluginStore(detail), detail)
+            XCTAssertFalse(HostKeyConflict.isKeyLoss(detail), detail)
+        }
+        for detail in ["unknown_key", "This profile already keeps location from 8 devices; delete one from Conduit first",
+                       "The calendar store is being upgraded; try again in a moment"] {
+            XCTAssertFalse(HostKeyConflict.isNewerPluginStore(detail), detail)
+        }
+    }
+
+    /// A store written by a newer plugin (409 `schema`) waits for a plugin
+    /// update: the batch stays to send after it, and the key stays.
+    func testANewerPluginsStoreKeepsTheBatchAndAsksForAPluginUpdate() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let hostPrivate = Curve25519.KeyAgreement.PrivateKey()
+        var keyRequests = 0
+        let newer = "This location store was written by a newer plugin; update the plugin"
+        var ingestDetail = newer
+        var ingestFailure: Error?
+        let request: LocationSyncEngine.Request = { path, _, body in
+            if path.hasSuffix("/key") {
+                keyRequests += 1
+                let devicePublic = try XCTUnwrap((body?["public_key"] as? String).flatMap(NotificationE2E.base64URLDecoded))
+                return [
+                    "host_public_key": NotificationE2E.base64URL(hostPrivate.publicKey.rawRepresentation),
+                    "kid": LocationCrypto.keyID(devicePublic: devicePublic, hostPublic: hostPrivate.publicKey.rawRepresentation),
+                ]
+            }
+            if path.contains("/status") { return ["ok": true] }
+            throw ingestFailure ?? DashboardTicketBridgeError.http(status: 409, detail: ingestDetail)
+        }
+        let keys = LocationKeyStore.memory()
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")), keys: keys)
+        let config = LocationFixtures.config()
+        let batch = LocationBatch(sentAt: LocationFixtures.at, settings: config.settings)
+
+        let outcome = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(outcome, .failed, "Kept to send once the plugin is updated, not dropped as refused")
+        XCTAssertEqual(engine.state.pause, .pluginMissing)
+        XCTAssertNotNil(keys.load())
+        XCTAssertEqual(keyRequests, 1)
+
+        // A later timeout, or a 404 while the plugin's status route answers,
+        // replaces the pause so its own error shows.
+        ingestFailure = URLError(.timedOut)
+        let timedOut = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(timedOut, .failed)
+        XCTAssertNil(engine.state.pause)
+        XCTAssertNotNil(engine.lastError)
+        ingestFailure = nil
+        _ = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(engine.state.pause, .pluginMissing)
+        ingestFailure = DashboardTicketBridgeError.http(status: 404, detail: "Not found")
+        let notFound = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(notFound, .failed)
+        XCTAssertNil(engine.state.pause)
+        XCTAssertEqual(engine.lastError, "Not found")
+        ingestFailure = nil
+
+        // Once the plugin is updated, a different refusal replaces the
+        // pause: it no longer asks for an update.
+        ingestDetail = "Background location is off on this profile"
+        let next = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(next, .refused)
+        XCTAssertNil(engine.state.pause)
+        XCTAssertEqual(engine.lastError, ingestDetail)
+    }
+
     func testAnIngest404KeepsTheKeyAndIsThePluginMissingOnlyWhenStatusIsGoneToo() async throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -412,6 +523,38 @@ extension NotificationE2ETests {
         XCTAssertEqual(engine.state.pause, .pluginMissing)
         XCTAssertEqual(keys.load(), key)
         XCTAssertEqual(calls.filter { $0.hasSuffix("/key") }.count, 1)
+    }
+
+    // #973: a send that fails on the network shows plain words on the
+    // settings page, never NSURLErrorDomain text.
+    func testAFailedSendShowsPlainLanguageOnTheSettingsPage() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        var failure: Error = URLError(.notConnectedToInternet)
+        let request: LocationSyncEngine.Request = { _, _, _ in throw failure }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        let config = LocationFixtures.config()
+        let batch = LocationBatch(sentAt: LocationFixtures.at, settings: config.settings)
+
+        let offline = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(offline, .failed)
+        XCTAssertEqual(engine.lastError, ConnectionFailure.offline.userMessage)
+
+        // Conduit's own errors keep their text.
+        failure = DashboardTicketBridgeError.notReady
+        _ = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(engine.lastError, DashboardTicketBridgeError.notReady.errorDescription)
+
+        // So does an HTTP status with no special handling: the page shows
+        // the bridge's own wording for it, unchanged by the plain-language
+        // mapping.
+        let unhandled = DashboardTicketBridgeError.http(status: 502, detail: "Bad gateway")
+        failure = unhandled
+        let unhandledResult = await engine.send(batch, config: config, request: request)
+        XCTAssertEqual(unhandledResult, .failed)
+        XCTAssertNotNil(unhandled.errorDescription)
+        XCTAssertEqual(engine.lastError, unhandled.errorDescription)
     }
 
     func testAnUnsentSettingsChangeIsRememberedInTheSharedConfig() throws {
@@ -544,6 +687,85 @@ extension NotificationE2ETests {
         XCTAssertNil(engine.voiceReadKey(deviceID: "another-device"))
         _ = await engine.send(batch, config: config, request: request)
         XCTAssertEqual(keyRequests, 1)
+    }
+
+    func testSharingBoundToARemovedDashboardIsUnboundKeepingPlacesAndChoices() {
+        var config = LocationFixtures.config(background: true, talking: true)
+        config.settings.otherProfilesChosen = true
+        config.settings.backgroundPrecision = .precise
+        config.settingsPending = true
+        config.setVoiceRead("grok-live", allowed: true)
+        config.places = [LocationFixtures.home]
+        let deviceID = config.deviceID
+
+        XCTAssertFalse(config.isBound(outside: [LocationFixtures.dashboardID, UUID()]), "Still saved")
+        XCTAssertTrue(config.isBound(outside: [UUID()]), "Removed from Conduit (issue 1800)")
+        XCTAssertTrue(config.isBound(outside: []), "The last dashboard removed")
+
+        config.unbind()
+        XCTAssertNil(config.binding)
+        XCTAssertFalse(config.settings.isOn, "Shows off, so turning a layer on binds to the dashboard in use")
+        XCTAssertFalse(config.settings.otherProfilesChosen, "A choice about the old host's profiles isn't the next one's")
+        XCTAssertNil(config.voiceReaders, "Turning on again asks each voice mode again")
+        XCTAssertFalse(config.settingsPending, "Nothing left to tell a host that's gone")
+        XCTAssertEqual(config.places, [LocationFixtures.home])
+        XCTAssertEqual(config.settings.backgroundPrecision, .precise)
+        XCTAssertEqual(config.deviceID, deviceID)
+        XCTAssertFalse(config.isBound(outside: []), "Unbound is bound nowhere")
+    }
+
+    @MainActor
+    func testForgettingSpotsDropsTheShopEntriesWaitingToBeSent() {
+        var unsent = LocationUnsent()
+        unsent.keep(spotEntry: LocationSpotEntry(id: "s_1", spotID: "0.c1", name: "Florist",
+                                                 at: LocationFixtures.at, radius: 1_000))
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        let controller = LocationSharingController(engine: engine, config: LocationFixtures.config(background: true),
+                                                   unsent: unsent)
+        XCTAssertEqual(controller.unsentSpotEntryCount, 1)
+        controller.forgetSpots()
+        XCTAssertEqual(controller.unsentSpotEntryCount, 0)
+        controller.forgetSpots()
+        XCTAssertEqual(controller.unsentSpotEntryCount, 0, "Nothing left: a second forget changes nothing")
+    }
+
+    @MainActor
+    func testAMessageAtThePlaceTheHostHasSendsNoFixAgain() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        let controller = LocationSharingController(engine: engine, config: LocationFixtures.config(background: false, talking: true),
+                                                   unsent: LocationUnsent())
+        var now = LocationFixtures.at
+        var conditions = DeviceConditions()
+        controller.now = { now }
+        controller.deviceConditions = { conditions }
+        let here = LocationRawFix(latitude: 51.5321, longitude: -0.0755, accuracy: 15, timestamp: now)
+        let precision = controller.settings.precision(for: .message)
+
+        XCTAssertTrue(controller.messageFixIsNews(here, precision: precision), "Nothing sent yet")
+        controller.noteSent(LocationFixRecord(source: .message, raw: here), at: now)
+        now += 5 * 60
+        XCTAssertFalse(controller.messageFixIsNews(here, precision: precision))
+        now += 6 * 60
+        XCTAssertTrue(controller.messageFixIsNews(here, precision: precision), "Ten minutes on: sent again")
+        conditions.lowPowerMode = true
+        XCTAssertFalse(controller.messageFixIsNews(here, precision: precision), "Low Power Mode waits longer")
+
+        // A visit's fix is the host's latest now: the next message's goes.
+        controller.noteSent(LocationFixRecord(source: .visit, raw: here), at: now)
+        XCTAssertNil(controller.lastTalkingUpload)
+        XCTAssertTrue(controller.messageFixIsNews(here, precision: precision))
+
+        // A forgotten key drops the host's fix.
+        controller.noteSent(LocationFixRecord(source: .call, raw: here), at: now)
+        XCTAssertFalse(controller.messageFixIsNews(here, precision: precision))
+        engine.forgetHost()
+        XCTAssertTrue(controller.messageFixIsNews(here, precision: precision))
     }
 
     func testACachedFixAnswersPreciseOnlyWhenCloseToTheAskedAccuracy() {
@@ -846,6 +1068,101 @@ extension NotificationE2ETests {
         }
     }
 
+    func testAMapsDistanceToASavedPlaceIsRoundedLikeAnAreaOne() {
+        // Exact metres from a saved place to several known places would give
+        // its coordinates away (issue 1880): 100 m, whatever "me" is.
+        XCTAssertEqual(MapsDistance.rounded(1_234.4, saved: true, me: false, meAtArea: false), 1_200)
+        XCTAssertEqual(MapsDistance.rounded(1_234.4, saved: true, me: true, meAtArea: false), 1_200,
+                       "me at Precise to a saved place: the saved place's step")
+        XCTAssertEqual(MapsDistance.rounded(1_234.4, saved: false, me: true, meAtArea: false), 1_230)
+        XCTAssertEqual(MapsDistance.rounded(1_234.4, saved: false, me: true, meAtArea: true), 1_200)
+        XCTAssertEqual(MapsDistance.rounded(1_234.4, saved: false, me: false, meAtArea: false), 1_234, "between other places, to the metre")
+        XCTAssertEqual(MapsDistance.rounded(.infinity, saved: true, me: false, meAtArea: false), 0)
+    }
+
+    @MainActor
+    func testACompletionThatNeverAnswersEndsAtTheDeadline() async {
+        // CarPlay's open(_:options:completionHandler:) may never answer:
+        // nothing is left waiting on it (issue 1882).
+        var kept: ((Bool) -> Void)?
+        let silent = await MapsDeadline.first(after: 0.05, fallback: false) { answer in kept = answer }
+        XCTAssertFalse(silent)
+        kept?(true)
+        let answered = await MapsDeadline.first(after: 5, fallback: false) { answer in
+            answer(true)
+            answer(false)
+        }
+        XCTAssertTrue(answered, "the first answer counts, a second is ignored")
+    }
+
+    @MainActor
+    func testTheVoiceMapsToolReadsTheLocationConsentAgainEachTime() {
+        // MapsVoiceTool checks it again after the fix and after the lookup:
+        // a pause that starts meanwhile is seen (issue 1881).
+        var config = LocationFixtures.config(background: false, talking: true, pausedUntil: LocationFixtures.at.addingTimeInterval(60))
+        config.setVoiceRead(LiveVoiceModeName.geminiLive.storageID, allowed: true)
+        config.settings.talkingPrecision = .area
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        let controller = LocationSharingController(engine: engine, config: config, unsent: LocationUnsent())
+        var now = LocationFixtures.at.addingTimeInterval(120)
+        controller.now = { now }
+        XCTAssertTrue(MapsVoiceTool.allowsLocation(mode: .geminiLive, controller: controller))
+        XCTAssertFalse(MapsVoiceTool.allowsLocation(mode: .gptLive, controller: controller), "each mode is its own yes")
+        // The detail is Area now: a lookup begun at Area or Places only goes on,
+        // one begun at Precise doesn't.
+        XCTAssertTrue(MapsVoiceTool.allowsLocation(mode: .geminiLive, controller: controller, detail: .area))
+        XCTAssertTrue(MapsVoiceTool.allowsLocation(mode: .geminiLive, controller: controller, detail: .places))
+        XCTAssertFalse(MapsVoiceTool.allowsLocation(mode: .geminiLive, controller: controller, detail: .precise),
+                       "detail lowered since the lookup began")
+        now = LocationFixtures.at
+        XCTAssertFalse(MapsVoiceTool.allowsLocation(mode: .geminiLive, controller: controller), "paused")
+    }
+
+    func testEveryIngestSaysWhetherTheHostsOtherProfilesMayRead() throws {
+        var settings = LocationSharingSettings()
+        settings.talking = true
+        XCTAssertFalse(settings.otherProfiles, "only the bound profile reads unless the user says so")
+        var sharing = try XCTUnwrap(LocationBatch(sentAt: LocationFixtures.at, settings: settings).json()["sharing"] as? [String: Any])
+        XCTAssertEqual(sharing["other_profiles"] as? Bool, false)
+        settings.otherProfiles = true
+        sharing = try XCTUnwrap(LocationBatch(sentAt: LocationFixtures.at, settings: settings).json()["sharing"] as? [String: Any])
+        XCTAssertEqual(sharing["other_profiles"] as? Bool, true)
+        // Saved before the switch existed: the bound profile alone (notifier #287).
+        let old = try JSONDecoder().decode(LocationSharingSettings.self, from: Data(#"{"talking": true}"#.utf8))
+        XCTAssertFalse(old.otherProfiles)
+        XCTAssertTrue(try JSONDecoder().decode(LocationSharingSettings.self, from: JSONEncoder().encode(settings)).otherProfiles)
+    }
+
+    @MainActor
+    func testTheFirstLayerOnRecordsWhetherOtherProfilesMayReadAndASecondKeepsIt() {
+        let home = LocationBinding(dashboardID: LocationFixtures.dashboardID, profile: "default", host: "hermes.example.com")
+        let other = LocationBinding(dashboardID: UUID(), profile: "default", host: "other.example.com")
+        func decide(_ settings: LocationSharingSettings, to destination: LocationBinding? = nil, offered: Bool) -> Bool {
+            LocationSharingController.otherProfiles(turningOn: settings, bound: home, to: destination ?? home, offered: offered)
+        }
+        var settings = LocationSharingSettings()
+        XCTAssertTrue(decide(settings, offered: true))
+        XCTAssertFalse(decide(settings, offered: false))
+        settings.talking = true
+        settings.otherProfiles = true
+        XCTAssertTrue(decide(settings, offered: false), "the background layer keeps what the user agreed to")
+        settings.otherProfiles = false
+        XCTAssertFalse(decide(settings, offered: true), "turned off in Settings: a second layer doesn't turn it back on")
+        // Off in Settings, then sharing off and on again: the choice stands.
+        settings.otherProfilesChosen = true
+        settings.talking = false
+        XCTAssertFalse(decide(settings, offered: true))
+        settings.otherProfiles = true
+        XCTAssertTrue(decide(settings, offered: false))
+        // On for another host: that host's profiles are asked about afresh.
+        XCTAssertFalse(decide(settings, to: other, offered: false))
+        settings.otherProfiles = false
+        XCTAssertTrue(decide(settings, to: other, offered: true))
+    }
+
     func testEveryIngestSaysThePhoneAnswersMapsAndWhetherTheHostMayToo() throws {
         var settings = LocationSharingSettings()
         settings.background = true
@@ -916,5 +1233,91 @@ extension NotificationE2ETests {
         XCTAssertEqual(keys.load()?.answersMaps, true)
         _ = await engine.send(batch, config: background, request: request)
         XCTAssertEqual(keyRequests, 1)
+    }
+
+    // MARK: Apple Maps datum in mainland China (#1122)
+
+    func testMapDatumShiftsMainlandChinaToWhereAppleMapsDrawsIt() {
+        let tiananmen = CLLocationCoordinate2D(latitude: 39.9087, longitude: 116.3975)
+        let onMap = MapDatum.toMap(tiananmen)
+        XCTAssertEqual(onMap.latitude, 39.910103, accuracy: 0.000005)
+        XCTAssertEqual(onMap.longitude, 116.403744, accuracy: 0.000005)
+        let shift = CLLocation(latitude: tiananmen.latitude, longitude: tiananmen.longitude)
+            .distance(from: CLLocation(latitude: onMap.latitude, longitude: onMap.longitude))
+        XCTAssertGreaterThan(shift, 300)
+    }
+
+    func testMapDatumRegionParsesEveryPoint() {
+        let tokens = MapDatumRegion.mainland.split(whereSeparator: \.isWhitespace)
+        XCTAssertGreaterThan(tokens.count, 1_000)
+        for token in tokens + MapDatumRegion.excluded.flatMap({ $0.split(whereSeparator: \.isWhitespace) }) {
+            let parts = token.split(separator: ",")
+            XCTAssertEqual(parts.count, 2, String(token))
+            XCTAssertNotNil(parts.first.flatMap { Double($0) }, String(token))
+            XCTAssertNotNil(parts.last.flatMap { Double($0) }, String(token))
+        }
+    }
+
+    func testMapDatumReadsAMapPointBackToTheFixDatum() {
+        for fix in [CLLocationCoordinate2D(latitude: 39.9087, longitude: 116.3975),
+                    CLLocationCoordinate2D(latitude: 31.2304, longitude: 121.4737),
+                    CLLocationCoordinate2D(latitude: 22.5431, longitude: 114.0579),
+                    CLLocationCoordinate2D(latitude: 30.5728, longitude: 104.0668)] {
+            let back = MapDatum.fromMap(MapDatum.toMap(fix))
+            let error = CLLocation(latitude: fix.latitude, longitude: fix.longitude)
+                .distance(from: CLLocation(latitude: back.latitude, longitude: back.longitude))
+            XCTAssertLessThan(error, 0.01)
+        }
+    }
+
+    func testMapDatumLeavesPlacesOutsideMainlandChinaAlone() {
+        let outside: [(Double, Double)] = [
+            (51.5007, -0.1246),   // London
+            (25.0330, 121.5654),  // Taipei
+            (23.5700, 119.5800),  // Penghu
+            (24.4300, 118.3200),  // Kinmen
+            (26.1600, 119.9500),  // Matsu
+            (22.2819, 114.1582),  // Hong Kong Central
+            (22.4450, 114.0200),  // Yuen Long
+            (22.5280, 114.1130),  // Lo Wu
+            (22.2930, 114.1700),  // Victoria Harbour
+            (22.2400, 114.1500),  // off Aberdeen
+            (22.1987, 113.5439),  // Macau
+            (22.1900, 113.5600),  // between Macau and Taipa
+            (47.9184, 106.9177),  // Ulaanbaatar
+            (48.9683, 89.9625),   // Ölgii
+            (42.8700, 74.6000),   // Bishkek
+            (27.7000, 85.3200),   // Kathmandu
+            (27.4700, 89.6400),   // Thimphu
+            (21.0300, 105.8500),  // Hanoi
+            (40.1000, 124.4000),  // Sinuiju
+            (50.2700, 127.5300),  // Blagoveshchensk
+            (37.5665, 126.9780),  // Seoul
+            (37.9700, 124.6700),  // Baengnyeong
+        ]
+        for (latitude, longitude) in outside {
+            let place = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+            XCTAssertFalse(MapDatum.isShifted(place), "\(latitude), \(longitude)")
+            for converted in [MapDatum.toMap(place), MapDatum.fromMap(place)] {
+                XCTAssertEqual(converted.latitude, place.latitude)
+                XCTAssertEqual(converted.longitude, place.longitude)
+            }
+        }
+        let mainland: [(Double, Double)] = [
+            (22.5431, 114.0579),  // Shenzhen
+            (22.4800, 113.9100),  // Shekou
+            (22.2186, 113.5489),  // Gongbei, Zhuhai
+            (22.1300, 113.5200),  // Hengqin
+            (24.4798, 118.0894),  // Xiamen
+            (30.0160, 122.2070),  // Zhoushan
+            (18.2528, 109.5119),  // Sanya
+            (40.1270, 124.3900),  // Dandong
+            (50.2450, 127.4900),  // Heihe
+            (43.8256, 87.6168),   // Urumqi
+            (39.4700, 75.9900),   // Kashgar
+        ]
+        for (latitude, longitude) in mainland {
+            XCTAssertTrue(MapDatum.isShifted(CLLocationCoordinate2D(latitude: latitude, longitude: longitude)), "\(latitude), \(longitude)")
+        }
     }
 }

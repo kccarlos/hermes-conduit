@@ -1,0 +1,240 @@
+import XCTest
+@testable import Conduit
+
+/// Switching voice mode from a call screen: saved as Settings saves it, and
+/// the call starts again in the new mode, in the same chat.
+@MainActor
+extension AppStateVoiceCapabilityTests {
+    private func makeModeSwitchAppState() -> AppState {
+        let defaults = makeScratchDefaults("VoiceModeSwitch")
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
+        appState.isConnected = true
+        appState.installVoiceCapabilityStateForTesting(
+            bridge: DashboardTicketBridge(baseURL: "https://example.com"),
+            snapshot: VoiceCapabilitySnapshot(isGatewayConnected: true, supportsTranscription: false, supportsSpeech: false, unavailableReason: "No STT"),
+            isVoiceEnabled: false,
+            transcriptionMode: .hermes,
+            appleSpeechAvailability: .ready(localeIdentifier: "en-US")
+        )
+        return appState
+    }
+
+    private func installModeSwitchFakeGPTLive(in appState: AppState) -> (GPTLiveConversationController, FakeGPTLiveSessionControl) {
+        let session = FakeGPTLiveSessionControl()
+        let client = FakeGPTLiveClient()
+        let controller = GPTLiveConversationController(
+            makeSession: { session },
+            availability: { try await client.availability() },
+            briefing: { "[rules]" },
+            supervisor: appState.voiceBackgroundJobSupervisor,
+            requestPermission: { true }
+        )
+        _ = appState.gptLiveController
+        appState.gptLiveController = controller
+        return (controller, session)
+    }
+
+    @discardableResult
+    private func installModeSwitchFakeGeminiLive(in appState: AppState, provider: DirectLiveProvider = .gemini) -> FakeGeminiLiveSessionControl {
+        let session = FakeGeminiLiveSessionControl()
+        let tokens = FakeGeminiLiveTokens()
+        let controller = GeminiLiveConversationController(
+            makeSession: { session },
+            availability: { try await tokens.availability() },
+            tools: GeminiLiveToolBridge(supervisor: appState.voiceBackgroundJobSupervisor),
+            input: FakeGeminiLiveInput(),
+            output: FakeGeminiLiveOutput(),
+            routePolicy: { .fullDuplex }
+        )
+        if provider == .qwen {
+            _ = appState.qwenLiveController
+            appState.qwenLiveController = controller
+        } else {
+            _ = appState.geminiLiveController
+            appState.geminiLiveController = controller
+        }
+        return session
+    }
+
+    func testVoiceModeChoiceNamesEachEngine() {
+        for choice in VoiceModeChoice.allCases {
+            XCTAssertEqual(VoiceModeChoice(engine: choice.engine), choice)
+        }
+        XCTAssertNil(VoiceModeChoice.classic.engine)
+        XCTAssertEqual(VoiceModeChoice(engine: .localLive, localAgent: false), .classic,
+                       "Local Live outside agent mode is Classic's hands-free option, as Settings lists it")
+    }
+
+    func testQwenCanSwitchToGeminiAndClassicWithoutLosingPreferences() {
+        let appState = makeModeSwitchAppState()
+        appState.setGeminiLiveVoice("Kore")
+        appState.setQwenLiveVoice("Tina")
+        appState.applyVoiceMode(.qwen)
+        XCTAssertEqual(appState.configuredLiveVoiceEngine(profile: appState.activeProfile), .qwenLive)
+        XCTAssertFalse(appState.isGeminiLiveEnabled)
+        appState.applyVoiceMode(.gemini)
+        XCTAssertFalse(appState.isQwenLiveEnabled)
+        XCTAssertEqual(appState.geminiLiveVoice, "Kore")
+        XCTAssertEqual(appState.qwenLiveVoice, "Tina")
+        appState.applyVoiceMode(.qwen)
+        appState.applyVoiceMode(.classic)
+        XCTAssertFalse(appState.isQwenLiveEnabled)
+        XCTAssertNil(appState.configuredLiveVoiceEngine(profile: appState.activeProfile))
+    }
+
+    func testQwenPhoneEntryWorksWithClassicDisabledAndHasInstructionsPreview() async {
+        let appState = makeModeSwitchAppState()
+        _ = await appState.setVoiceEnabled(false)
+        appState.setQwenLiveEnabled(true)
+        appState.setQwenLiveMemoryEnabled(true)
+        appState.setQwenLivePersonalityEnabled(true)
+        XCTAssertNotNil(appState.voiceUnavailableReason)
+        XCTAssertNil(appState.phoneVoiceUnavailableReason)
+        XCTAssertTrue(appState.showsComposerVoiceButton)
+        let preview = appState.liveVoiceInstructionsPreview()
+        XCTAssertEqual(preview?.mode, "Qwen Live")
+        XCTAssertEqual(preview?.instructions.contains("SOUL.md"), true)
+        appState.isConnected = false
+        XCTAssertNotNil(appState.phoneVoiceUnavailableReason)
+    }
+
+    func testReopeningQwenDoesNotLetGeminiTeardownDetachItsChat() async {
+        let appState = makeModeSwitchAppState()
+        appState.setQwenLiveEnabled(true)
+        installModeSwitchFakeGeminiLive(in: appState, provider: .qwen)
+        let thread = VoiceThreadTarget(runtimeSessionID: "qwen-runtime", storedSessionID: "qwen-stored", title: "Qwen")
+        appState.voiceBackgroundJobSupervisor.attachLiveThread(thread)
+        appState.showQwenLiveSheet = true
+        await appState.qwenLiveController.start()
+        XCTAssertTrue(appState.qwenLiveController.isActive)
+        XCTAssertTrue(appState.openQwenLiveConversation())
+        XCTAssertEqual(appState.voiceBackgroundJobSupervisor.liveThread, thread)
+        XCTAssertTrue(appState.qwenLiveController.isActive)
+        appState.closeQwenLiveConversation()
+    }
+
+    func testAHandsFreeLocalCallCanMoveToClassic() {
+        let appState = makeModeSwitchAppState()
+        appState.setLocalLiveEnabled(true)
+        appState.setLocalLiveAgent(false)
+
+        let handsFree = appState.voiceModeSwitch(for: .localLive)
+        XCTAssertEqual(handsFree.current, .classic, "listed as Settings lists it")
+        XCTAssertTrue(handsFree.moves(to: .classic), "the call isn't classic voice yet")
+
+        let classic = appState.voiceModeSwitch(for: nil)
+        XCTAssertFalse(classic.moves(to: .classic), "a classic call stays as it is")
+        XCTAssertTrue(classic.moves(to: .gpt))
+    }
+
+    func testApplyingAVoiceModeSavesItAsSettingsDoes() {
+        let appState = makeModeSwitchAppState()
+
+        appState.applyVoiceMode(.gpt)
+        XCTAssertEqual(appState.configuredLiveVoiceEngine(profile: appState.activeProfile), .gptLive)
+
+        appState.applyVoiceMode(.gemini)
+        XCTAssertTrue(appState.isGeminiLiveEnabled)
+        XCTAssertFalse(appState.isGPTLiveEnabled, "one live mode per profile")
+
+        appState.applyVoiceMode(.local)
+        XCTAssertTrue(appState.isLocalLiveEnabled)
+        XCTAssertTrue(appState.isLocalLiveAgent, "Local is agent mode, as Settings picks it")
+        XCTAssertFalse(appState.isGeminiLiveEnabled)
+
+        appState.applyVoiceMode(.classic)
+        XCTAssertNil(appState.configuredLiveVoiceEngine(profile: appState.activeProfile))
+    }
+
+    func testASwitchFromALocalLiveCallsOwnChatStartsTheNewModeThere() {
+        let own = VoiceThreadTarget(runtimeSessionID: "rt-own", storedSessionID: "st-own", title: "Call", profile: "furina")
+        let attached = VoiceThreadTarget(runtimeSessionID: "rt-chat", storedSessionID: "st-chat", title: "Build")
+        XCTAssertEqual(AppState.voiceModeSwitchThread(classicChat: nil, classicWasOpen: false, liveThread: nil, localLiveOwnChat: own), own,
+                       "a Home call, or one whose chat was deleted, keeps the chat it made")
+        XCTAssertEqual(AppState.voiceModeSwitchThread(classicChat: nil, classicWasOpen: false, liveThread: attached, localLiveOwnChat: own), attached)
+        XCTAssertNil(AppState.voiceModeSwitchThread(classicChat: nil, classicWasOpen: true, liveThread: attached, localLiveOwnChat: own),
+                     "Classic works in the open chat only")
+        XCTAssertNil(AppState.voiceModeSwitchThread(classicChat: nil, classicWasOpen: false, liveThread: nil, localLiveOwnChat: own,
+                                                    isDeleted: { $0 == own }),
+                     "an own chat deleted since is never handed to the new mode")
+    }
+
+    func testSwitchingACallsModeStartsTheNewModeInTheSameChat() async {
+        let appState = makeModeSwitchAppState()
+        appState.setGPTLiveEnabled(true)
+        let (gptController, gptSession) = installModeSwitchFakeGPTLive(in: appState)
+        installModeSwitchFakeGeminiLive(in: appState)
+        let thread = VoiceThreadTarget(runtimeSessionID: "runtime-1", storedSessionID: "stored-1", title: "Marketing")
+        appState.voiceBackgroundJobSupervisor.attachLiveThread(thread)
+        appState.showGPTLiveSheet = true
+        await gptController.start()
+        gptSession.becomeReady()
+        XCTAssertTrue(gptController.isActive)
+        XCTAssertEqual(appState.voiceModeSwitch(for: .gptLive).current, .gpt)
+
+        await appState.switchVoiceMode(to: .gemini)
+
+        XCTAssertFalse(gptController.isActive, "the GPT-Live call hangs up")
+        XCTAssertFalse(appState.showGPTLiveSheet)
+        XCTAssertTrue(appState.showGeminiLiveSheet, "the new mode's call screen opens")
+        XCTAssertTrue(appState.isGeminiLiveEnabled, "saved as the profile's mode")
+        XCTAssertFalse(appState.isGPTLiveEnabled)
+        XCTAssertEqual(appState.voiceBackgroundJobSupervisor.liveThread, thread, "the new call works in the same chat")
+
+        // The old screen's dismissal lands after the new one is up: it
+        // must not let go of the new call's chat.
+        appState.liveVoiceSheetDismissed(.gptLive)
+        XCTAssertEqual(appState.voiceBackgroundJobSupervisor.liveThread, thread)
+        XCTAssertTrue(appState.showGeminiLiveSheet)
+        XCTAssertNil(appState.minimisedLiveVoice)
+
+        appState.closeGeminiLiveConversation()
+    }
+
+    func testSwitchingWhileDisconnectedSavesTheModeAndSaysWhyNothingStarted() async {
+        let appState = makeModeSwitchAppState()
+        appState.isConnected = false
+
+        await appState.switchVoiceMode(to: .grok)
+
+        XCTAssertTrue(appState.isGrokLiveEnabled, "the pick is still saved")
+        XCTAssertFalse(appState.showGrokLiveSheet)
+        XCTAssertEqual(appState.errorMessage, AppLocalization.string("Reconnect to Hermes to start voice."))
+    }
+
+    /// Waits until `condition` holds, failing after a few seconds.
+    private func waitUntil(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(condition(), "timed out", file: file, line: line)
+    }
+
+    func testTheOldScreensDismissalDoesNotTouchANewCallOnTheSameEngine() async {
+        // A hands-free Local Live call moving to Local restarts the same
+        // engine; GPT-Live stands in for it here, with fakes.
+        let appState = makeModeSwitchAppState()
+        appState.setGPTLiveEnabled(true)
+        let (gptController, gptSession) = installModeSwitchFakeGPTLive(in: appState)
+        let thread = VoiceThreadTarget(runtimeSessionID: "runtime-2", storedSessionID: "stored-2", title: "Trip")
+        appState.voiceBackgroundJobSupervisor.attachLiveThread(thread)
+        appState.showGPTLiveSheet = true
+        await gptController.start()
+        gptSession.becomeReady()
+
+        let switching = Task { await appState.switchVoiceMode(to: .gpt) }
+        await waitUntil { appState.voiceModeSwitchDismissing == .gptLive }
+        // The old screen's dismissal lands while the switch waits for it.
+        appState.liveVoiceSheetDismissed(.gptLive)
+        await switching.value
+
+        XCTAssertNil(appState.voiceModeSwitchDismissing)
+        XCTAssertTrue(appState.showGPTLiveSheet, "the new call's screen is up")
+        XCTAssertNil(appState.minimisedLiveVoice, "and not minimised by the old one going")
+        XCTAssertEqual(appState.voiceBackgroundJobSupervisor.liveThread, thread)
+
+        appState.closeGPTLiveConversation()
+    }
+}

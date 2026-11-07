@@ -98,6 +98,9 @@ final class WatchBridgeCallModel: ObservableObject {
     static let historyTurns = 40
     static let endTimeout: TimeInterval = 4
     static let sendsInFlightLimit = 20
+    /// Text events outstanding on one connection; at this many the socket
+    /// stopped taking them (#1231).
+    static let eventsInFlightLimit = 32
     static let timelineInterval: TimeInterval = 30
 
     @Published private(set) var phase: Phase = .idle
@@ -159,6 +162,8 @@ final class WatchBridgeCallModel: ObservableObject {
     private var pingMisses = 0
     private var pingOutstanding = false
     private var openFailures = 0
+    /// Sockets watchOS gave no network (#1346).
+    private var noNetwork = WatchNoNetwork()
     private var hostError: String?
     private var bytesUpBefore = 0
     private var bytesDownBefore = 0
@@ -179,6 +184,11 @@ final class WatchBridgeCallModel: ObservableObject {
     // Uplink
     private var pendingSamples: [Int16] = []
     private var sendsInFlight = 0
+    /// The current connection's text events outstanding: handed to the
+    /// socket and not yet completed.
+    private var eventsInFlight = 0
+    /// Times this call gave a connection up for its text backlog.
+    private var eventsBackloggedTrips = 0
     private var chunksUp = 0
     private var chunksDropped = 0
     private var sendFailures = 0
@@ -207,6 +217,10 @@ final class WatchBridgeCallModel: ObservableObject {
     @Published private(set) var transcript: [WatchVoiceWire.DirectTurn] = []
     /// Lines passed on with a delegation already.
     private var handledLines = 0
+    /// Settled lines dropped from the front to keep the call's tail, and
+    /// the user's among them, so counts of the user's lines still hold.
+    private var transcriptLinesDropped = 0
+    private var userLinesDropped = 0
     private var userLine = ""
     /// The profile's spoken end phrases: the user saying one ends the
     /// call once GPT-Live's goodbye has played, as on the iPhone.
@@ -227,9 +241,29 @@ final class WatchBridgeCallModel: ObservableObject {
         var text: String
         var channel: GPTLiveProtocol.Channel
         var delegationID: String?
+        /// The settled job whose outcome this says (#1210).
+        var newsJobID: String? = nil
     }
     /// Answers waiting for a quiet moment.
     private var pendingSends: [Pending] = []
+    /// A settled job's outcome from its news, not yet said: the status
+    /// context still names it, and a model that lets it pass hears it once
+    /// more, as on the iPhone (#1210). By job id.
+    private struct UnsaidNews {
+        let title: String
+        let status: String
+        let text: String
+        var resent = false
+        /// The check waiting on the send that carries it: newer news for
+        /// the job replaces the entry, and its own send checks it.
+        var check: UUID?
+    }
+    private var unsaidNews: [String: UnsaidNews] = [:]
+    /// The model's last words as text.
+    private var lastModelWordsAt: TimeInterval?
+    /// How long a job's outcome may go unspoken after it was sent before it
+    /// is sent once more (GeminiLiveConversationController.outcomeSpeechGrace).
+    static let newsSpeechGrace: TimeInterval = 6
     private var seenDelegations: Set<String> = []
     /// Each delegation's connection: a rejoined session can't take an
     /// answer on the old one's delegations, so those go as session context.
@@ -363,7 +397,9 @@ final class WatchBridgeCallModel: ObservableObject {
         // dropped; the microphone opens, and GPT-Live stops when it hears
         // the user.
         audio.stopPlayback()
-        suppressingTurn = true
+        // Only a stretch still arriving is dropped: pressed while an ended
+        // one's tail plays, the next must be heard (issue 1790).
+        suppressingTurn = modelSpeaking
         modelSpeaking = false
         lastPlaybackEndedAt = now
         awaitingFirstAudio = false
@@ -401,11 +437,8 @@ final class WatchBridgeCallModel: ObservableObject {
         let choice = approve ? WatchJobAnswer.approve : WatchJobAnswer.deny
         let id = callID
         Task { [weak self] in
-            let outcome = await relay.run(name: WatchJobAnswer.answerApproval, arguments: [
-                "job_id": approval.jobID,
-                "request_id": approval.requestID,
-                "choice": choice,
-            ])
+            let outcome = await relay.run(name: WatchJobAnswer.answerApproval,
+                                          arguments: WatchJobAnswer.answerArguments(approval, choice: choice))
             guard let self, self.callID == id, self.isActive else { return }
             // The grant ran out (it isn't renewed: the bridge belongs to it),
             // so no card can be answered from the Watch any more.
@@ -416,12 +449,19 @@ final class WatchBridgeCallModel: ObservableObject {
             }
             var taken = false
             // Hermes answered, and turned it down (already handled, or
-            // expired): asking again can't change that.
+            // expired), or the plugin held it back because the request
+            // changed (its new card comes with news): asking again can't
+            // change that.
             var refused = false
             if case .answered(let body) = outcome {
                 let result = WatchJobAnswer.result(body: body)
-                taken = result["error"] == nil && result["status"] != "failed"
+                taken = WatchJobAnswer.answerTaken(result)
                 refused = !taken
+                // Job news has stopped (the calls left are kept for
+                // answers), so the new request's card can't follow.
+                if result["status"] == "changed", !self.followingJobs {
+                    self.caption = String(localized: "The job's request changed. Answer it in Conduit on your iPhone.")
+                }
             }
             self.note("bridgeApproval", ["choice": choice, "taken": taken, "outcome": outcome.logLabel])
             if taken {
@@ -506,6 +546,11 @@ final class WatchBridgeCallModel: ObservableObject {
         case .callRefused(_, let reason)?:
             note("bridgeRefused", ["reason": reason])
             finish(reason)
+        case .callOnPhone?:
+            // A call from Hermes the iPhone kept on its headset (#1204):
+            // the call screen controls it from here (WatchVoiceCall).
+            note("bridgeOnPhone", [:])
+            finish(WatchCallEnd.onPhone)
         default:
             finish(String(localized: "Conduit on the iPhone sent something this Watch app can't read. Update both."))
         }
@@ -581,7 +626,11 @@ final class WatchBridgeCallModel: ObservableObject {
     private func connect() {
         guard isActive, let bridgeURL, let grantID, let grantRoot, let watchKey else { return }
         // A stream id is taken once per grant, and a grant takes 32.
-        guard streamsOpened < 30, let stream = WatchAudioBridgeStream(grantID: grantID, root: grantRoot) else {
+        guard streamsOpened < 30 else {
+            finish(WatchCallEnd.streamsSpent)
+            return
+        }
+        guard let stream = WatchAudioBridgeStream(grantID: grantID, root: grantRoot) else {
             finish(String(localized: "Couldn't reconnect to Hermes."))
             return
         }
@@ -613,6 +662,7 @@ final class WatchBridgeCallModel: ObservableObject {
         switch kind {
         case "open":
             socketOpenedAt = now
+            noNetwork.socketOpened()
             note("bridgeSocketOpen", [
                 "connection": number,
                 "ms": connectStartedAt.map { Int((now - $0) * 1000) } as Any,
@@ -628,6 +678,11 @@ final class WatchBridgeCallModel: ObservableObject {
             details["live"] = live
             details["screen"] = "\(scenePhase)"
             note("bridgeSocketClosed", details)
+            if endRequestedAt == nil, noNetwork.socketEnded(fields) {
+                openFailures += 1
+                finish(WatchCallEnd.noNetwork)
+                return
+            }
             connectionLost(code: fields["code"] as? Int ?? socket?.closeCode, opened: socketOpenedAt != nil)
         default:
             break
@@ -661,6 +716,7 @@ final class WatchBridgeCallModel: ObservableObject {
         bytesDownBefore += socket.bytesDown
         socket.close()
         self.socket = nil
+        eventsInFlight = 0
         startSentAt = nil
         pingMisses = 0
         pingOutstanding = false
@@ -768,10 +824,14 @@ final class WatchBridgeCallModel: ObservableObject {
                 return
             }
             // A call from Hermes: the model says what it called about, as
-            // the phone's GPT-Live call asks it to. Once, never on a rejoin,
-            // and only when the host didn't already have it speak first.
-            if WatchAudioBridgeWire.sendsOpeningTurn(rejoining: rejoining, started: info), let openingTurn {
-                pendingSends.insert(Pending(text: openingTurn, channel: .speakable, delegationID: nil), at: 0)
+            // the phone's GPT-Live call asks it to; any other call greets when
+            // the user asked for a greeting. Once, never on a rejoin, and only
+            // when the host didn't already have it speak first (an older
+            // plugin did; the model no longer does from its instructions,
+            // notifier #541).
+            if WatchAudioBridgeWire.sendsOpeningTurn(rejoining: rejoining, started: info),
+               let opening = openingTurn ?? greeting.map(LiveVoiceGreeting.turn) {
+                pendingSends.insert(Pending(text: opening, channel: .speakable, delegationID: nil), at: 0)
             }
             flushPending()
         case .ended(let reason):
@@ -786,6 +846,11 @@ final class WatchBridgeCallModel: ObservableObject {
             }
         case .error(let code, let message):
             note("bridgeHostError", ["code": code as Any, "message": String(message.prefix(200)), "live": live])
+            if code == WatchAudioBridgeWire.streamsSpent {
+                // No stream left to rejoin on: waiting for a start is pointless.
+                finish(endRequestedAt == nil ? WatchCallEnd.streamsSpent : WatchCallEnd.byUser)
+                return
+            }
             let text = message.isEmpty ? String(localized: "GPT-Live failed on Hermes.") : message
             switch code ?? "" {
             case "unreachable", "failed":
@@ -814,6 +879,7 @@ final class WatchBridgeCallModel: ObservableObject {
             userLine += words
             caption = String(userLine.suffix(120))
         case .outputTranscript(let words):
+            lastModelWordsAt = now
             assistantLine += words
             caption = String(assistantLine.suffix(120))
         case .turnDone(let role, let words):
@@ -824,10 +890,13 @@ final class WatchBridgeCallModel: ObservableObject {
             } else {
                 assistantLine = ""
                 lastModelTurnEndedAt = now
+                // A turn whose words come only here was still said.
+                if !text.isEmpty { lastModelWordsAt = now }
             }
             if !text.isEmpty {
                 transcript.append(.init(role: role == "user" ? .user : .assistant, text: text, at: Date()))
                 caption = String(text.suffix(120))
+                trimTranscript()
             }
             if role == "user", goodbyeHeardAt == nil, endRequestedAt == nil,
                VoiceSpokenCommands.asksToEndCall(text, endPhrases: endPhrases) {
@@ -839,6 +908,8 @@ final class WatchBridgeCallModel: ObservableObject {
                 if !text.isEmpty { handledLines = transcript.count }
             }
         case .delegation(let id, let text):
+            // Acting on a result counts as taking it, as words do (#1210).
+            lastModelWordsAt = now
             delegated(id: id, itemText: text)
         case .error(let code, let message):
             note("bridgeEngineError", ["code": code as Any, "message": String(message.prefix(200))])
@@ -853,12 +924,20 @@ final class WatchBridgeCallModel: ObservableObject {
         audioChunksDown += 1
         guard !samples.isEmpty, endRequestedAt == nil, phase != .needsTap else { return }
         let loud = samples.contains { abs(Int($0)) > Self.speechPeak }
+        // Quiet before this chunk: with no chunks between stretches, a new
+        // stretch's first loud chunk still shows the old one ended.
+        let quietBefore = lastLoudAt.map { now - $0 } ?? .infinity
         if loud { lastLoudAt = now }
         let quietFor = lastLoudAt.map { now - $0 } ?? .infinity
         if suppressingTurn {
-            // Dropped until this stretch of speech ends.
-            if quietFor > Self.speechGap { suppressingTurn = false }
-            return
+            // Dropped until this stretch of speech ends; the next is heard
+            // (issue 1790).
+            if quietBefore > Self.speechGap {
+                suppressingTurn = false
+            } else {
+                if quietFor > Self.speechGap { suppressingTurn = false }
+                return
+            }
         }
         if modelSpeaking {
             audio.enqueue(samples, sampleRate: Self.playbackRate)
@@ -984,7 +1063,12 @@ final class WatchBridgeCallModel: ObservableObject {
 
     private func sendEvent(_ message: [String: Any]) {
         guard let text = try? GPTLiveProtocol.encode(message) else { return }
-        send(Data(text.utf8), kind: .event)
+        eventsInFlight += 1
+        let number = connection
+        send(Data(text.utf8), kind: .event) { [weak self] _ in
+            guard let self, self.connection == number else { return }
+            self.eventsInFlight = max(0, self.eventsInFlight - 1)
+        }
     }
 
     private func audioInterrupted(began: Bool) {
@@ -1092,7 +1176,7 @@ final class WatchBridgeCallModel: ObservableObject {
         if !open.isEmpty { lines.append(.init(role: .user, text: open, handled: false)) }
         handledLines = transcript.count
         openLineDelegated = !open.isEmpty
-        delegationUserLines[id] = lines.filter { $0.role == .user }.count
+        delegationUserLines[id] = userLinesDropped + lines.filter { $0.role == .user }.count
         let request = WatchBridgeDelegation.request(itemText: itemText, lines: lines)
         let userWords = lines.filter { $0.role == .user && !$0.handled }.map(\.text).joined(separator: " ")
         let ownWords = itemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? userWords : itemText
@@ -1138,18 +1222,44 @@ final class WatchBridgeCallModel: ObservableObject {
             answer(id, WatchToolAnswer.delegatedCantOpen, channel: .commentary)
             return
         }
+        // "Answer: 2" for the call from Hermes this call answers: the host
+        // passes it to Hermes (WatchCallAnswer). Never an approval: on the
+        // Watch the user taps those.
+        if relay.tools.contains(WatchCallAnswer.tool),
+           let arguments = WatchCallAnswer.delegatedArguments(itemText, userWords: userWords, approves: false) {
+            answerCall(for: id, arguments: arguments, relay: relay)
+            return
+        }
+        // Any other answer marker answers nothing here, and is never new
+        // work: a bare "Answer:" with nothing said yet, or one on a call
+        // that can't answer Hermes.
+        let marker = itemText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if marker.hasPrefix("answer:") {
+            answer(id, relay.tools.contains(WatchCallAnswer.tool)
+                ? WatchCallAnswer.missingArgument(name: "answer_question")["error"] ?? ""
+                : "This call can't give Hermes the answer. Tell the user to answer in that chat in Conduit on their iPhone.",
+                channel: .commentary)
+            return
+        }
+        if ["approve:", "deny:"].contains(where: marker.hasPrefix) {
+            answer(id, "Approvals aren't given by voice on the Watch. Tell the user to answer in that chat in Conduit on their iPhone.", channel: .commentary)
+            return
+        }
         // "Job 2: make it Alex" puts the user's words into job 2 while it
         // runs (#455). A number with no job is just new work.
         // Read where the phone reads it: the delegation's own text, else
         // the user's words GPT-Live left it in.
-        if let marker = WatchBridgeDelegation.jobMarker(in: ownWords) {
+        // "Add to job 2: a quiet table" adds to job 2 without changing its
+        // direction: the job is steered, not redirected.
+        let addition = WatchBridgeDelegation.addToJobMarker(in: ownWords)
+        if let marker = addition ?? WatchBridgeDelegation.jobMarker(in: ownWords) {
             if let jobID = jobNumbers[marker.number] {
                 let words = WatchBridgeDelegation.followUpWords(userWords: userWords, delegated: marker.rest)
                 guard !words.isEmpty else {
                     answer(id, WatchBridgeDelegation.noRequest, channel: .speakable)
                     return
                 }
-                followUp(for: id, jobID: jobID, words: words, relay: relay)
+                followUp(for: id, jobID: jobID, words: words, kind: addition == nil ? nil : "add", relay: relay)
                 return
             }
             // A bare "Job 9:" asks for nothing, as on the phone: the user's
@@ -1204,11 +1314,13 @@ final class WatchBridgeCallModel: ObservableObject {
     /// this call's jobs on: a delegation has no way through the iPhone.
     static func startArguments(_ request: String, relay: WatchToolRelayClient) -> (arguments: [String: Any]?, refusal: String) {
         let task = WatchBridgeDelegation.removingQuickMarker(request)
+        // Ordinary work goes to the chat the call's first such job made (#1250).
+        let joinsCall = WatchJobAnswer.joinsCall(request, profile: nil)
         switch relay.jobRoute(instructions: task, spokenProfile: nil) {
         case nil:
-            return (["instructions": task], "")
+            return (["instructions": task, "joins_call": joinsCall], "")
         case .relay(let instructions, nil):
-            return (["instructions": instructions], "")
+            return (["instructions": instructions, "joins_call": joinsCall], "")
         case .relay(let instructions, let profile?):
             return (["instructions": instructions, "profile": profile], "")
         case .viaPhone(let label):
@@ -1274,7 +1386,7 @@ final class WatchBridgeCallModel: ObservableObject {
     }
 
     /// A correction to a job this call started, into the job on the host.
-    private func followUp(for delegationID: String, jobID: String, words: String, relay: WatchToolRelayClient) {
+    private func followUp(for delegationID: String, jobID: String, words: String, kind: String? = nil, relay: WatchToolRelayClient) {
         followUps += 1
         guard relay.tools.contains(WatchJobAnswer.interruptJob) else {
             answer(delegationID, WatchBridgeDelegation.followUpsUnavailable, channel: .speakable)
@@ -1284,7 +1396,7 @@ final class WatchBridgeCallModel: ObservableObject {
             answer(delegationID, WatchBridgeDelegation.relay("Hermes didn't get that (\(WatchBridgeDelegation.grantRanOutClause))"), channel: .speakable)
             return
         }
-        guard let arguments = WatchJobAnswer.arguments(name: WatchJobAnswer.interruptJob, ["job_id": jobID, "message": words]) else {
+        guard let arguments = WatchJobAnswer.arguments(name: WatchJobAnswer.interruptJob, ["job_id": jobID, "message": words, "kind": kind ?? ""]) else {
             answer(delegationID, WatchBridgeDelegation.noRequest, channel: .speakable)
             return
         }
@@ -1316,6 +1428,34 @@ final class WatchBridgeCallModel: ObservableObject {
         case .finished: return "finished"
         case .failed: return "failed"
         case .unknownJob: return "unknownJob"
+        }
+    }
+
+    /// The user's answer to what the call from Hermes waits on, through the
+    /// grant to the host; its reply (and a batch's next question) goes
+    /// back on the delegation. The log carries the outcome, never the answer.
+    private func answerCall(for delegationID: String, arguments: [String: Any], relay: WatchToolRelayClient) {
+        guard relay.canRun(WatchCallAnswer.tool) else {
+            let ranOut: String = WatchBridgeDelegation.grantRanOut
+            answer(delegationID, "The answer didn't reach Hermes: " + ranOut + " Tell the user to answer in Conduit on their iPhone.", channel: .commentary)
+            return
+        }
+        let id = callID
+        let sentAt = now
+        Task { [weak self] in
+            let outcome = await relay.run(name: WatchCallAnswer.tool, arguments: arguments)
+            guard let self, self.callID == id, self.isActive else { return }
+            let text: String
+            switch outcome {
+            case .answered(let body):
+                text = WatchCallAnswer.delegatedReply(body: body)
+            case .timedOut:
+                text = "Hermes didn't confirm the answer in time. Tell the user to check the chat in Conduit on their iPhone."
+            case .unavailable:
+                text = "The answer didn't reach Hermes. Tell the user to answer in Conduit on their iPhone."
+            }
+            self.note("bridgeCallAnswer", ["outcome": outcome.logLabel, "ms": Int((self.now - sentAt) * 1000)])
+            self.answer(delegationID, text, channel: .commentary)
         }
     }
 
@@ -1401,13 +1541,26 @@ final class WatchBridgeCallModel: ObservableObject {
         guard live, endRequestedAt == nil, !pendingSends.isEmpty else { return }
         let quiet = isQuiet
         var kept: [Pending] = []
+        var backlogged = false
         for item in pendingSends {
+            // A socket that stopped taking text is given up, as the phone's
+            // writer does: the replies not yet sent stay pending for the
+            // rejoined session rather than piling up behind it. Checked per
+            // reply: its chunks go out together, never half of it.
+            if backlogged || eventsInFlight >= Self.eventsInFlightLimit {
+                backlogged = true
+                kept.append(item)
+                continue
+            }
             guard item.channel == .commentary || quiet else {
                 kept.append(item)
                 continue
             }
             // A rejoined session doesn't know the old one's delegations.
             let delegationID = item.delegationID.flatMap { delegationConnection[$0] == connection ? $0 : nil }
+            if let jobID = item.newsJobID, unsaidNews[jobID]?.text == item.text {
+                checkNewsSpoken(jobID, text: item.text, since: now)
+            }
             var text = item.text
             if item.channel == .speakable, let asked = item.delegationID {
                 if userSpokeAfter(asked) { text = WatchBridgeDelegation.resultAfterUserNote + text }
@@ -1419,6 +1572,41 @@ final class WatchBridgeCallModel: ObservableObject {
             }
         }
         pendingSends = kept
+        if backlogged {
+            eventsBackloggedTrips += 1
+            note("bridgeEventsBacklogged", ["eventsInFlight": eventsInFlight, "trips": eventsBackloggedTrips, "kept": kept.count])
+            connectionLost(code: nil, opened: true)
+        }
+    }
+
+    /// A job's outcome counts as said once the model has said something
+    /// since it went out; one it let pass goes out once more.
+    /// Newer news for the job replaces the entry and gets its own check.
+    private func checkNewsSpoken(_ jobID: String, text: String, since sentAt: TimeInterval) {
+        let check = UUID()
+        unsaidNews[jobID]?.check = check
+        let id = callID
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.newsSpeechGrace))
+            guard let self, self.callID == id, self.isActive, self.endRequestedAt == nil,
+                  let news = self.unsaidNews[jobID], news.check == check else { return }
+            if self.modelSpoke(since: sentAt) || news.resent {
+                self.unsaidNews[jobID] = nil
+                self.sendJobStatus()
+                return
+            }
+            self.unsaidNews[jobID]?.resent = true
+            self.unsaidNews[jobID]?.check = nil
+            self.note("bridgeNewsResent", ["status": news.status])
+            self.pendingSends.append(Pending(text: news.text, channel: .speakable, delegationID: nil, newsJobID: jobID))
+            self.flushPending()
+        }
+    }
+
+    private func modelSpoke(since at: TimeInterval) -> Bool {
+        if let loud = lastLoudAt, loud >= at { return true }
+        if let words = lastModelWordsAt, words >= at { return true }
+        return false
     }
 
     /// The user said more after asking for this, as the phone checks:
@@ -1426,7 +1614,20 @@ final class WatchBridgeCallModel: ObservableObject {
     /// any words of theirs has no line to count from.
     private func userSpokeAfter(_ delegationID: String) -> Bool {
         guard let known = delegationUserLines[delegationID], known > 0 else { return false }
-        return transcript.filter { $0.role == .user }.count > known
+        return userLinesDropped + transcript.filter { $0.role == .user }.count > known
+    }
+
+    /// Keeps the settled lines to what the saved call can hold (#1008):
+    /// the oldest go once a turn settles. A delegation takes its context
+    /// from the newest lines (WatchBridgeDelegation.request), and the
+    /// user's line still being heard is kept apart.
+    private func trimTranscript() {
+        let dropped = WatchVoiceWire.DirectTranscript.overflow(transcript)
+        guard dropped > 0 else { return }
+        userLinesDropped += transcript.prefix(dropped).filter { $0.role == .user }.count
+        transcript.removeFirst(dropped)
+        handledLines = max(0, handledLines - dropped)
+        transcriptLinesDropped += dropped
     }
 
     private var isQuiet: Bool {
@@ -1489,8 +1690,11 @@ final class WatchBridgeCallModel: ObservableObject {
     /// The phone's job status context: GPT-Live answers "how's my job
     /// going?" from it instead of delegating or guessing.
     private func sendJobStatus() {
+        // A settled job is named until its outcome is said, as the iPhone
+        // lists it (#1210).
         let jobs = jobNumbers.sorted { $0.key < $1.key }.compactMap { entry in
             runningJobs[entry.value].map { (number: entry.key, title: $0.title, status: $0.status) }
+                ?? unsaidNews[entry.value].map { (number: entry.key, title: $0.title, status: $0.status) }
         }
         answer(nil, WatchBridgeDelegation.statusContext(jobs), channel: .commentary)
     }
@@ -1516,8 +1720,8 @@ final class WatchBridgeCallModel: ObservableObject {
     private func jobNews(_ news: WatchJobAnswer.News) {
         relayJobsRunning = news.running
         jobNewsItems += news.items.count
-        let open = Set(news.openApprovals.map { "\($0.jobID)\n\($0.requestID)" })
-        approvals.removeAll { !open.contains("\($0.jobID)\n\($0.requestID)") }
+        let open = Set(news.openApprovals.map { WatchJobAnswer.openKey(jobID: $0.jobID, requestID: $0.requestID, fingerprint: $0.fingerprint) })
+        approvals.removeAll { !open.contains(WatchJobAnswer.openKey(jobID: $0.jobID, requestID: $0.requestID, fingerprint: $0.fingerprint)) }
         var shown = 0
         var statusChanged = false
         for item in news.items {
@@ -1547,8 +1751,17 @@ final class WatchBridgeCallModel: ObservableObject {
             // GPT-Live can't answer an approval here: the user taps it.
             guard let text = WatchJobAnswer.notice(for: item, voiceApprovals: false) else { continue }
             let settled = ["finished", "failed", "cancelled"].contains(item.status)
+            // The same outcome reported again is already on its way, and
+            // may have had its one resend (#1210).
+            if settled, unsaidNews[item.jobID]?.text == text { continue }
+            if settled {
+                // Newer news keeps the job's one resend spent.
+                let resent = unsaidNews[item.jobID]?.resent ?? false
+                unsaidNews[item.jobID] = UnsaidNews(title: Self.jobTitle(item.title), status: item.status, text: text, resent: resent)
+                statusChanged = true
+            }
             let delegationID = settled ? jobDelegations.removeValue(forKey: item.jobID) : nil
-            pendingSends.append(Pending(text: text, channel: .speakable, delegationID: delegationID))
+            pendingSends.append(Pending(text: text, channel: .speakable, delegationID: delegationID, newsJobID: settled ? item.jobID : nil))
         }
         pendingApproval = approvals.first
         if statusChanged { sendJobStatus() }
@@ -1743,6 +1956,7 @@ final class WatchBridgeCallModel: ObservableObject {
         lastPingAt = 0
         pingFailures = 0
         openFailures = 0
+        noNetwork = WatchNoNetwork()
         hostError = nil
         bytesUpBefore = 0
         bytesDownBefore = 0
@@ -1756,6 +1970,8 @@ final class WatchBridgeCallModel: ObservableObject {
         microphoneStopped = false
         pendingSamples = []
         sendsInFlight = 0
+        eventsInFlight = 0
+        eventsBackloggedTrips = 0
         chunksUp = 0
         chunksDropped = 0
         sendFailures = 0
@@ -1776,6 +1992,8 @@ final class WatchBridgeCallModel: ObservableObject {
         events = [:]
         transcript = []
         handledLines = 0
+        transcriptLinesDropped = 0
+        userLinesDropped = 0
         userLine = ""
         openLineDelegated = false
         assistantLine = ""
@@ -1785,6 +2003,8 @@ final class WatchBridgeCallModel: ObservableObject {
         endPhrases = []
         goodbyeHeardAt = nil
         pendingSends = []
+        unsaidNews = [:]
+        lastModelWordsAt = nil
         seenDelegations = []
         delegationConnection = [:]
         delegationUserLines = [:]
@@ -1858,6 +2078,7 @@ final class WatchBridgeCallModel: ObservableObject {
             "playbackStalls": audio.playbackStalls - playbackStallsAtStart,
             "streamsOpened": streamsOpened,
             "openFailures": openFailures,
+            "offlineRefusals": noNetwork.refusals,
             "drops": drops,
             "rejoins": rejoins,
             "rejoinMaxMs": WatchVoiceStats.milliseconds(rejoinTimes.max()) as Any,
@@ -1891,6 +2112,7 @@ final class WatchBridgeCallModel: ObservableObject {
             "watchSuspendedMs": watchSuspendedMs,
             "watchGaps": watchGaps,
             "transcriptLines": saved.count,
+            "transcriptLinesDropped": transcriptLinesDropped,
             "transcriptQueued": queued,
             "batteryStart": batteryAtStart,
             "batteryEnd": battery,

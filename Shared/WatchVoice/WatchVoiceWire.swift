@@ -13,20 +13,23 @@ import Foundation
 enum WatchVoiceWire {
     /// Bumped when either side changes what a message means; a mismatch
     /// refuses the call instead of misreading it.
-    static let version = 2
+    // Version 4 separates provider selection and Qwen token semantics.
+    // Older Watches must update before receiving Qwen credentials.
+    static let version = 4
     /// The message dictionary's only key.
     static let messageKey = "wv"
 
-    /// A single-use Gemini Live token the iPhone got from the Hermes host
-    /// (designs/apple-watch-voice-direct.md). With the call's tool grant,
-    /// the only credential the Watch ever holds: it works for one session
-    /// and expires within the half hour.
+    /// A short-lived Gemini or Qwen credential obtained through Hermes.
+    /// The permanent provider key is never sent to the Watch. Qwen uses
+    /// this credential in an Authorization header, not Google's URL auth.
     struct DirectToken: Codable, Equatable {
         var token: String
         var expiresAt: Date?
         var newSessionExpiresAt: Date?
         var model: String
         var webSocketURL: String
+        var voice: String? = nil
+        var provider: DirectLiveProvider? = nil
     }
 
     /// Everything a Watch call needs to run Gemini Live the way a call on
@@ -148,6 +151,21 @@ enum WatchVoiceWire {
         var endPhrases: [String]? = nil
     }
 
+    /// Everything a Watch call to Local Live needs, built on the iPhone: the
+    /// grant that opens the host's audio bridge, where the host relays the
+    /// Watch's session to the user's speech server and answers its turns in
+    /// a Hermes chat. No setup: the speech server's model is Hermes.
+    struct LocalLiveCall: Codable, Equatable {
+        var grant: DirectToolGrant
+        /// What the speech server says once the call is ready, resolved
+        /// from the greeting setting as the iPhone's call does; nil says
+        /// nothing.
+        var greeting: String?
+        /// The profile's spoken end phrases: the user saying one ends the
+        /// call, as on the iPhone.
+        var endPhrases: [String]? = nil
+    }
+
     /// The setup's long part. Function declarations travel as their JSON:
     /// their parameter schemas aren't Codable.
     struct DirectSetup: Codable, Equatable {
@@ -160,6 +178,12 @@ enum WatchVoiceWire {
         var id: String
         var name: String
         var arguments: [String: String]
+        /// What the user last said in the call, and which of their turns
+        /// it was: a change to what they keep on the iPhone takes their
+        /// own yes, which the iPhone can't hear on a Watch call. Nil from
+        /// an older Watch app.
+        var userWords: String? = nil
+        var userTurn: Int? = nil
     }
 
     /// What the tool bridge asks the call to send Gemini, as on the iPhone.
@@ -183,6 +207,19 @@ enum WatchVoiceWire {
         /// started elsewhere count too): the Watch asks again while there
         /// are any.
         var runningJobs: Int
+        /// The settled jobs whose outcome a `textWhenIdle` above says: the
+        /// iPhone counts it told once the Watch has it, so the Watch keeps
+        /// it on list_jobs until the model says it (#1210). Nil from an
+        /// older iPhone app.
+        var newsJobs: [DirectNewsJob]? = nil
+    }
+
+    /// A settled job and the text update that carries its outcome.
+    struct DirectNewsJob: Codable, Equatable {
+        var text: String
+        var jobID: String
+        var title: String
+        var status: String
     }
 
     /// One settled line of a Watch call's transcript.
@@ -246,6 +283,22 @@ enum WatchVoiceWire {
         /// takes three bytes a character), and a long call keeps its end.
         static let maxTextBytes = 40_000
 
+        /// How many of the oldest turns a running call drops so the rest
+        /// fit `bytes`, as the saved call would keep them: a long call
+        /// holds no more on the Watch than it can send. Turns from
+        /// `protected` on (a line still open) stay, whatever their size,
+        /// and so does the newest, which `capped` clips rather than drops.
+        static func overflow(_ turns: [DirectTurn], bytes: Int = maxTextBytes, protected: Int? = nil) -> Int {
+            var total = turns.reduce(0) { $0 + $1.text.utf8.count }
+            let limit = max(0, min(protected ?? turns.count, turns.count - 1))
+            var dropped = 0
+            while total > bytes, dropped < limit {
+                total -= turns[dropped].text.utf8.count
+                dropped += 1
+            }
+            return dropped
+        }
+
         static func capped(_ turns: [DirectTurn], bytes: Int = maxTextBytes) -> [DirectTurn] {
             var kept: [DirectTurn] = []
             var total = 0
@@ -285,12 +338,14 @@ enum WatchVoiceWire {
         // Watch → iPhone
         /// A finished call's summary, as one JSON line for the iPhone's log.
         case report(String)
-        /// Any other Watch event, as one JSON line for the iPhone's log.
+        /// Any other Watch events, as JSON lines for the iPhone's log,
+        /// joined by newlines (WatchCallLogBatch): one line from an older
+        /// Watch.
         case note(String)
         /// A Watch call to Gemini Live wants its session. `ring`: the call
         /// from Hermes it answers (designs/hermes-calls-watch.md), so it
         /// opens with what Hermes called about.
-        case directStart(callID: UInt32, version: Int, ring: String? = nil)
+        case directStart(callID: UInt32, version: Int, ring: String? = nil, provider: DirectLiveProvider? = nil)
         /// A new single-use token for the call's next connection.
         case directToken(callID: UInt32)
         case directTool(callID: UInt32, call: DirectToolCall)
@@ -310,6 +365,9 @@ enum WatchVoiceWire {
         /// A Watch call to Grok wants its setup and the grant that opens
         /// the host's audio bridge.
         case grokStart(callID: UInt32, version: Int, ring: String? = nil)
+        /// A Watch call to Local Live wants the grant that opens the host's
+        /// audio bridge. Calls from Hermes don't ring a Watch on Local Live.
+        case localLiveStart(callID: UInt32, version: Int, ring: String? = nil)
         /// The Watch's own PushKit token, which calls from Hermes ring on
         /// (designs/hermes-calls-watch.md); nil once it has none. Queued, so
         /// it reaches a sleeping iPhone. `key`: the Watch's handoff key,
@@ -317,8 +375,11 @@ enum WatchVoiceWire {
         /// the relay (HermesRingHandoff); nil from an older Watch. `engine`:
         /// the voice an answered call starts with (a WatchCallVoices.Voice
         /// raw value), sent again when it changes: the Watch rings only
-        /// while it can start; nil from an older Watch.
-        case callsToken(token: String?, key: String? = nil, engine: String? = nil)
+        /// while it can start; nil from an older Watch. `phoneHeadset`:
+        /// the Watch can leave an answered call on the iPhone's headset
+        /// and control it from its call screen (`callOnPhone`); nil from
+        /// an older Watch, which can't.
+        case callsToken(token: String?, key: String? = nil, engine: String? = nil, phoneHeadset: Bool? = nil)
         // iPhone → Watch
         /// Why the iPhone can't serve the call, as the Watch shows it.
         case callRefused(callID: UInt32, reason: String)
@@ -334,6 +395,13 @@ enum WatchVoiceWire {
         case bridgeSession(callID: UInt32, session: BridgeSession)
         /// The answer to `grokStart`; a refusal comes as `callRefused`.
         case grokSession(callID: UInt32, session: GrokSession)
+        /// The answer to `localLiveStart`; a refusal comes as `callRefused`.
+        case localLiveSession(callID: UInt32, call: LocalLiveCall)
+        /// The answer to a start for a call from Hermes answered on the
+        /// Watch while the iPhone has a headset on (#1204): the iPhone
+        /// answered its own ring, so the voice plays on the headset, and
+        /// the Watch's call screen keeps Mute and End (HermesRingControl).
+        case callOnPhone(callID: UInt32)
     }
 
     static func encode(_ message: Message) -> [String: Any] {
@@ -360,7 +428,16 @@ enum WatchVoiceMain {
     /// scrolls, and the pause would read as a link stall or a suspension.
     static func timer(every interval: TimeInterval, repeats: Bool, _ block: @escaping @Sendable (Timer) -> Void) -> Timer {
         let timer = Timer(timeInterval: interval, repeats: repeats, block: block)
+        timer.tolerance = tolerance(for: interval)
         RunLoop.main.add(timer, forMode: .common)
         return timer
+    }
+
+    /// How late a timer may fire, so the system can group its wakeups
+    /// with others': a tenth of an interval of a second or more (a call's
+    /// 1 s tick may come at 1.1 s, a 20 s ping at 22 s). A shorter one
+    /// paces the call's microphone audio and stays exact.
+    static func tolerance(for interval: TimeInterval) -> TimeInterval {
+        interval >= 1 ? interval / 10 : 0
     }
 }

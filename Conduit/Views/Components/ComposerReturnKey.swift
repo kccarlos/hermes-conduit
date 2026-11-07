@@ -17,6 +17,22 @@ enum ComposerReturnKey {
     /// never synchronized to the Hermes profile or gateway.
     static let preferenceKey = "conduit.composerReturnKeySends"
 
+    /// The preference before it is first set. On a Mac, Return sends, as in
+    /// Hermes Desktop, Messages and Slack, with Shift-Return for a new line.
+    /// On iPhone and iPad it stays off, so a hardware keyboard keeps the
+    /// newline it always had.
+    static var sendsByDefault: Bool { sendsByDefault(onMac: ProcessInfo.processInfo.isiOSAppOnMac) }
+
+    static func sendsByDefault(onMac: Bool) -> Bool { onMac }
+
+    /// Settings' note on where the preference starts, so a Mac user can
+    /// tell why it's already on.
+    static func defaultFootnote(onMac: Bool) -> String {
+        sendsByDefault(onMac: onMac)
+            ? AppLocalization.string("On by default on a Mac. Turn it off to make Return insert a new line.")
+            : AppLocalization.string("Off by default on iPhone and iPad.")
+    }
+
     /// What the text view should do with one hardware Return press.
     enum Decision: Equatable {
         case submit
@@ -46,7 +62,7 @@ enum ComposerReturnKey {
     /// empty composer is stop-only; Return must never act as the Stop button.
     static func canSubmit(action: ComposerAction) -> Bool {
         switch action {
-        case .send, .steer, .interrupt: return true
+        case .send, .steer, .interrupt, .queue: return true
         case .stop, .unavailable: return false
         }
     }

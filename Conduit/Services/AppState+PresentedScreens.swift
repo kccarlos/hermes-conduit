@@ -32,6 +32,78 @@ extension AppState {
         await openExpectedPresentedMaps()
     }
 
+    /// Whether a voice conversation is up that can show Hermes' cards.
+    var voiceConversationShowsCards: Bool {
+        isQwenLiveActive || isGeminiLiveActive || isGrokLiveActive || isLocalLiveActive || showVoiceSheet
+    }
+
+    /// Hermes showing a card (`conduit_show`) or ending a reply during a
+    /// voice conversation: fetch what it showed. The tool's start comes
+    /// before the card is kept, and its end isn't sent when tool progress
+    /// is off, so the reply's end fetches too.
+    func notePresentedCardEvent(_ event: StreamEvent) {
+        guard voiceConversationShowsCards else { return }
+        switch event {
+        case .toolStart(_, let name, _, _):
+            guard name == PresentedCard.toolName else { return }
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, self.voiceConversationShowsCards else { return }
+                await self.syncPresentedScreens()
+            }
+        case .toolComplete(_, let name, _, _):
+            guard name == PresentedCard.toolName else { return }
+            Task { [weak self] in await self?.syncPresentedScreens() }
+        case .messageComplete:
+            Task { [weak self] in await self?.syncPresentedScreens() }
+        default:
+            return
+        }
+    }
+
+    /// New cards from Hermes: on the call's screen (waiting there while
+    /// it's minimised: Hermes has said they're on it), or over a Classic
+    /// voice conversation, where one sheet holds them all, cards arriving
+    /// while it's open included. Outside a voice conversation they're only
+    /// noted.
+    func showPresentedCards(_ cards: [PresentedCard]) {
+        var unshown: [PresentedCard] = []
+        for card in cards {
+            let shown = voiceBackgroundJobSupervisor.showOnScreen(
+                title: card.title, markdown: card.markdown, cards: card.cards, evenIfHidden: true)
+            if shown == nil { unshown.append(card) }
+        }
+        guard showVoiceSheet, !unshown.isEmpty else { return }
+        // A live card replaces the sheet's earlier one of the same name,
+        // one that came in the same exchange included.
+        var parts = classicVoiceCard == nil ? [] : classicVoiceCardParts
+        for card in unshown {
+            let live = Set(card.cards.compactMap { $0["live"] as? String })
+            if !live.isEmpty {
+                parts = parts.compactMap { part -> PresentedCard? in
+                    let kept = part.cards.filter { ($0["live"] as? String).map { !live.contains($0) } ?? true }
+                    if kept.count == part.cards.count { return part }
+                    return kept.isEmpty && part.markdown.isEmpty
+                        ? nil : PresentedCard(id: part.id, title: part.title, markdown: part.markdown, cards: kept)
+                }
+            }
+            parts.append(card)
+        }
+        classicVoiceCardParts = parts
+        let title = parts.count == 1 ? parts[0].title : AppLocalization.string("From Hermes")
+        // Each card under its own heading when there are several, clipped as
+        // the call screen clips its cards.
+        let markdown = parts.count == 1 ? parts[0].markdown : parts.map { card in
+            card.title.isEmpty ? card.markdown : "### \(card.title)\n\n\(card.markdown)"
+        }.joined(separator: "\n\n")
+        classicVoiceCard = PresentedCard(
+            id: parts.map(\.id).joined(separator: "+"),
+            title: String(title.prefix(VoiceBackgroundJobSupervisor.maximumScreenTitleCharacters)),
+            markdown: VoiceBackgroundJobSupervisor.clippedScreenMarkdown(markdown),
+            cards: parts.flatMap(\.cards)
+        )
+    }
+
     /// Hermes was seen asking to open Apple Maps (`conduit_maps` navigate)
     /// in the chat on screen: that Go confirmation opens Maps without a tap.
     func noteMapsNavigateExpected(_ promptID: String) {
@@ -96,6 +168,12 @@ extension AppState {
     func answerPresentedConfirm(_ prompt: PresentedConfirm, outcome: PresentedConfirmOutcome,
                                 via source: PresentedConfirmAnswerSource) async {
         presentedScreens.answer(prompt, outcome: outcome, via: source)
+        await reportPresentedAnswer(prompt, outcome: outcome)
+    }
+
+    /// An answer already taken: the host hears it, and a confirmed one
+    /// opens its Maps directions.
+    func reportPresentedAnswer(_ prompt: PresentedConfirm, outcome: PresentedConfirmOutcome) async {
         await syncPresentedScreens()
         if outcome == .confirmed { await openPresentedMaps(prompt) }
     }
@@ -127,7 +205,9 @@ extension AppState {
     /// The user's last turn in the running live call.
     func liveCallLastUserTurn() -> (id: UUID?, text: String) {
         let transcript: [VoiceConversationTranscriptEntry]
-        if isGeminiLiveActive {
+        if isQwenLiveActive {
+            transcript = qwenLiveController.transcript
+        } else if isGeminiLiveActive {
             transcript = geminiLiveController.transcript
         } else if isGrokLiveActive {
             transcript = grokLiveController.transcript
@@ -135,6 +215,8 @@ extension AppState {
             transcript = gptLiveController.transcript
         } else if isLocalLiveActive {
             transcript = localLiveController.transcript
+        } else if let turn = watchCallUserTurn {
+            return (turn.id, turn.text)
         } else {
             return (nil, "")
         }
@@ -177,7 +259,7 @@ extension AppState {
                 let turn = self.liveCallLastUserTurn().id
                 for prompt in fresh { self.presentedScreens.noteShown(prompt.id, userTurn: turn) }
                 guard !fresh.isEmpty, supervisor.hostToolsMode == mode,
-                      self.isGeminiLiveActive || self.isGPTLiveActive || self.isGrokLiveActive else { return }
+                      self.isQwenLiveActive || self.isGeminiLiveActive || self.isGPTLiveActive || self.isGrokLiveActive || self.isLocalLiveActive else { return }
                 for prompt in fresh { supervisor.notePhoneChange(PresentVoiceTool.note(for: prompt)) }
             }
     }

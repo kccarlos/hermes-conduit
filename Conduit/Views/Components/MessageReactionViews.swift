@@ -50,10 +50,10 @@ struct MessageReactionChips: View {
     private func chip(_ group: ChipGroup) -> some View {
         let label = HStack(spacing: 2) {
             Text(group.emoji)
-                .font(.subheadline)
+                .scaledFont(.subheadline)
             if group.count > 1 {
                 Text(verbatim: "\(group.count)")
-                    .font(.caption2.weight(.semibold))
+                    .scaledFont(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
         }
@@ -116,7 +116,7 @@ struct TapbackPicker: View {
                     onPick(emoji)
                 } label: {
                     Text(emoji)
-                        .font(.title2)
+                        .scaledFont(.title2)
                         .frame(minWidth: 44, minHeight: 44)
                         .background(
                             Circle().fill(emoji == selected ? Color.conduitAccent.opacity(0.22) : Color.clear)
@@ -144,20 +144,23 @@ struct MessageReactButton: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     let message: ChatMessage
     @Binding var isPresented: Bool
-    @EnvironmentObject private var appState: AppState
+    @Environment(\.chatRowState) private var rowState
+    @Environment(\.chatRowActions) private var rowActions
+    /// Acted on, not observed: what a row shows comes from `rowState`.
+    private var appState: AppState { rowActions.required }
 
     private var mine: String? {
         message.reactions.first(where: \.isFromUser)?.emoji
     }
 
     var body: some View {
-        let enabled = appState.canReact(to: message)
+        let enabled = rowState.canReact(to: message)
         Button {
             Haptics.light()
             isPresented = true
         } label: {
             Image(systemName: mine == nil ? "face.smiling" : "face.smiling.inverse")
-                .font(.subheadline.weight(.semibold))
+                .scaledFont(.subheadline.weight(.semibold))
                 .frame(width: 34, height: 34)
         }
         .buttonStyle(.plain)

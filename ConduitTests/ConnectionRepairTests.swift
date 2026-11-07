@@ -38,11 +38,7 @@ final class ConnectionRepairTests: XCTestCase {
         reconnectScheduler: ChatResumeReconnectScheduler? = nil
     ) -> (appState: AppState, coordinator: ChatResumeCoordinator, store: ChatResumeStore,
           recoverySequence: ChatResumeRecoverySequence, defaults: UserDefaults) {
-        let suite = "ConnectionRepairTests.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suite) else {
-            fatalError("Failed to create test defaults suite")
-        }
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let defaults = makeScratchDefaults("ConnectionRepairTests")
         let store = ChatResumeStore(defaults: defaults)
         let coordinator = ChatResumeCoordinator(store: store)
         let recoverySequence = ChatResumeRecoverySequence()
@@ -137,10 +133,12 @@ final class ConnectionRepairTests: XCTestCase {
             ConnectionSetupFlow.initialPath(for: .repairConnection, draft: draft, repairFailure: .cloudflareTokenRejected),
             [.connectionDetails, .cloudflareTroubleshooting]
         )
-        XCTAssertEqual(
-            ConnectionSetupFlow.initialPath(for: .repairConnection, draft: draft, repairFailure: .tlsUntrusted),
-            [.connectionDetails, .tlsTroubleshooting]
-        )
+        for failure: ConnectionFailure in [.tlsUntrusted, .tlsBadDate, .tlsFailure, .tlsHostnameMismatch, .tlsNotStandardsCompliant] {
+            XCTAssertEqual(
+                ConnectionSetupFlow.initialPath(for: .repairConnection, draft: draft, repairFailure: failure),
+                [.connectionDetails, .tlsTroubleshooting]
+            )
+        }
         for failure: ConnectionFailure in [.invalidAddress, .hostNotFound, .unreachable, .connectionRefused, .timedOut, .offline, .dashboardUnavailable, .unexpectedServerResponse] {
             XCTAssertEqual(
                 ConnectionSetupFlow.initialPath(for: .repairConnection, draft: draft, repairFailure: failure),
@@ -160,6 +158,11 @@ final class ConnectionRepairTests: XCTestCase {
         )
         XCTAssertEqual(
             ConnectionSetupFlow.initialPath(for: .repairConnection, draft: draft, repairFailure: nil),
+            [.connectionDetails, .connectionTest]
+        )
+        // A sign-in page that didn't open says nothing about the address.
+        XCTAssertEqual(
+            ConnectionSetupFlow.initialPath(for: .repairConnection, draft: draft, repairFailure: .signInPageFailed),
             [.connectionDetails, .connectionTest]
         )
         XCTAssertEqual(ConnectionSetupFlow.entryStep(for: .repairConnection), .connectionDetails)
@@ -201,10 +204,6 @@ final class ConnectionRepairTests: XCTestCase {
         flow.back()
         XCTAssertEqual(flow.step, .connectionDetails)
         flow.submitDetails()
-        XCTAssertEqual(flow.step, .loginCredentials)
-        XCTAssertTrue(flow.draft.username.isEmpty)
-        XCTAssertTrue(flow.draft.password.isEmpty)
-        flow.submitCredentials()
         XCTAssertEqual(flow.step, .connectionTest, "Empty credentials must not block the repair test path")
         XCTAssertNil(flow.validationError)
 
@@ -220,6 +219,184 @@ final class ConnectionRepairTests: XCTestCase {
         XCTAssertFalse(flow.canUseSettings, "Credentials required never authorizes Reconnect Now")
         flow.editAfterFailedTest(.loginCredentials)
         XCTAssertEqual(flow.step, .loginCredentials)
+        flow.back()
+        XCTAssertEqual(flow.step, .connectionDetails, "The credentials step replaced the spent test")
+    }
+
+    // MARK: - Sign In to Reconnect fencing
+
+    /// A Repair flow whose staged test ended in `terminal` (an interactive
+    /// outcome), sitting on Review.
+    private func repairFlowAtReview(ending terminal: ConnectionSetupTestEvent) throws -> ConnectionSetupFlow {
+        var flow = ConnectionSetupFlow(
+            entry: .repairConnection,
+            draft: ConnectionSetupDraft(existingServerURL: ConnectionRepairTests.failedURL)
+        )
+        XCTAssertEqual(flow.step, .connectionTest)
+        let generation = try XCTUnwrap(flow.beginTest())
+        for event in StagedTestDriver.successEvents.prefix(5) {
+            flow.applyTestEvent(event, generation: generation)
+        }
+        flow.applyTestEvent(terminal, generation: generation)
+        XCTAssertEqual(flow.step, .review)
+        return flow
+    }
+
+    func testSignInToReconnectAnswerIsDroppedAfterAnEditOrANewerTest() throws {
+        for terminal in [
+            ConnectionSetupTestEvent.requiresInteractiveSignIn(.authentication, .browser(.authProxyRedirect)),
+            .requiresSignInChoice(.authentication, .nativeCapable(provider: "self-hosted"))
+        ] {
+            var flow = try repairFlowAtReview(ending: terminal)
+            let result = try XCTUnwrap(flow.complete())
+            let request = ConnectionRepairSignInRequest(
+                configuration: result,
+                revision: flow.draftRevision,
+                generation: flow.testGeneration
+            )
+            XCTAssertTrue(request.isCurrent(in: flow), "\(terminal)")
+
+            // The user goes Back and edits the address while the capability
+            // check runs: its late answer must not open a sign-in at all.
+            var edited = flow
+            edited.back()
+            edited.back()
+            XCTAssertEqual(edited.step, .connectionDetails)
+            edited.draft.existingServerURL = "https://other.example.test"
+            XCTAssertFalse(request.isCurrent(in: edited), "\(terminal): an edited draft")
+
+            // A newer test supersedes it too, even for the same address.
+            var retested = flow
+            retested.invalidateTestForRepairRetry()
+            XCTAssertFalse(request.isCurrent(in: retested), "\(terminal): a newer test")
+        }
+    }
+
+    func testSignInChoiceInRepairOffersThePasswordRoute() throws {
+        var flow = try repairFlowAtReview(ending: .requiresSignInChoice(.authentication, .legacyOAuth))
+        XCTAssertTrue(flow.canUseSettings, "Sign In to Reconnect is available for the choice")
+        flow.enterCredentialsForSignInChoice()
+        XCTAssertEqual(flow.step, .loginCredentials, "Enter Credentials leads to a password test instead")
+        XCTAssertFalse(flow.canUseSettings)
+    }
+
+    /// Counts capability checks; Sign In to Reconnect has no discovery seam
+    /// at all, so it can only open what the staged test decided.
+    private final class CapabilitySeam {
+        var calls = 0
+        let answer: Result<Bool, Error>
+
+        init(_ answer: Result<Bool, Error>) {
+            self.answer = answer
+        }
+
+        var resolver: DashboardSignInResolver {
+            DashboardSignInResolver(supportsNativeOAuth: { [self] in
+                calls += 1
+                return try answer.get()
+            })
+        }
+    }
+
+    private enum CapabilityFixture: Error { case unavailable }
+
+    func testSignInToReconnectOpensTheSignInTheTestDecided() async throws {
+        for signIn in [
+            DashboardInteractiveSignIn.nativeOAuth(provider: "self-hosted"),
+            .nativeOAuth(provider: nil),
+            .browser(.legacyOAuth),
+            .browser(.authProxyRedirect)
+        ] {
+            let flow = try repairFlowAtReview(ending: .requiresInteractiveSignIn(.authentication, signIn))
+            // Whatever the dashboard would answer now, the tested decision
+            // stands: no second discovery, no capability check.
+            let seam = CapabilitySeam(.failure(CapabilityFixture.unavailable))
+            let opened = try await ConnectionRepairSignIn.signIn(for: flow.testState, resolver: seam.resolver)
+            XCTAssertEqual(opened, signIn)
+            XCTAssertEqual(seam.calls, 0, "\(signIn)")
+        }
+    }
+
+    func testPrivateSignInSwitchShowsOnlyWhereSignInCanBeNative() throws {
+        // A tested native sign-in, or a choice the capability check may still
+        // send to Safari, reads the switch; the embedded browser never does.
+        for (terminal, shows) in [
+            (ConnectionSetupTestEvent.requiresInteractiveSignIn(.authentication, .nativeOAuth(provider: "self-hosted")), true),
+            (.requiresInteractiveSignIn(.authentication, .browser(.legacyOAuth)), false),
+            (.requiresInteractiveSignIn(.authentication, .browser(.authProxyRedirect)), false),
+            (.requiresSignInChoice(.authentication, .nativeCapable(provider: "self-hosted")), true),
+            (.requiresSignInChoice(
+                .authentication,
+                .nativeCapable(provider: "self-hosted", advertisedFlows: ["cookie", "native_pkce"])
+            ), true),
+            (.requiresSignInChoice(.authentication, .legacyOAuth), false)
+        ] {
+            let flow = try repairFlowAtReview(ending: terminal)
+            XCTAssertEqual(ConnectionRepairSignIn.mayOpenNativeSignIn(for: flow.testState), shows, "\(terminal)")
+        }
+        XCTAssertFalse(ConnectionRepairSignIn.mayOpenNativeSignIn(for: ConnectionSetupTestState()))
+    }
+
+    func testSignInToReconnectFromAChoiceChecksCapabilityOnlyForANativeCapableOffer() async throws {
+        let native = CapabilitySeam(.success(true))
+        let nativeFlow = try repairFlowAtReview(
+            ending: .requiresSignInChoice(.authentication, .nativeCapable(provider: "self-hosted"))
+        )
+        let nativeOpened = try await ConnectionRepairSignIn.signIn(for: nativeFlow.testState, resolver: native.resolver)
+        XCTAssertEqual(nativeOpened, .nativeOAuth(provider: "self-hosted"))
+        XCTAssertEqual(native.calls, 1)
+
+        let older = CapabilitySeam(.success(false))
+        let olderOpened = try await ConnectionRepairSignIn.signIn(for: nativeFlow.testState, resolver: older.resolver)
+        XCTAssertEqual(olderOpened, .browser(.legacyOAuth))
+
+        let legacy = CapabilitySeam(.success(true))
+        let legacyFlow = try repairFlowAtReview(ending: .requiresSignInChoice(.authentication, .legacyOAuth))
+        let legacyOpened = try await ConnectionRepairSignIn.signIn(for: legacyFlow.testState, resolver: legacy.resolver)
+        XCTAssertEqual(legacyOpened, .browser(.legacyOAuth))
+        XCTAssertEqual(legacy.calls, 0)
+    }
+
+    func testSignInToReconnectFromAChoiceWhoseTestAdvertisedNativeSignInAsksNothing() async throws {
+        let flow = try repairFlowAtReview(
+            ending: .requiresSignInChoice(
+                .authentication,
+                .nativeCapable(provider: "self-hosted", advertisedFlows: ["cookie", "native_pkce"])
+            )
+        )
+        // Behind an auth edge the capability check would be refused; the
+        // tested provider answer already said.
+        let seam = CapabilitySeam(.failure(CapabilityFixture.unavailable))
+        let opened = try await ConnectionRepairSignIn.signIn(for: flow.testState, resolver: seam.resolver)
+        XCTAssertEqual(opened, .nativeOAuth(provider: "self-hosted"))
+        XCTAssertEqual(seam.calls, 0)
+    }
+
+    func testSignInToReconnectFailsClosedWhenAChoicesCapabilityCheckFails() async throws {
+        let flow = try repairFlowAtReview(
+            ending: .requiresSignInChoice(.authentication, .nativeCapable(provider: "self-hosted"))
+        )
+        do {
+            let opened = try await ConnectionRepairSignIn.signIn(
+                for: flow.testState,
+                resolver: CapabilitySeam(.failure(CapabilityFixture.unavailable)).resolver
+            )
+            XCTFail("A failed capability check must not open a sign-in, got \(String(describing: opened))")
+        } catch {
+            XCTAssertEqual(error as? CapabilityFixture, .unavailable, "An error, never the browser view instead")
+        }
+    }
+
+    func testSignInToReconnectOpensNothingForAPasswordOutcome() async throws {
+        var flow = ConnectionSetupFlow(
+            entry: .repairConnection,
+            draft: ConnectionSetupDraft(existingServerURL: ConnectionRepairTests.failedURL, username: "u", password: "p")
+        )
+        StagedTestDriver.runSuccessfulTest(on: &flow)
+        let seam = CapabilitySeam(.success(true))
+        let opened = try await ConnectionRepairSignIn.signIn(for: flow.testState, resolver: seam.resolver)
+        XCTAssertNil(opened, "A password outcome reconnects through its tested candidate, never a browser")
+        XCTAssertEqual(seam.calls, 0)
     }
 
     // MARK: - Candidate lifecycle (spec 11, 17, 32)
@@ -382,9 +559,11 @@ final class ConnectionRepairTests: XCTestCase {
         harness.appState.connection = HermesConnection(baseUrl: ConnectionRepairTests.failedURL, ticket: "stale-ticket")
         harness.appState.client = HermesClient(connection: HermesConnection(baseUrl: ConnectionRepairTests.failedURL, ticket: "t"), profile: "default")
 
-        // First reconnect fails: the typed classification must remain
-        // available for Repair seeding and routing.
-        await harness.appState.reconnectForRetry(purpose: .preserveCurrent)
+        // A tapped Reconnect fails: its failure shows at once (a resume's
+        // keeps quiet for the first retries, #1624, covered in
+        // AppStateChatResumeTests), and the typed classification must
+        // remain available for Repair seeding and routing.
+        await harness.appState.reconnect()
         XCTAssertFalse(harness.appState.isConnected)
         XCTAssertNotNil(harness.appState.lastConnectionFailure,
                         "A failed reconnect must leave the typed classification available for Repair")
@@ -430,6 +609,47 @@ final class ConnectionRepairTests: XCTestCase {
         XCTAssertEqual(harness.appState.connection?.ticket, "repaired-ticket")
         XCTAssertEqual(harness.appState.activeSessionId, "stored-a", "The server confirmed the preserved session")
         XCTAssertEqual(connectCount.value, 1, "Exactly one activation")
+    }
+
+    func testRepairToAnotherSavedDashboardsAddressConnectsAndWritesNothing() async {
+        let connectCount = RepairConnectCount()
+        let harness = makeHarness(lifecycleOperations: sessionPreservingFakes(connectClient: { _ in
+            connectCount.value += 1
+        }))
+        let repairing = harness.appState.registerDashboard(forNormalizedURL: ConnectionRepairTests.failedURL)
+        let other = harness.appState.registerDashboard(forNormalizedURL: "https://other.example")
+        let otherCredentials = DashboardCredentials(baseURL: "https://other.example", username: "b", password: "b-secret", requiresFaceID: false)
+        KeychainHelper.saveCredentials(otherCredentials, dashboardID: other)
+        harness.appState.connection = HermesConnection(baseUrl: ConnectionRepairTests.failedURL, ticket: "stale-ticket")
+
+        let outcome = await harness.appState.performConnectionRepair(.native(candidate(
+            serverURL: "https://other.example",
+            ticket: "repaired-ticket",
+            revision: 4,
+            generation: 2
+        )))
+
+        guard case .addressBelongsToDashboard(let id, _) = outcome else {
+            return XCTFail("expected the other dashboard's address to be refused, got \(outcome)")
+        }
+        XCTAssertEqual(id, other)
+        XCTAssertEqual(connectCount.value, 0, "Nothing connects")
+        XCTAssertEqual(harness.appState.connection?.ticket, "stale-ticket")
+        XCTAssertEqual(KeychainHelper.loadCredentials(dashboardID: other), otherCredentials, "B's sign-in is untouched")
+        // Its own address, or a new one, still repairs.
+        XCTAssertNil(harness.appState.repairAddressOwner(ConnectionRepairTests.failedURL, repairing: ConnectionRepairTests.failedURL))
+        XCTAssertNil(harness.appState.repairAddressOwner("https://new.example", repairing: ConnectionRepairTests.failedURL))
+        XCTAssertNotEqual(repairing, other)
+        // A new address a repair's sign-in registered stays that repair's.
+        let registered = harness.appState.registerRepairDashboard(forURL: "https://fresh.example")
+        XCTAssertNotNil(registered)
+        XCTAssertNil(harness.appState.repairAddressOwner("https://fresh.example", repairing: ConnectionRepairTests.failedURL))
+        XCTAssertEqual(harness.appState.registerRepairDashboard(forURL: "https://other.example"), other)
+        XCTAssertNotNil(harness.appState.repairAddressOwner("https://other.example", repairing: ConnectionRepairTests.failedURL),
+                        "An address that was already saved is still another dashboard's")
+        // A later repair doesn't inherit it.
+        _ = harness.appState.beginSavedConnectionRepair()
+        XCTAssertNotNil(harness.appState.repairAddressOwner("https://fresh.example", repairing: ConnectionRepairTests.failedURL))
     }
 
     func testChangedEndpointFailsSafelyIntoTheExistingIdentityBoundary() async {
@@ -481,6 +701,8 @@ final class ConnectionRepairTests: XCTestCase {
         XCTAssertEqual(harness.defaults.string(forKey: "conduit.dashboardURL"), remembered,
                        "A failed activation must not move the remembered dashboard")
         XCTAssertFalse(harness.appState.isConnected)
+        XCTAssertNil(harness.appState.repairAddressOwner("https://replacement.example", repairing: remembered),
+                     "The address this repair registered stays its own, so a fresh test there isn't refused")
     }
 
     func testBrowserSignInRepairActivatesAndRemembersWithoutInventingCredentials() async {
@@ -634,6 +856,120 @@ final class ConnectionRepairTests: XCTestCase {
         XCTAssertEqual(harness.appState.connection?.ticket, "native-ticket")
         XCTAssertTrue(KeychainHelper.loadCredentials(dashboardID: dashboardID) == nil,
                       "Successful OAuth restoration must clear saved password credentials")
+    }
+
+    /// A browser sign-in's saved ticket was spent when it last opened the
+    /// socket (Hermes' tickets are single-use and last 30 seconds). Cold
+    /// launch mints a fresh one with the dashboard's cookies and connects
+    /// with that, instead of a first attempt Hermes is bound to refuse.
+    func testColdStartSavedSessionConnectsWithFreshTicket() async throws {
+        let connected = expectation(description: "saved session connected")
+        let connectCount = RepairConnectCount()
+        var connectedTickets: [String] = []
+        var mintedBaseURLs: [String] = []
+        let harness = makeHarness(lifecycleOperations: coldStartLifecycle(
+            mint: { baseURL in
+                mintedBaseURLs.append(baseURL)
+                return "fresh-ticket"
+            },
+            connected: { client in
+                connectedTickets.append(client.connection.ticket)
+                connectCount.value += 1
+                if connectCount.value == 1 { connected.fulfill() }
+            }
+        ))
+        let dashboardID = harness.appState.adoptDashboard(forNormalizedURL: Self.failedURL)
+        KeychainHelper.saveConnection(
+            HermesConnection(baseUrl: Self.failedURL, ticket: "spent-ticket"),
+            dashboardID: dashboardID
+        )
+
+        harness.appState.loadSavedConnection()
+        await fulfillment(of: [connected], timeout: 2)
+
+        XCTAssertEqual(mintedBaseURLs.first, Self.failedURL)
+        XCTAssertEqual(connectedTickets.first, "fresh-ticket")
+        XCTAssertEqual(harness.appState.connection?.ticket, "fresh-ticket")
+    }
+
+    /// A mint that fails (the page not up yet, the cookies refused) connects
+    /// with the saved record as before; its refusal schedules the reconnect.
+    func testColdStartSavedSessionKeepsSavedTicketWhenMintFails() async throws {
+        let connected = expectation(description: "saved session connected")
+        let connectCount = RepairConnectCount()
+        var connectedTickets: [String] = []
+        let harness = makeHarness(lifecycleOperations: coldStartLifecycle(
+            mint: { _ in throw DashboardTicketBridgeError.notReady },
+            connected: { client in
+                connectedTickets.append(client.connection.ticket)
+                connectCount.value += 1
+                if connectCount.value == 1 { connected.fulfill() }
+            }
+        ))
+        let dashboardID = harness.appState.adoptDashboard(forNormalizedURL: Self.failedURL)
+        KeychainHelper.saveConnection(
+            HermesConnection(baseUrl: Self.failedURL, ticket: "saved-ticket"),
+            dashboardID: dashboardID
+        )
+
+        harness.appState.loadSavedConnection()
+        await fulfillment(of: [connected], timeout: 2)
+
+        XCTAssertEqual(connectedTickets.first, "saved-ticket")
+    }
+
+    /// A mint cancelled under it (the bridge torn down by a switch or a
+    /// sign-out) ends this restore: it never connects with the spent ticket.
+    func testColdStartSavedSessionStopsWhenItsMintIsCancelled() async throws {
+        let connectCount = RepairConnectCount()
+        var mints = 0
+        let harness = makeHarness(lifecycleOperations: coldStartLifecycle(
+            mint: { _ in
+                mints += 1
+                throw CancellationError()
+            },
+            connected: { _ in connectCount.value += 1 }
+        ))
+        let dashboardID = harness.appState.adoptDashboard(forNormalizedURL: Self.failedURL)
+        KeychainHelper.saveConnection(
+            HermesConnection(baseUrl: Self.failedURL, ticket: "spent-ticket"),
+            dashboardID: dashboardID
+        )
+
+        harness.appState.loadSavedConnection()
+        let deadline = Date().addingTimeInterval(2)
+        while (mints == 0 || harness.appState.isConnecting) && connectCount.value == 0 && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(mints, 1)
+        XCTAssertEqual(connectCount.value, 0, "the spent ticket is never tried")
+        XCTAssertFalse(harness.appState.isConnecting, "the restore that still owns the flow stops connecting")
+        XCTAssertNotEqual(harness.appState.turnState, .synchronizing, "nor leaves the composer synchronizing")
+    }
+
+    private func coldStartLifecycle(
+        mint: @escaping @MainActor (String) async throws -> String,
+        connected: @escaping @MainActor (HermesClient) async throws -> Void
+    ) -> ChatResumeLifecycleOperations {
+        ChatResumeLifecycleOperations(
+            connectClient: connected,
+            loadCatalog: { _, _ in [] },
+            mintTicket: mint,
+            openSession: { _, id, _ in
+                SessionResumeResult(
+                    sessionId: id,
+                    messages: [],
+                    snapshot: SessionRuntimeSnapshot(object: ["running": .bool(false)])
+                )
+            },
+            refreshContext: { _, _ in },
+            loadProfiles: {},
+            loadBusyInputMode: { _ in },
+            loadProfileDisplayPreferences: {},
+            loadSlashCommands: {}
+        )
     }
 
     func testNativeOAuthBridgeRebuildsAfterSameModeGrantReplacement() throws {

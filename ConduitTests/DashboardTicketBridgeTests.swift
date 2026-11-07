@@ -68,9 +68,84 @@ final class DashboardTicketBridgeTests: XCTestCase {
             XCTFail("Expected DashboardTicketBridgeError.notReady, got \(error)")
         }
 
-        // Both retries must re-attempt the terminally failed page load; the
+        // Every attempt must re-attempt the terminally failed page load; the
         // original wedge (no reload at all) would leave this at zero.
-        XCTAssertEqual(bridge.reloadCount, 2)
+        XCTAssertEqual(bridge.reloadCount, 3)
+    }
+
+    /// A page whose load failed while the socket stayed open (a request that
+    /// stalled across a Wi-Fi change) must be reloaded by the next dashboard
+    /// request, not only by a ticket mint: an open socket mints none, so
+    /// history and status reads were refused in a fraction of a second until
+    /// the app quit (#1412).
+    func testRequestOnAFailedPageReloadsIt() async {
+        let bridge = DashboardTicketBridge(
+            baseURL: "http://127.0.0.1:1",
+            readinessPollAttempts: 2,
+            readinessPollInterval: .milliseconds(10)
+        )
+        bridge.webViewCanRun = { true }
+        bridge.webViewWebContentProcessDidTerminate(bridge.webView)
+        XCTAssertTrue(bridge.isLoadFailed)
+
+        do {
+            _ = try await bridge.requestJSON(path: "/api/sessions")
+            XCTFail("Expected requestJSON to throw while the reloaded page loads")
+        } catch DashboardTicketBridgeError.notReady {
+            // expected: nothing listens, so the fresh load can't finish
+        } catch {
+            XCTFail("Expected DashboardTicketBridgeError.notReady, got \(error)")
+        }
+
+        XCTAssertEqual(bridge.reloadCount, 1, "The request must reload the failed page")
+    }
+
+    /// Requests that meet the same failed page together reload it once: the
+    /// first reload clears the failure before any of them waits.
+    func testConcurrentRequestsOnAFailedPageReloadItOnce() async {
+        let bridge = DashboardTicketBridge(
+            baseURL: "http://127.0.0.1:1",
+            readinessPollAttempts: 2,
+            readinessPollInterval: .milliseconds(10)
+        )
+        bridge.webViewCanRun = { true }
+        // Let the initial load settle first: it starts after the bridge's
+        // cookie restore, and starting it clears the failure modeled below.
+        for _ in 0..<80 where !bridge.isLoadFailed {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        bridge.webViewWebContentProcessDidTerminate(bridge.webView)
+
+        let first = Task { @MainActor in _ = try? await bridge.requestJSON(path: "/api/sessions") }
+        let second = Task { @MainActor in _ = try? await bridge.requestJSON(path: "/api/status") }
+        await first.value
+        await second.value
+
+        // A fresh load that fails inside the poll window can be reloaded by
+        // a later request, never by these two together.
+        XCTAssertEqual(bridge.reloadCount, 1)
+    }
+
+    /// A load still in flight is polled, never restarted by a request: on a
+    /// degraded link it may be about to finish.
+    func testRequestLeavesALoadInFlightAlone() async {
+        let bridge = DashboardTicketBridge(
+            baseURL: "http://127.0.0.1:1",
+            readinessPollAttempts: 2,
+            readinessPollInterval: .milliseconds(10)
+        )
+        bridge.webViewCanRun = { true }
+        XCTAssertFalse(bridge.isLoadFailed)
+
+        do {
+            _ = try await bridge.requestJSON(path: "/api/sessions")
+            XCTFail("Expected requestJSON to throw before the page is ready")
+        } catch {
+            // notReady, or the initial load's own failure on hosts where it
+            // lands inside the poll window
+        }
+
+        XCTAssertEqual(bridge.reloadCount, 0)
     }
 
     /// A bridge parked on the dashboard's login page must route minting to
@@ -304,6 +379,122 @@ extension DashboardTicketBridgeTests {
     }
 }
 
+// MARK: - Answers that land after a dashboard switch
+
+@MainActor
+extension DashboardTicketBridgeTests {
+    /// The page answered, and the switch invalidated the bridge before the
+    /// caller ran: the caller hears that the old dashboard accepted it,
+    /// never its answer, which it would apply to the dashboard now showing.
+    func testAPageAnswerThatLandsAfterInvalidationIsAnsweredAfterSwitch() async throws {
+        let requests = DashboardTicketBridgePendingRequests()
+        let bridge = DashboardTicketBridge(
+            baseURL: "http://127.0.0.1:1",
+            pendingRequests: requests,
+            readinessPollAttempts: 0,
+            readinessPollInterval: .milliseconds(1)
+        )
+        bridge.webViewCanRun = { true }
+        // Let the initial load settle first, as in
+        // testExpiredRequestDeadlineMarksWebViewStalled, so its failure
+        // can't reject the request this test answers.
+        for _ in 0..<80 where !bridge.isLoadFailed {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        bridge.simulateLandingForTesting(.ready)
+
+        let result = Task { try await bridge.requestJSON(path: "/api/sessions") }
+        var answer: DashboardTicketBridgePendingRequests.Continuation?
+        for _ in 0..<1_000 where answer == nil {
+            await Task.yield()
+            answer = requests.removeValue(for: 1)
+        }
+        try XCTUnwrap(answer).resume(returning: ["sessions": []])
+        bridge.invalidate()
+
+        do {
+            _ = try await result.value
+            XCTFail("an answer for an invalidated bridge must not reach its caller")
+        } catch DashboardTicketBridgeError.answeredAfterSwitch {
+            // expected
+        }
+    }
+
+    /// A change the page sent before a switch keeps waiting for its answer:
+    /// the caller learns the old dashboard accepted it. A read waiting at
+    /// the switch hears unreadiness at once.
+    func testAPageWriteWaitingAtASwitchHearsItsAnswer() async throws {
+        let requests = DashboardTicketBridgePendingRequests()
+        let bridge = DashboardTicketBridge(
+            baseURL: "http://127.0.0.1:1",
+            pendingRequests: requests,
+            readinessPollAttempts: 0,
+            readinessPollInterval: .milliseconds(1)
+        )
+        bridge.webViewCanRun = { true }
+        for _ in 0..<80 where !bridge.isLoadFailed {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        bridge.simulateLandingForTesting(.ready)
+
+        let write = Task { try await bridge.requestJSON(path: "/api/sessions/s", method: "DELETE") }
+        for _ in 0..<1_000 where requests.count < 1 { await Task.yield() }
+        let read = Task { try await bridge.requestJSON(path: "/api/sessions") }
+        for _ in 0..<1_000 where requests.count < 2 { await Task.yield() }
+        XCTAssertEqual(requests.count, 2)
+        bridge.invalidate()
+
+        do {
+            _ = try await read.value
+            XCTFail("a read waiting at a switch must not wait for the old dashboard")
+        } catch DashboardTicketBridgeError.notReady {
+            // expected
+        }
+        XCTAssertEqual(requests.count, 1, "the change is still waiting for its answer")
+        try XCTUnwrap(requests.removeValue(for: 1)).resume(returning: [:])
+        do {
+            _ = try await write.value
+            XCTFail("an answer for an invalidated bridge must not reach its caller")
+        } catch DashboardTicketBridgeError.answeredAfterSwitch {
+            // expected
+        }
+    }
+
+    /// invalidate() doesn't cancel a request sent without the page, so its
+    /// answer can come back up to its deadline after a switch.
+    func testAnAnswerWithoutThePageThatLandsAfterInvalidationIsAnsweredAfterSwitch() async throws {
+        let held = HeldDashboardRequests(baseURL: "https://late-\(UUID().uuidString.lowercased()).invalid")
+        let result = Task { try await held.bridge.requestJSON(path: "/api/sessions") }
+        try await held.waitForRequests(1)
+        held.bridge.invalidate()
+        try await held.answer(["sessions": []])
+
+        do {
+            _ = try await result.value
+            XCTFail("an answer for an invalidated bridge must not reach its caller")
+        } catch DashboardTicketBridgeError.answeredAfterSwitch {
+            // expected
+        }
+    }
+
+    /// A refusal that lands after a switch says nothing happened there: the
+    /// caller hears plain unreadiness, as for a request that never went out.
+    func testARefusalWithoutThePageThatLandsAfterInvalidationIsNotReady() async throws {
+        let held = HeldDashboardRequests(baseURL: "https://late-\(UUID().uuidString.lowercased()).invalid")
+        let result = Task { try await held.bridge.requestJSON(path: "/api/sessions/s", method: "DELETE") }
+        try await held.waitForRequests(1)
+        held.bridge.invalidate()
+        try await held.answer(["detail": "Session not found"], status: 404)
+
+        do {
+            _ = try await result.value
+            XCTFail("an answer for an invalidated bridge must not reach its caller")
+        } catch DashboardTicketBridgeError.notReady {
+            // expected
+        }
+    }
+}
+
 @MainActor
 extension DashboardTicketBridgeTests {
     func testBackgroundRequestsSendTheCookieThatExpiresLast() throws {
@@ -339,6 +530,36 @@ extension DashboardTicketBridgeTests {
             DashboardBackgroundSession.redirect(from: original, to: try proposed("https://elsewhere.example/api/sessions")),
             "cookies never follow a redirect to another origin"
         )
+    }
+
+    func testABackgroundResponseOverTheLimitIsNeverHeldWhole() async throws {
+        let limit = 1_024
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://example.com/api/sessions")))
+        let body = Data(repeating: 0x20, count: limit * 4)
+
+        // A length over the limit is refused before the body is read.
+        let announced = try await DashboardTicketBridge.load(
+            request, deadline: .seconds(10), maxResponseBytes: limit,
+            session: downloadSession(status: 200, body: body, headers: ["Content-Length": String(body.count)])
+        )
+        XCTAssertTrue(announced.oversized)
+        XCTAssertTrue(announced.data.isEmpty, "nothing of an announced oversized body is held")
+
+        // Without a length, the read stops once the limit is passed.
+        let streamed = try await DashboardTicketBridge.load(
+            request, deadline: .seconds(10), maxResponseBytes: limit,
+            session: downloadSession(status: 200, body: body)
+        )
+        XCTAssertTrue(streamed.oversized)
+        XCTAssertLessThanOrEqual(streamed.data.count, limit, "the body past the limit is never held")
+
+        let small = Data(#"{"ok":true}"#.utf8)
+        let fits = try await DashboardTicketBridge.load(
+            request, deadline: .seconds(10), maxResponseBytes: limit,
+            session: downloadSession(status: 200, body: small)
+        )
+        XCTAssertFalse(fits.oversized)
+        XCTAssertEqual(fits.data, small)
     }
 
     // MARK: - File downloads (#569)
@@ -399,6 +620,19 @@ extension DashboardTicketBridgeTests {
             XCTFail("401 needs a sign-in")
         } catch DashboardTicketBridgeError.signInRequired {}
 
+        // Hermes refuses a sensitive or unreadable file with 403 to a caller
+        // who is signed in: a failure with Hermes' reason, not a sign-in.
+        do {
+            _ = try await DashboardTicketBridge.download(
+                request, filename: "a.mp3", into: root, maxBytes: 1_000,
+                session: downloadSession(status: 403, body: Data(#"{"detail":"Access to sensitive files is not allowed"}"#.utf8))
+            )
+            XCTFail("a refused file is not a file")
+        } catch DashboardTicketBridgeError.http(let status, let detail) {
+            XCTAssertEqual(status, 403)
+            XCTAssertEqual(detail, "Access to sensitive files is not allowed")
+        }
+
         do {
             _ = try await DashboardTicketBridge.download(
                 request, filename: "a.mp3", into: root, maxBytes: 1_000,
@@ -407,6 +641,37 @@ extension DashboardTicketBridgeTests {
             XCTFail("an older Hermes without the route is a failure the data URL can fall back from")
         } catch DashboardTicketBridgeError.http(let status, _) {
             XCTAssertEqual(status, 404)
+        }
+    }
+
+    /// The background session returns only redirects to sign-in or another
+    /// origin; each is judged by the shared sign-in decision, not by a
+    /// "/login" substring (#791).
+    func testADownloadRedirectedToAnAuthProxysSignInIsSignIn() async throws {
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://example.com/api/fs/download?path=/tmp/a.mp3")))
+        let root = try downloadRoot()
+        for location in [
+            "https://auth.example.org/oauth2/start?rd=%2Fapi%2Ffs%2Fdownload",
+            "/oauth2/sign_in?rd=%2Fapi%2Ffs%2Fdownload",
+            "/signin",
+        ] {
+            do {
+                _ = try await DashboardTicketBridge.download(
+                    request, filename: "a.mp3", into: root, maxBytes: 1_000,
+                    session: downloadSession(status: 302, body: Data(), headers: ["Location": location])
+                )
+                XCTFail("A redirect to \(location) needs a sign-in")
+            } catch DashboardTicketBridgeError.signInRequired {}
+        }
+
+        do {
+            _ = try await DashboardTicketBridge.download(
+                request, filename: "a.mp3", into: root, maxBytes: 1_000,
+                session: downloadSession(status: 302, body: Data(), headers: ["Location": "/docs/login-guide"])
+            )
+            XCTFail("An unfollowed redirect to an ordinary page is not a file")
+        } catch DashboardTicketBridgeError.http(let status, _) {
+            XCTAssertEqual(status, 302)
         }
     }
 }
@@ -430,4 +695,90 @@ private final class DashboardDownloadURLProtocolStub: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+extension DashboardTicketBridgeTests {
+    /// The page's answers are parsed off the main thread; only an object the
+    /// page sent as an answer counts as one.
+    func testOnlyThePagesAnswersParseAsAnswers() {
+        let payload = DashboardTicketBridge.dashboardResponsePayload(
+            #"{"type":"dashboard-response","id":3,"ok":true,"body":{"a":1}}"#
+        )
+        XCTAssertEqual(payload?["id"] as? Int, 3)
+        XCTAssertNil(DashboardTicketBridge.dashboardResponsePayload("not json"))
+        XCTAssertNil(DashboardTicketBridge.dashboardResponsePayload("[1, 2]"))
+        XCTAssertNil(DashboardTicketBridge.dashboardResponsePayload(#"{"type":"other","id":3}"#))
+    }
+
+    /// A big answer the page sends is parsed off the main thread and resumes
+    /// its request back on it; a small one, a write's, resumes it where it
+    /// arrives, before anything after it on the main thread can reject it.
+    /// One whose request already ended (its deadline, a reload) resumes
+    /// nothing, nor does a message that isn't an answer.
+    func testAReceivedAnswerResumesOnlyARequestStillWaiting() async throws {
+        let requests = DashboardTicketBridgePendingRequests()
+        let bridge = DashboardTicketBridge(
+            baseURL: "http://127.0.0.1:1",
+            pendingRequests: requests,
+            readinessPollAttempts: 0,
+            readinessPollInterval: .milliseconds(1)
+        )
+        bridge.webViewCanRun = { true }
+        // The initial load settles first, as in
+        // testAPageAnswerThatLandsAfterInvalidationIsAnsweredAfterSwitch, so
+        // its failure can't reject the requests this test answers.
+        for _ in 0..<80 where !bridge.isLoadFailed {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        let dashboard = try XCTUnwrap(URL(string: "http://127.0.0.1:1"))
+        let registered = expectation(description: "requests registered")
+        registered.expectedFulfillmentCount = 3
+        let ended = Task { @MainActor () -> Bool in
+            do {
+                _ = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String: Any], Error>) in
+                    requests.insert(continuation, for: 1)
+                    registered.fulfill()
+                }
+                return true
+            } catch {
+                return false
+            }
+        }
+        let waiting = Task { @MainActor () -> Int? in
+            let body = try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String: Any], Error>) in
+                requests.insert(continuation, for: 2)
+                registered.fulfill()
+            }
+            return body?["a"] as? Int
+        }
+        let written = Task { @MainActor () -> Bool? in
+            let body = try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String: Any], Error>) in
+                requests.insert(continuation, for: 3)
+                registered.fulfill()
+            }
+            return body?["saved"] as? Bool
+        }
+        await fulfillment(of: [registered], timeout: 10.0)
+        // Request 1's deadline ended it before its answer was parsed.
+        requests.removeValue(for: 1)?.resume(throwing: DashboardTicketBridgeError.notReady)
+
+        // A limit of 0 sends these off the main thread, as a long chat's
+        // page goes.
+        await bridge.receive(#"{"type":"dashboard-response","id":1,"ok":true,"body":{"late":true}}"#, expectedURL: dashboard, inlineLimit: 0)?.value
+        await bridge.receive(#"{"type":"other","id":2,"ok":true,"body":{"a":2}}"#, expectedURL: dashboard, inlineLimit: 0)?.value
+        XCTAssertEqual(requests.count, 2, "Not an answer: requests 2 and 3 still wait")
+        await bridge.receive(#"{"type":"dashboard-response","id":2,"ok":true,"body":{"a":1}}"#, expectedURL: dashboard, inlineLimit: 0)?.value
+        XCTAssertNil(
+            bridge.receive(#"{"type":"dashboard-response","id":3,"ok":true,"body":{"saved":true}}"#, expectedURL: dashboard),
+            "A small answer is parsed where it arrives"
+        )
+        XCTAssertEqual(requests.count, 0, "Resumed before this line, so a reload here can't reject it")
+
+        let endedHeardTheAnswer = await ended.value
+        XCTAssertFalse(endedHeardTheAnswer, "It heard its deadline, not the late answer")
+        let answered = await waiting.value
+        XCTAssertEqual(answered, 1)
+        let saved = await written.value
+        XCTAssertEqual(saved, true)
+    }
 }

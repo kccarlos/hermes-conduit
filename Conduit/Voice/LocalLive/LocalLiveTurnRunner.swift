@@ -13,6 +13,10 @@
 //  a second turn the chat couldn't take. A cancelled turn only stops being
 //  spoken: Hermes' reply still lands in the chat.
 //
+//  What the reply writes to be seen (a table, code, links) isn't spoken:
+//  unless Hermes showed it with `conduit_show`, it goes on the call's
+//  screen when the reply ends (SpokenVisualSplitter).
+//
 
 import Foundation
 
@@ -46,10 +50,28 @@ final class LocalLiveTurnRunner {
         var submit: @MainActor (_ chat: Chat, _ text: String) async throws -> Submission
         /// Puts `text` into the reply running on `runtimeID`.
         var redirect: @MainActor (_ runtimeID: String, _ text: String) async throws -> VoiceRedirectResult
+        /// Answers the one card waiting on the user when `text` is a plain
+        /// yes or no to it; true when it did.
+        var answerWaiting: @MainActor (_ text: String) async -> Bool = { _ in false }
+        /// Answers the approval the followed reply waits on ("once" or
+        /// "deny"); true when Hermes took it.
+        var respondToApproval: @MainActor (_ approval: ApprovalActivity, _ choice: String, _ profile: String?) async -> Bool
+            = { _, _, _ in false }
+        /// Answers one question of the clarify the followed reply waits on
+        /// (`questionID` nil for a single question; `answer` nil leaves one
+        /// of a form blank); the card as it stands after, or nil when
+        /// Hermes didn't take it. `sessionID` and `profile` are the reply's
+        /// chat, where the session authority reads a question this socket
+        /// never saw asked.
+        var respondToClarify: @MainActor (_ clarify: ClarifyActivity, _ questionID: String?, _ answer: String?, _ sessionID: String?, _ profile: String?) async -> ClarifyActivity?
+            = { _, _, _, _, _ in nil }
     }
 
     var onDelta: (@MainActor (_ turnID: String, _ text: String) -> Void)?
     var onDone: (@MainActor (_ turnID: String) -> Void)?
+    /// Puts what a reply wrote to be seen on the call's screen; false when
+    /// there's no screen to put it on.
+    var onVisual: (@MainActor (_ markdown: String) -> Bool)?
 
     private let backend: Backend
 
@@ -71,8 +93,26 @@ final class LocalLiveTurnRunner {
         /// Corrections Hermes queued behind it: the current reply's end
         /// isn't the one the call waits for.
         var skipsCompletions = 0
+        /// The command approval the reply is paused on, which the user's
+        /// next yes or no answers.
+        var waitingApproval: ApprovalActivity?
+        /// The question the reply is paused on, which the user's next words
+        /// answer.
+        var waitingQuestion: ClarifyActivity?
+        /// The profile of the chat it runs in.
+        var profile: String?
     }
     private var reply: Reply?
+    /// The open turn's words, with what's to be seen kept out.
+    private var splitter = SpokenVisualSplitter()
+    /// Leaves a persona's narrated actions and emoji out of what is said,
+    /// as in Classic voice.
+    private var actions = SpokenTextFilter()
+    /// Hermes showed something with `conduit_show` while answering the
+    /// open turn: what its reply writes isn't shown again.
+    private var showedCard = false
+    /// What the open turn said so far ends a line (or nothing was said).
+    private var endedLine = true
     private var task: Task<Void, Never>?
     /// Bumped by every new turn and reset, so older work stops at its next step.
     private var generation = 0
@@ -90,6 +130,10 @@ final class LocalLiveTurnRunner {
         // The plugin cancels a turn before sending the next: whatever is
         // still open here has nobody waiting for it.
         turn = (turnID, false)
+        splitter.reset()
+        actions.reset()
+        showedCard = false
+        endedLine = true
         generation += 1
         let generation = generation
         // After the last turn's work: one send or correction at a time, in
@@ -98,6 +142,18 @@ final class LocalLiveTurnRunner {
         task = Task { @MainActor [weak self] in
             await previous?.value
             await self?.run(turnID: turnID, text: text, generation: generation)
+        }
+    }
+
+    /// Whether the turn sending now is still the newest and not cancelled,
+    /// for a send that waits (a chat takeover, #1061) before going out
+    /// again: a turn the call moved past stops waiting and isn't sent.
+    func currentTurnCheck() -> () -> Bool {
+        let generation = generation
+        let turnID = turn?.id
+        return { [weak self] in
+            guard let self else { return false }
+            return self.generation == generation && self.turn?.id == turnID
         }
     }
 
@@ -119,6 +175,10 @@ final class LocalLiveTurnRunner {
         task = nil
         turn = nil
         reply = nil
+        splitter.reset()
+        actions.reset()
+        showedCard = false
+        endedLine = true
     }
 
     private func run(turnID: String, text: String, generation: Int) async {
@@ -129,6 +189,40 @@ final class LocalLiveTurnRunner {
             finish(turnID)
             return
         }
+        // A yes or no to the approval the reply is paused on: Hermes takes
+        // it and the reply goes on to answer this turn.
+        if let approval = reply?.waitingApproval {
+            let choice: String? = VoiceCallDecisionOutcome.isYes(words) ? "once"
+                : VoiceThreadRouting.heldRequestAnswer(words) == .no(change: nil) ? "deny" : nil
+            if let choice, await backend.respondToApproval(approval, choice, reply?.profile) {
+                if reply?.waitingApproval == approval { reply?.waitingApproval = nil }
+                return
+            }
+            guard generation == self.generation else { return }
+        }
+        // The answer to the question the reply is paused on: a choice the
+        // words point at sends what its tap sends. A batch reads out its
+        // next question.
+        if let clarify = reply?.waitingQuestion, let question = HermesCallWaiting(clarify: clarify)?.openQuestion {
+            let value = HermesCallWaiting.answerValue(for: words, question: question)
+            if let after = await backend.respondToClarify(clarify, clarify.questions.count == 1 ? nil : question.id, value, reply?.runtimeID, reply?.profile) {
+                guard reply?.waitingQuestion?.requestId == clarify.requestId else { return }
+                if let next = HermesCallWaiting(clarify: after)?.openQuestion {
+                    reply?.waitingQuestion = after
+                    say(HermesCallWaiting.spokenQuestion(next), to: turnID, generation: generation)
+                } else {
+                    reply?.waitingQuestion = nil
+                }
+                return
+            }
+            guard generation == self.generation else { return }
+        }
+        // A yes or no to what waits on the user, answered as a tap would.
+        // When Hermes' reply is paused on it, the words aren't put into the
+        // reply: it goes on and answers this turn. Otherwise Hermes hears
+        // them as a turn, as in Classic voice.
+        if await backend.answerWaiting(words), reply != nil { return }
+        guard generation == self.generation else { return }
         var sentToken: UUID?
         do {
             if let running = reply {
@@ -152,7 +246,7 @@ final class LocalLiveTurnRunner {
             }
             guard generation == self.generation else { return }
             // Its events are this turn's from the send on.
-            let following = Reply(runtimeID: chat.runtimeID)
+            let following = Reply(runtimeID: chat.runtimeID, profile: chat.profile)
             reply = following
             sentToken = following.token
             switch try await backend.submit(chat, words) {
@@ -164,7 +258,7 @@ final class LocalLiveTurnRunner {
             }
         } catch {
             if let sentToken, reply?.token == sentToken { reply = nil }
-            say(error is VoiceThreadBusyError ? Self.busyLine : Self.failureLine, to: turnID, generation: generation)
+            say(Self.spokenFailure(for: error), to: turnID, generation: generation)
         }
     }
 
@@ -199,12 +293,19 @@ final class LocalLiveTurnRunner {
 
     func observe(_ event: StreamEvent) {
         guard let current = reply else { return }
+        if case .toolStart(let id, let name, _, _) = event, id == current.runtimeID, name == PresentedCard.toolName {
+            showedCard = true
+        }
         switch event {
-        case .messageStart(let id), .reasoningDelta(let id, _), .toolStart(let id, _, _, _), .toolComplete(let id, _, _, _):
+        case .messageStart(let id), .reasoningDelta(let id, _), .messageInterim(let id, _, _),
+             .toolStart(let id, _, _, _), .toolComplete(let id, _, _, _):
             guard id == current.runtimeID else { return }
             // Hermes is writing again after the correction: a marker after
             // this ends the reply.
             if !current.correcting { reply?.skipsInterruption = false }
+            // Writing again: whatever it waited on was answered.
+            reply?.waitingApproval = nil
+            reply?.waitingQuestion = nil
         case .messageDelta(let id, let text):
             guard id == current.runtimeID else { return }
             // Until Hermes takes the correction, the words are the reply
@@ -212,7 +313,7 @@ final class LocalLiveTurnRunner {
             guard !current.correcting else { return }
             reply?.skipsInterruption = false
             speak(text)
-        case .messageComplete(let id, _, let content, _):
+        case .messageComplete(let id, _, let content, _, _):
             guard id == current.runtimeID else { return }
             // The notice for a reply a correction cut off is never its answer.
             if VoiceBackgroundJobSupervisor.isInterruptionNotice(content) { return }
@@ -239,7 +340,23 @@ final class LocalLiveTurnRunner {
             guard id == current.runtimeID else { return }
             reply = nil
             if let turn { say(Self.errorLine, to: turn.id, generation: generation) }
-        case .approval(let id, _), .clarify(let id, _), .inputPrompt(let id, _):
+        case .approval(let id, let activity):
+            guard id == current.runtimeID else { return }
+            reply?.waitingApproval = activity
+            guard let turn else { return }
+            say(Self.approvalLine(activity), to: turn.id, generation: generation)
+        case .clarify(let id, let activity):
+            guard id == current.runtimeID else { return }
+            reply?.waitingQuestion = activity
+            guard let turn else { return }
+            // Hermes asks: the call reads the question out with its
+            // choices, and the user's next words answer it.
+            if let question = HermesCallWaiting(clarify: activity)?.openQuestion {
+                say(HermesCallWaiting.spokenQuestion(question), to: turn.id, generation: generation)
+            } else {
+                say(Self.needsInputLine, to: turn.id, generation: generation)
+            }
+        case .inputPrompt(let id, _):
             guard id == current.runtimeID, let turn else { return }
             // Hermes waits on the user: the call says where to answer, and
             // the reply is still followed for the turn after.
@@ -251,15 +368,28 @@ final class LocalLiveTurnRunner {
 
     // MARK: Speaking
 
+    /// Hermes' words, as they come.
     private func speak(_ text: String) {
         guard let current = turn, !text.isEmpty else { return }
         turn?.spoke = true
-        onDelta?(current.id, text)
+        let spoken = actions.feed(splitter.feed(text))
+        if !spoken.isEmpty {
+            endedLine = spoken.hasSuffix("\n")
+            onDelta?(current.id, spoken)
+        }
     }
 
+    /// A line of the call's own instead of Hermes' reply.
     private func say(_ text: String, to turnID: String, generation: Int) {
         guard generation == self.generation, turn?.id == turnID else { return }
-        speak(text)
+        turn?.spoke = true
+        // What the reply still held ends with it: nothing of it follows the
+        // call's line. Words the action filter held back for a marker that
+        // never closed were said, so they go first.
+        splitter.dropSpeech()
+        let held = actions.finish()
+        if !held.isEmpty { onDelta?(turnID, held + (held.hasSuffix("\n") ? "" : "\n")) }
+        onDelta?(turnID, text)
         finish(turnID)
     }
 
@@ -270,13 +400,66 @@ final class LocalLiveTurnRunner {
 
     private func finish(_ turnID: String) {
         guard turn?.id == turnID else { return }
+        let rest = actions.feed(splitter.finish()) + actions.finish()
+        if !rest.isEmpty {
+            endedLine = rest.hasSuffix("\n")
+            onDelta?(turnID, rest)
+        }
+        // A card the model showed stands for the reply's tables and links;
+        // the files it attached still go on the screen.
+        let visual = showedCard ? splitter.fileMarkdown : splitter.visualMarkdown
+        if !visual.isEmpty, onVisual?(visual) == true {
+            onDelta?(turnID, (endedLine ? "" : "\n") + Self.onScreenLine)
+        }
+        splitter.reset()
+        actions.reset()
+        showedCard = false
+        endedLine = true
         turn = nil
         onDone?(turnID)
+    }
+
+    /// Where a call's next turn runs: the chat the call is attached to, or
+    /// else the one it made for itself, while `runtime` finds it (nil: the
+    /// chat was deleted); else a chat `create` makes on the profile of the
+    /// chat it lost, kept as the call's own for the rest of the call (issue
+    /// 1797). `own` is the call's own chat after this turn, on the runtime
+    /// it was found on: a delete of the resumed chat names that one, even
+    /// where it has no stored id (a legacy gateway).
+    static func callChat(
+        attached: VoiceThreadTarget?,
+        own: VoiceThreadTarget?,
+        runtime: @MainActor (VoiceThreadTarget) async throws -> String?,
+        create: @MainActor (_ profile: String?) async throws -> VoiceThreadTarget
+    ) async throws -> (chat: Chat, own: VoiceThreadTarget?) {
+        var profile: String?
+        if let attached {
+            if let runtimeID = try await runtime(attached) { return (Chat(runtimeID: runtimeID, profile: attached.profile), own) }
+            profile = attached.profile
+        }
+        if let own {
+            if let runtimeID = try await runtime(own) {
+                var found = own
+                found.runtimeSessionID = runtimeID
+                return (Chat(runtimeID: runtimeID, profile: own.profile), found)
+            }
+            profile = own.profile
+        }
+        let made = try await create(profile)
+        return (Chat(runtimeID: made.runtimeSessionID, profile: made.profile), made)
     }
 
     // Spoken to the user by their speech server.
     static var busyLine: String {
         AppLocalization.string("Hermes is still busy in this chat. Try again in a moment.")
+    }
+
+    /// What the call says when a turn couldn't go to Hermes: the reason,
+    /// when the send gave one (the chat is open in Hermes Desktop, #1061).
+    static func spokenFailure(for error: Error) -> String {
+        if error is VoiceThreadBusyError { return busyLine }
+        if case .unavailable(let reason)? = error as? VoiceAudioError, !reason.isEmpty { return reason }
+        return failureLine
     }
 
     static var failureLine: String {
@@ -285,6 +468,18 @@ final class LocalLiveTurnRunner {
 
     static var errorLine: String {
         AppLocalization.string("Hermes ran into a problem with that.")
+    }
+
+    static var onScreenLine: String {
+        AppLocalization.string("The rest is on your screen.")
+    }
+
+    /// The command Hermes asks to run, which a yes or no answers here.
+    static func approvalLine(_ approval: ApprovalActivity) -> String {
+        let asked = HermesApprovalText.description(approval.description).trimmingCharacters(in: .whitespacesAndNewlines)
+        let what = asked.isEmpty ? HermesApprovalText.command(approval.command) : asked
+        let clipped = what.count > 200 ? String(what.prefix(200)) + "…" : what
+        return AppLocalization.string("Hermes needs your OK to go on: \(clipped). Say yes to allow it once, or no.")
     }
 
     static var needsInputLine: String {

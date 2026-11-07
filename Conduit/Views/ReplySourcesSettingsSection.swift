@@ -24,7 +24,7 @@ struct ReplySourcesSettingsSection: View {
     var body: some View {
         ConduitSettingsSection(title: AppLocalization.string("Replies to messages from"), symbol: "bubble.left.and.text.bubble.right", tint: .conduitAccent) {
             Text(AppLocalization.string("A reply to a message you sent from a source turned off here sends no Response ready notification. Applies to this profile on this dashboard."))
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             if loadedKey == key {
                 ForEach(ReplySource.allCases) { source in
@@ -36,7 +36,7 @@ struct ReplySourcesSettingsSection: View {
             }
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.red)
                 if loadedKey != key {
                     Button(AppLocalization.string("Try again")) {
@@ -59,7 +59,7 @@ struct ReplySourcesSettingsSection: View {
         )) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title(source))
-                Text(detail(source)).font(.caption).foregroundStyle(.secondary)
+                Text(detail(source)).scaledFont(.caption).foregroundStyle(.secondary)
             }
         }
         .tint(.conduitAccent)
@@ -102,7 +102,7 @@ struct ReplySourcesSettingsSection: View {
         } catch is CancellationError {
             return
         } catch let readError {
-            replySourcesLogger.notice("Reply sources not read: \(readError.localizedDescription, privacy: .public)")
+            replySourcesLogger.notice("Reply sources not read: \(LogRedaction.message(readError), privacy: .public)")
             if key == self.key { error = AppLocalization.string("Could not read this setting from the host: \(UserFacingError.message(for: readError))") }
         }
     }
@@ -123,7 +123,7 @@ struct ReplySourcesSettingsSection: View {
             let cancelled = saveError is CancellationError
             if !cancelled {
                 Haptics.error()
-                replySourcesLogger.notice("Reply sources not saved: \(saveError.localizedDescription, privacy: .public)")
+                replySourcesLogger.notice("Reply sources not saved: \(LogRedaction.message(saveError), privacy: .public)")
             }
             // Read back what the host kept rather than guess at it.
             saving = nil

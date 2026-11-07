@@ -46,6 +46,10 @@ protocol GeminiLiveAudioOutput: AnyObject {
     func play(_ pcm: Data, sampleRate: Double) throws
     /// Drop everything queued now (the user started speaking).
     func interrupt()
+    /// The model's reply ended (turnComplete): an odd trailing PCM16 byte
+    /// is invalid and is dropped, never shifted into the next reply.
+    /// Whatever is queued plays on.
+    func endReply()
     func stop()
     /// Silences the speaker (#487) without stopping playback, so the
     /// call's timing (turns, echo tail, drains) is unchanged. Kept until
@@ -114,6 +118,7 @@ final class PlaybackServiceGeminiLiveOutput: GeminiLiveAudioOutput {
     }
 
     func interrupt() { playback.stop() }
+    func endReply() { playback.discardRemainder() }
     func stop() { playback.stop() }
     func setMuted(_ muted: Bool) { playback.isMuted = muted }
 }
@@ -139,10 +144,13 @@ final class GeminiLiveConversationController: ObservableObject {
 
     /// Asking first (#451), for calls whose supervisor can hold requests.
     /// A Watch call can't, so it's left out there.
-    static let askFirstParagraph = "Asking first: when it is on for this call, a new request waits for the user's OK. start_job and ask_thread then answer waiting_for_ok: tell the user in a few words what you'll send to Hermes and ask whether to send it. When they say yes in any words, call send_request. When they change it, call start_job or ask_thread again with the new request; it replaces the waiting one. When they say no, drop it. When they tell you to send it to Hermes, it goes at once. Corrections to running work never wait. When the user asks you to check with them before sending things to Hermes, or to stop checking, call set_ask_first."
+    static let askFirstParagraph = "Asking first: when it is on for this call, a new request waits for the user's OK. start_job and ask_thread then answer waiting_for_ok: tell the user in a few words what you'll do and ask whether to go ahead. When they say yes in any words, call send_request. When they change it, call start_job or ask_thread again with the new request; it replaces the waiting one. When they say no, drop it. When they tell you to send it to Hermes, it goes at once. Corrections to running work never wait. When the user asks you to check with them before sending things to Hermes, or to stop checking, call set_ask_first."
 
     /// Instructions for the live model. Written for the model, not shown as
-    /// UI copy, so not localized.
+    /// UI copy, so not localized. `acknowledgesOnceStarted`: Grok and Local
+    /// Live, whose start_job answers once the job runs, acknowledge after it.
+    /// `followedBy`: the call's own blocks (its chat, Hermes' tools, the
+    /// style), which go before the language rule.
     static func instructions(
         search: GeminiLiveSearchSource,
         memory: GeminiLiveMemoryContext? = nil,
@@ -150,7 +158,10 @@ final class GeminiLiveConversationController: ObservableObject {
         answerLength: LiveVoiceAnswerLength = .standard,
         asksFirst: Bool = true,
         readsBack: Bool = true,
-        onWatch: Bool = false
+        onWatch: Bool = false,
+        acknowledgesOnceStarted: Bool = false,
+        language: String? = LiveVoiceLanguage.current,
+        followedBy tail: String = ""
     ) -> String {
         // A Watch call has no read-backs (#451) and no screen to show
         // things on; its approvals come as requests that say how to answer.
@@ -174,15 +185,18 @@ final class GeminiLiveConversationController: ObservableObject {
     \(answerLength.instructions(readsBack: readsBack))
     Never speak while the user is speaking. If they interrupt you, stop and listen. If you have nothing useful to add, stay silent rather than filling the pause.
     Answer quick questions yourself. \(lookups)
-    Call start_job only for work that needs the user's Hermes agent: their files, code, systems, accounts, or longer multi-step research. Pass the complete task. Every time you call start_job, first say a very short acknowledgement out loud, like "On it, I'll have Hermes look into that." Then carry on with the conversation; the job runs on Hermes in the background.
-    Do not comment on how a job is progressing unless the user asks; use list_jobs when they do. When a job's result arrives, tell the user the outcome once, when the conversation is quiet: what Hermes found or did, with the details that matter.
-    \(readsBack ? readBackParagraph + "\n" : "")\(onWatch ? watchFindChatParagraph + "\n" : showOnScreenParagraph + "\n" + findChatParagraph + "\n")\(onWatch ? watchApprovalParagraph : "Never approve, deny, or answer anything on a job's behalf. If a job needs input, tell the user to open it in Conduit.")
+    Call start_job only for work that needs the user's Hermes agent: their files, code, systems, accounts, or longer multi-step research. Pass the complete task. \(acknowledgesOnceStarted ? "Call start_job without announcing it first, and only once it returns started, acknowledge it out loud." : "Every time you call start_job, first acknowledge it out loud.") \(LiveVoiceAcknowledgement.rule) Then carry on with the conversation; the job runs on Hermes in the background.
+    Do not comment on how a job is progressing unless the user asks; use list_jobs when they do. When a job's result arrives, tell the user the outcome once, when the conversation is quiet: what you found or did, with the details that matter.
+    \(readsBack ? readBackParagraph + "\n" : "")\(onWatch ? watchFindChatParagraph + "\n" : showOnScreenParagraph + "\n" + findChatParagraph + "\n")\(onWatch ? watchApprovalParagraph : "Never approve, deny, or answer anything on a job's behalf yourself. When a job update says it needs the user's OK, ask them, and answer it with answer_approval only on their own yes or no; if a job needs any other input, tell the user to open it in Conduit.")
     When the user corrects, changes, pauses or calls off a job Hermes is still working on ("wait, make it Alex", "hold that", "never mind"), call interrupt_job with their words right away (job_id from list_jobs): Hermes takes them in at once and decides what they mean. Use cancel_job only when the user asks to cancel.
     \(asksFirst ? askFirstParagraph + "\n" : "")When the user says goodbye to you, or asks to end, hang up or close the call, say a short goodbye, then call end_conversation. Jobs keep running after it ends.
     """ + personalityInstructions(personality) + memoryInstructions(memory) + speechRule(personality)
+        // The call's own blocks, then its language, last of all: a rule
+        // stated only before English text loses (issue 1868).
+        + tail + LiveVoiceLanguage.rule(language: language)
     }
 
-    static let showOnScreenParagraph = "Use show_on_screen for anything better seen than heard: charts, tables, forecasts, recipes and other steps, comparisons, images and links. Put the full detail there; once it's shown, say in a sentence that it's on their screen and give the gist: the screen takes the place of a long spoken answer. If it says the screen isn't available, just tell the user."
+    static let showOnScreenParagraph = "Use show_on_screen for anything better seen than heard: charts, tables, forecasts, recipes and other steps, comparisons, images and links, and places as map or place cards. Put the full detail there; once it's shown, say in a sentence that it's on their screen and give the gist: the screen takes the place of a long spoken answer. If it says the screen isn't available, just tell the user."
 
     /// A Watch call finds and reads chats (through its grant, or the phone)
     /// but can't open one: the phone isn't in view.
@@ -250,15 +264,28 @@ final class GeminiLiveConversationController: ObservableObject {
         didSet {
             syncHeadsetMute()
             // A host issue labels only the failure it caused.
-            if case .failed = phase {} else { hostIssue = nil }
+            if case .failed = phase {} else {
+                hostIssue = nil
+                awaitingConsent = nil
+            }
         }
     }
     /// What the host's check found wrong on the last start, set before
     /// the phase fails with the host's reason; nil once a start gets past
     /// the check, or when the failure was something else.
     private(set) var hostIssue: LiveVoiceHostIssue?
+    /// The mode whose provider the user hasn't yet allowed to hear them
+    /// (#827), set before the phase fails on it: the call screen then asks
+    /// instead of showing the failure. Nil otherwise.
+    @Published private(set) var awaitingConsent: LiveVoiceModeName?
+    /// The mode still needing the user's OK before this call may reach its
+    /// provider, or nil (`LiveVoiceProviderConsent.missing`).
+    private let missingConsent: @MainActor () -> LiveVoiceModeName?
     @Published private(set) var transcript: [VoiceConversationTranscriptEntry] = []
     @Published private(set) var isMicrophoneMuted = false { didSet { syncHeadsetMute() } }
+    /// Whether a call starting now starts with the microphone off: a call
+    /// from Hermes the user muted in CallKit before this call was running.
+    var startsMuted: () -> Bool = { false }
     /// The model's voice is silenced (#487). Its words still show in the
     /// captions, and job news Conduit would have it say waits until the
     /// speaker is back on.
@@ -307,7 +334,8 @@ final class GeminiLiveConversationController: ObservableObject {
     private var session: GeminiLiveSessionControlling?
     private var initialWidgetCaptureAuthorization: WidgetInitialCaptureAuthorization?
     /// Set by the Interrupt button: the rest of the current model turn is
-    /// dropped locally until the server ends or interrupts it.
+    /// dropped locally until the server ends or interrupts it. A press
+    /// after the turn ended (its tail still playing) sets nothing.
     private var suppressingModelTurn = false
     private var lastPlaybackAt: Date?
     private var lastModelAudioAt: Date?
@@ -325,6 +353,8 @@ final class GeminiLiveConversationController: ObservableObject {
     /// so a later nudge (an unmute) can't replace that proof.
     private var audioReturnSeen = false
     private var audioPauseObservers: [NSObjectProtocol] = []
+    /// CallKit's audio going and coming, for the whole call (#1145).
+    private var callAudioObservers: [NSObjectProtocol] = []
     private let notificationCenter: NotificationCenter
     /// Tries to restart the microphone after the system says the other
     /// sound ended: the session can still be settling right after it.
@@ -380,12 +410,14 @@ final class GeminiLiveConversationController: ObservableObject {
 
     /// The turn that greets the user when a call connects, when they asked
     /// for one (#290). Sent once per call, never again on a reconnect.
+    private let provider: DirectLiveProvider
     private let openingPrompt: @MainActor () -> String?
     private var hasSentOpening = false
 
     init(
         makeSession: @escaping @MainActor () -> GeminiLiveSessionControlling,
         availability: @escaping @MainActor () async throws -> GeminiLiveAvailability,
+        missingConsent: @escaping @MainActor () -> LiveVoiceModeName? = { nil },
         tools: GeminiLiveToolBridge,
         input: GeminiLiveAudioInput,
         output: GeminiLiveAudioOutput,
@@ -394,11 +426,14 @@ final class GeminiLiveConversationController: ObservableObject {
         endConversationPhrases: @escaping @MainActor () -> [String] = { [] },
         openingPrompt: @escaping @MainActor () -> String? = { nil },
         headsetMute: HeadsetMicrophoneMute? = nil,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        provider: DirectLiveProvider = .gemini
     ) {
+        self.provider = provider
         self.notificationCenter = notificationCenter
         self.makeSession = makeSession
         self.availability = availability
+        self.missingConsent = missingConsent
         self.openingPrompt = openingPrompt
         self.tools = tools
         self.input = input
@@ -417,10 +452,15 @@ final class GeminiLiveConversationController: ObservableObject {
 
     /// The Interrupt button: stop the model now. On an open speaker this is
     /// how the user barges in, since the mic is closed while it speaks.
+    /// The session tells a server that keeps its own microphone gate (#1325).
     func interruptSpeaking() {
         guard modelTurnActive || output.isPlaying else { return }
         output.interrupt()
-        suppressingModelTurn = true
+        session?.cancelResponse()
+        // Only a turn still arriving is dropped: after its turnComplete,
+        // pressed while the tail plays, the next turn is the model's next
+        // reply and must be heard (issue 1790).
+        suppressingModelTurn = modelTurnActive
         modelTurnActive = false
         lastModelTurnEndedAt = now()
         lastPlaybackAt = nil
@@ -439,12 +479,14 @@ final class GeminiLiveConversationController: ObservableObject {
     /// another voice mode on its own.
     func start() async {
         guard !isActive else { return }
+        observeCallAudio()
         let widgetAuthorization = initialWidgetCaptureAuthorization
         // A mute belongs to the conversation it was set in: a new one (one
         // started from CarPlay, which has no mute control, included) is heard.
         // Cleared before the call goes active so the headset mute starts
-        // the call unmuted too.
-        isMicrophoneMuted = false
+        // the call unmuted too. A call from Hermes muted in CallKit while
+        // it opened starts muted (startsMuted).
+        isMicrophoneMuted = startsMuted()
         // So is the speaker mute.
         isSpeakerMuted = false
         output.setMuted(false)
@@ -463,12 +505,17 @@ final class GeminiLiveConversationController: ObservableObject {
         clearAudioPause()
         tools.returnUnsent(pendingTextTurns)
         pendingTextTurns = []
+        // A returned resend is a first send next time.
+        respokenJobIDs = []
         returnHeldOutcomes()
         // Best effort, as on GPT-Live: the chat still has the exchange.
         pendingContextNotes = []
         withdrawnCallIDs = []
         // Nothing from a previous attempt may gate or attach to this one.
         callEpoch &+= 1
+        // Stop then Start leaves `.connecting` again, so an older start's
+        // late availability or permission answer is told apart by epoch.
+        let epoch = callEpoch
         modelTurnActive = false
         suppressingModelTurn = false
         lastUserSpeechAt = nil
@@ -480,31 +527,39 @@ final class GeminiLiveConversationController: ObservableObject {
         activeEndPhrases = endConversationPhrases()
         if let traceName { LiveCallTrace.shared.begin(traceName) }
         hostIssue = nil
+        // Nothing reaches the provider, its credential included, until the
+        // user has allowed it to hear them (#827).
+        if let mode = missingConsent() {
+            initialWidgetCaptureAuthorization = nil
+            awaitingConsent = mode
+            phase = .failed(VoiceSetupIssue.providerConsentNeeded(mode).message)
+            return
+        }
         do {
             let status = try await availability()
-            guard phase == .connecting else { return }
+            guard isStarting(epoch) else { return }
             guard widgetAuthorization?.mayStartCapture != false else { phase = .idle; initialWidgetCaptureAuthorization = nil; return }
             guard status.isAvailable else {
                 initialWidgetCaptureAuthorization = nil
                 hostIssue = LiveVoiceHostIssue(status)
-                phase = .failed(status.userFacingReason ?? AppLocalization.string("Gemini Live is not available on this Hermes server."))
+                phase = .failed(status.userFacingReason(for: provider) ?? GeminiLiveAvailability.notAvailable(for: provider))
                 return
             }
         } catch {
-            guard phase == .connecting else { return }
+            guard isStarting(epoch) else { return }
             initialWidgetCaptureAuthorization = nil
             hostIssue = LiveVoiceHostIssue(error: error)
             phase = .failed(UserFacingError.message(for: error))
             return
         }
         guard await input.requestPermission() else {
-            guard phase == .connecting else { return }
+            guard isStarting(epoch) else { return }
             initialWidgetCaptureAuthorization = nil
             phase = .failed(VoiceAudioError.microphonePermissionDenied.localizedDescription)
             return
         }
-        guard phase == .connecting, widgetAuthorization?.mayStartCapture != false else {
-            if widgetAuthorization?.mayStartCapture == false { phase = .idle; initialWidgetCaptureAuthorization = nil }
+        guard isStarting(epoch), widgetAuthorization?.mayStartCapture != false else {
+            if isStarting(epoch), widgetAuthorization?.mayStartCapture == false { phase = .idle; initialWidgetCaptureAuthorization = nil }
             return
         }
         // A retry after a failed connection starts a new server session:
@@ -537,6 +592,12 @@ final class GeminiLiveConversationController: ObservableObject {
         session.start()
     }
 
+    /// The start that bumped `callEpoch` to `epoch` is still the one under
+    /// way: nobody stopped it, and no newer start replaced it.
+    private func isStarting(_ epoch: Int) -> Bool {
+        phase == .connecting && callEpoch == epoch
+    }
+
     func installInitialWidgetCaptureAuthorization(_ authorization: WidgetInitialCaptureAuthorization?) {
         initialWidgetCaptureAuthorization = authorization
     }
@@ -552,6 +613,8 @@ final class GeminiLiveConversationController: ObservableObject {
         lateEndPhraseTask?.cancel()
         lateEndPhraseTask = nil
         clearAudioPause()
+        callAudioObservers.forEach(notificationCenter.removeObserver)
+        callAudioObservers = []
         session?.stop()
         session = nil
         stopInput()
@@ -565,6 +628,8 @@ final class GeminiLiveConversationController: ObservableObject {
         // Unspoken job notices go back to the supervisor, not the bin.
         tools.returnUnsent(pendingTextTurns)
         pendingTextTurns = []
+        // A returned resend is a first send next time.
+        respokenJobIDs = []
         returnHeldOutcomes()
         // Best effort, as on GPT-Live: the chat still has the exchange.
         pendingContextNotes = []
@@ -617,6 +682,15 @@ final class GeminiLiveConversationController: ObservableObject {
         }
     }
 
+    /// Whether this call's live connection runs its own agent (Live > Local),
+    /// so Hermes' job news is news to it. False while connecting, and for
+    /// every call that answers each utterance with a Hermes turn.
+    var sessionRunsAgentTurns: Bool { session?.runsAgentTurns == true }
+
+    /// Whether the live connection can take a send yet. The session's own
+    /// state, not the setting: a call keeps the mode it connected with.
+    var sessionIsReady: Bool { session?.isReady == true }
+
     /// Background-job updates became pending (the supervisor's
     /// onNoticePending, routed here while this mode is active).
     func deliverPendingJobUpdates() {
@@ -651,6 +725,8 @@ final class GeminiLiveConversationController: ObservableObject {
         idleFlushTask = nil
         tools.returnUnsent(pendingTextTurns)
         pendingTextTurns = []
+        // A returned resend is a first send next time.
+        respokenJobIDs = []
         returnHeldOutcomes()
         // Best effort, as on GPT-Live: the chat still has the exchange.
         pendingContextNotes = []
@@ -763,6 +839,7 @@ final class GeminiLiveConversationController: ObservableObject {
             audioPaused = true
             audioReturnSeen = false
             geminiLiveLogger.notice("Live voice paused by an audio interruption")
+            HermesCallTrace.shared.note("Live voice audio paused")
             observeAudioReturn()
         }
         // Whatever the model was saying can't be heard: drop the rest of
@@ -785,7 +862,8 @@ final class GeminiLiveConversationController: ObservableObject {
     }
 
     /// The system's interruption end and the app coming back to the
-    /// foreground are the cues that the other sound let go.
+    /// foreground are the cues that the other sound let go (CallKit giving
+    /// a call its audio back is another: `observeCallAudio`).
     private func observeAudioReturn() {
         guard audioPauseObservers.isEmpty else { return }
         audioPauseObservers = [
@@ -798,6 +876,49 @@ final class GeminiLiveConversationController: ObservableObject {
                 Task { @MainActor [weak self] in self?.scheduleAudioResume(delays: Self.audioResumeDelays, audioReturned: true) }
             },
         ]
+    }
+
+    /// In a call from Hermes CallKit gives the audio back with no
+    /// interruption end promised, and off screen (on CarPlay, locked) no
+    /// app activation follows (#1145). Watched for the whole call: CallKit's
+    /// audio can also come on after the call's microphone started.
+    private func observeCallAudio() {
+        guard callAudioObservers.isEmpty else { return }
+        callAudioObservers = [
+            notificationCenter.addObserver(forName: .hermesCallAudioActivated, object: nil, queue: nil) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.callAudioActivated() }
+            },
+            // CallKit taking the audio needn't come with an interruption:
+            // the microphone would run on a dead session.
+            notificationCenter.addObserver(forName: .hermesCallAudioDeactivated, object: nil, queue: nil) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.callAudioDeactivated() }
+            },
+        ]
+    }
+
+    /// CallKit took the call's audio: the call pauses as for an
+    /// interruption, until CallKit gives it back.
+    func callAudioDeactivated() {
+        guard isActive, endRequestedAt == nil, inputRunning else { return }
+        input.stop()
+        captureInterrupted()
+    }
+
+    /// CallKit activated the call's audio. Paused, the call resumes.
+    /// Listening, the microphone started before CallKit's audio was on
+    /// (answered in the car, it can come after the call's wait for it):
+    /// it restarts on the session CallKit activated.
+    func callAudioActivated() {
+        guard isActive, endRequestedAt == nil else { return }
+        if audioPaused {
+            scheduleAudioResume(delays: Self.audioResumeDelays, audioReturned: true)
+            return
+        }
+        guard inputRunning else { return }
+        stopInput()
+        // One that can't start pauses, and its trace says so.
+        guard startInput(pausingOnFailure: true) else { return }
+        HermesCallTrace.shared.note("Live voice microphone restarted on the call's audio")
     }
 
     /// Tries to bring the microphone back after each delay in turn,
@@ -852,6 +973,7 @@ final class GeminiLiveConversationController: ObservableObject {
         }
         clearAudioPause()
         geminiLiveLogger.notice("Live voice resumed after an audio interruption")
+        HermesCallTrace.shared.note("Live voice audio back")
         return true
     }
 
@@ -931,6 +1053,8 @@ final class GeminiLiveConversationController: ObservableObject {
             idleFlushTask = nil
             tools.returnUnsent(pendingTextTurns)
             pendingTextTurns = []
+            // A returned resend is a first send next time.
+            respokenJobIDs = []
             returnHeldOutcomes()
             // Ending: the goodbye finishes closing instead of offering a
             // retry (the end task closes the conversation).
@@ -981,6 +1105,9 @@ final class GeminiLiveConversationController: ObservableObject {
             // No turnComplete checks the utterance this turn answered.
             scheduleLateEndPhraseCheck()
         case .turnComplete:
+            // The reply's audio ended: an odd byte left of it would shift
+            // every sample of the next reply.
+            output.endReply()
             suppressingModelTurn = false
             modelTurnActive = false
             lastModelTurnEndedAt = now()
@@ -1002,14 +1129,17 @@ final class GeminiLiveConversationController: ObservableObject {
                 inFlightCallIDs.insert(call.id)
                 Task { [weak self] in
                     guard let self else { return }
-                    // The model is told to acknowledge before it calls, so
-                    // any speech since the user's request counts.
+                    // Gemini and Qwen acknowledge before they call, so any
+                    // speech since the user's request counts. Grok and Local
+                    // Live are told to stay quiet until it returns, so speech
+                    // there counts too; only silence brings the nudge.
                     let calledAt = self.now()
                     let requestedAt = min(calledAt, self.lastUserSpeechAt ?? calledAt)
                     self.trace("Running \(call.name)")
                     var outgoing = await self.tools.handle(call)
                     self.inFlightCallIDs.remove(call.id)
-                    self.trace("\(call.name): \(Self.traceStatus(of: outgoing, answering: call.id))")
+                    // A call that ended while this ran has its own trace no more.
+                    if self.callEpoch == epoch { self.trace("\(call.name): \(Self.traceStatus(of: outgoing, answering: call.id))") }
                     // The model withdrew the call while it ran (the user
                     // spoke over a lookup): its answer must not go back.
                     if self.withdrawnCallIDs.remove(call.id) != nil {
@@ -1065,7 +1195,8 @@ final class GeminiLiveConversationController: ObservableObject {
         return false
     }
 
-    /// The model is told to acknowledge every start_job out loud. If it
+    /// The model is told to acknowledge every start_job out loud (Grok and
+    /// Local Live once it returns). If it
     /// stayed silent (it sometimes does while a NON_BLOCKING call runs),
     /// prompt a one-line acknowledgement once the conversation is quiet.
     private func ensureAcknowledgement(since calledAt: Date, epoch: Int) {
@@ -1160,6 +1291,16 @@ final class GeminiLiveConversationController: ObservableObject {
         LiveCallTrace.shared.note(label)
     }
 
+    /// Which microphone the call records from, for the trace (#1418): the
+    /// port's type and the iPhone microphone in use (Bottom, Front, Back),
+    /// never a device's own name.
+    static func traceInputRoute(_ session: AVAudioSession = .sharedInstance()) -> String {
+        guard let port = session.currentRoute.inputs.first else { return "no input route" }
+        var description = port.portType.rawValue
+        if let source = port.selectedDataSource?.dataSourceName { description += " (\(source))" }
+        return description
+    }
+
     /// How a call was answered, for the trace: never its text.
     static func traceStatus(of outgoing: [GeminiLiveToolBridge.Outgoing], answering id: String) -> String {
         for item in outgoing {
@@ -1170,7 +1311,7 @@ final class GeminiLiveConversationController: ObservableObject {
         return "no answer"
     }
 
-    static let acknowledgementPrompt = "[You just started a background job on Hermes for the user's last request. Acknowledge it out loud in a few words, like \"On it, Hermes is checking.\" Do not start another job.]"
+    static let acknowledgementPrompt = "[You just started a background job for the user's last request. Acknowledge it out loud in a word or a few, in your own words and as your own work, never as something you asked Hermes to do. Do not start another job.]"
 
     var lastModelAudioAtForTesting: Date? { lastModelAudioAt }
 
@@ -1280,12 +1421,21 @@ final class GeminiLiveConversationController: ObservableObject {
         guard !pendingTextTurns.isEmpty, isConversationIdle else { return }
         let text = pendingTextTurns.removeFirst()
         let noticeJobID = tools.textUpdateSending(text)
+        let sentAt = now()
         modelTurnActive = true
         // An update that never reached the socket waits for the next
         // connection instead of being lost; a job notice whose conversation
-        // is gone goes back to the supervisor.
-        session.send(.textTurn(text), onSent: { [weak self] in
-            self?.tools.textUpdateDelivered(jobID: noticeJobID)
+        // is gone goes back to the supervisor. One the socket took counts
+        // as told only once the model has said something since: Grok and
+        // Local Live hear every result this way, and a model that lets one
+        // pass in silence hears it once more (#1210).
+        session.send(.textTurn(text), onSent: { [weak self, tools] in
+            guard let self else {
+                tools.textUpdateDelivered(jobID: noticeJobID)
+                return
+            }
+            guard noticeJobID != nil else { return }
+            self.ensureOutcomeSpoken(jobID: noticeJobID, since: sentAt)
         }, onFailure: { [weak self, weak session] in
             guard let self else { return }
             guard self.isActive, self.endRequestedAt == nil, let session, self.session === session else {
@@ -1360,10 +1510,15 @@ final class GeminiLiveConversationController: ObservableObject {
             guard self.session.map(ObjectIdentifier.init) == sentOn,
                   self.session?.connectionGeneration == generation else {
                 // Same call, new connection: said if the model spoke since,
-                // otherwise reported again there as a tracked update.
+                // otherwise reported again there as a tracked update. That
+                // is its one resend, on whichever connection (#1210).
                 if self.modelSpoke(since: sentAt) {
+                    if let jobID { self.respokenJobIDs.remove(jobID) }
+                    self.tools.outcomeSent(jobID: jobID)
+                } else if let jobID, self.respokenJobIDs.remove(jobID) != nil {
                     self.tools.outcomeSent(jobID: jobID)
                 } else {
+                    if let jobID { self.respokenJobIDs.insert(jobID) }
                     self.reissueAsTextUpdates([jobID])
                 }
                 return
@@ -1382,13 +1537,24 @@ final class GeminiLiveConversationController: ObservableObject {
 
     func respeakOutcomeIfSilent(jobID: UUID?, since sentAt: Date) {
         if modelSpoke(since: sentAt) {
+            if let jobID { respokenJobIDs.remove(jobID) }
             tools.outcomeSent(jobID: jobID)
             return
         }
         // No answer came, so no turn is running for it.
         modelTurnActive = false
+        // Said again once: a model that lets it pass twice won't take it a
+        // third time, and the job stays listed until then (#1210).
+        if let jobID, respokenJobIDs.remove(jobID) != nil {
+            tools.outcomeSent(jobID: jobID)
+            return
+        }
+        if let jobID { respokenJobIDs.insert(jobID) }
         reissueAsTextUpdates([jobID])
     }
+
+    /// Jobs whose news the model let pass once and was sent again.
+    private var respokenJobIDs: Set<UUID> = []
 
     /// The call these results were held for was withdrawn: said as text
     /// updates instead.
@@ -1492,10 +1658,11 @@ final class GeminiLiveConversationController: ObservableObject {
             initialWidgetCaptureAuthorization?.captureDidStart()
             initialWidgetCaptureAuthorization = nil
             inputRunning = true
+            trace("Microphone started: \(Self.traceInputRoute())\(input.cancelsEcho ? ", echo cancelling" : "")\(routePolicy() == .speakerSafeHalfDuplex ? ", open speaker" : "")")
             return true
         } catch {
             if pausingOnFailure {
-                geminiLiveLogger.notice("Live voice microphone couldn't start; pausing: \(String(describing: error), privacy: .public)")
+                geminiLiveLogger.notice("Live voice microphone couldn't start; pausing: \(LogRedaction.describing(error), privacy: .public)")
                 pauseForAudioInterruption()
                 if endRequestedAt == nil { phase = .paused }
                 if scheduleRetryOnFailure {

@@ -98,18 +98,23 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(first["greeting"] as? String, "Say hi.")
         XCTAssertNil(first["history"])
         XCTAssertNil(first["call_opening"])
-        // A call Hermes placed: the host has the model speak first (#544).
+        // A call Hermes placed: the host leaves the opening to the Watch's turn (#544, notifier #541).
         let called = try XCTUnwrap(JSONSerialization.jsonObject(with: WatchAudioBridgeWire.start(
             engine: "gpt_live", voice: nil, briefing: "About this call", greeting: nil, callOpening: true, history: []
         )) as? [String: Any])
         XCTAssertEqual(called["call_opening"] as? Bool, true)
-        // The Watch's own opening turn: only when the host didn't open, never on a rejoin.
-        let hostOpened = WatchAudioBridgeWire.Started(engine: "gpt_live", voice: nil, inputRate: 16_000, outputRate: 24_000, briefingApplied: true, greetingApplied: true)
-        var olderHost = hostOpened
-        olderHost.greetingApplied = false
-        XCTAssertFalse(WatchAudioBridgeWire.sendsOpeningTurn(rejoining: false, started: hostOpened))
-        XCTAssertTrue(WatchAudioBridgeWire.sendsOpeningTurn(rejoining: false, started: olderHost))
-        XCTAssertFalse(WatchAudioBridgeWire.sendsOpeningTurn(rejoining: true, started: olderHost))
+        // The Watch's own opening turn: only when the host didn't open (an
+        // older plugin did), never on a rejoin.
+        let olderHostOpened = WatchAudioBridgeWire.Started(engine: "gpt_live", voice: nil, inputRate: 16_000, outputRate: 24_000, briefingApplied: true, greetingApplied: true)
+        var host = olderHostOpened
+        host.greetingApplied = false
+        XCTAssertFalse(WatchAudioBridgeWire.sendsOpeningTurn(rejoining: false, started: olderHostOpened))
+        XCTAssertTrue(WatchAudioBridgeWire.sendsOpeningTurn(rejoining: false, started: host))
+        XCTAssertFalse(WatchAudioBridgeWire.sendsOpeningTurn(rejoining: true, started: host))
+        // A call with no reason of its own greets as the user's setting asks, as on the iPhone.
+        XCTAssertFalse(LiveVoiceGreeting.turn("").contains("Say:"))
+        XCTAssertTrue(LiveVoiceGreeting.turn("Hi Neal").contains(#"Say: "Hi Neal""#))
+        XCTAssertEqual(LiveVoiceStyle(greeting: "Hi Neal").openingPrompt, LiveVoiceGreeting.turn("Hi Neal"))
         // A rejoin: the conversation so far, no second greeting.
         let rejoin = try XCTUnwrap(JSONSerialization.jsonObject(with: WatchAudioBridgeWire.start(
             engine: "gpt_live", voice: nil, briefing: nil, greeting: nil,
@@ -128,6 +133,11 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(
             WatchAudioBridgeWire.control(Data(#"{"type":"error","code":"busy","message":"Another Watch call is running."}"#.utf8)),
             .error(code: "busy", message: "Another Watch call is running.")
+        )
+        // The plugin's refusal of a hello past the grant's streams (dashboard/api/watch_audio.py _hello).
+        XCTAssertEqual(
+            WatchAudioBridgeWire.control(Data(#"{"type":"error","code":"streams_spent","message":"Start the call again."}"#.utf8)),
+            .error(code: WatchAudioBridgeWire.streamsSpent, message: "Start the call again.")
         )
         XCTAssertNil(WatchAudioBridgeWire.control(Data(#"{"type":"later"}"#.utf8)))
         XCTAssertNil(WatchAudioBridgeWire.control(Data("not json".utf8)))
@@ -253,6 +263,53 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertNil(try JSONDecoder().decode(WatchDirectCallLedger.GrantScope.self, from: stored).audio)
     }
 
+    /// A call whose Watch died ends on the phone after the silence limit
+    /// (#1008), but not while a grant its Watch may use wrist down is open.
+    @MainActor
+    func testWatchCallSilenceDeadlineWaitsOutTheGrant() {
+        let heard = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        let limit = WatchDirectBroker.silenceLimit
+        XCTAssertEqual(WatchDirectBroker.silenceDeadline(lastHeardAt: heard, grantExpiresAt: nil), heard.addingTimeInterval(limit))
+        // A grant that ends before the limit changes nothing.
+        XCTAssertEqual(
+            WatchDirectBroker.silenceDeadline(lastHeardAt: heard, grantExpiresAt: heard.addingTimeInterval(10 * 60)),
+            heard.addingTimeInterval(limit)
+        )
+        // One that runs past it keeps the call until it ends, plus a minute.
+        let grantEnds = heard.addingTimeInterval(limit + 5 * 60)
+        XCTAssertEqual(
+            WatchDirectBroker.silenceDeadline(lastHeardAt: heard, grantExpiresAt: grantEnds),
+            grantEnds.addingTimeInterval(WatchDirectBroker.grantGrace)
+        )
+    }
+
+    /// The grant's end comes back with a call adopted after a restart, so
+    /// its watchdogs wait it out; calls stored before it read as unknown.
+    @MainActor
+    func testWatchCallLedgerKeepsTheGrantsEndAcrossARestart() throws {
+        let suite = "WatchDirectCallLedger.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var ledger = WatchDirectCallLedger(defaults: defaults)
+        ledger.begin(9, connection: WatchDirectConnection(profile: "default", dashboard: "A"), saveCalls: true)
+        let ends = Date(timeIntervalSinceReferenceDate: 800_001_800)
+        let scope = WatchDirectCallLedger.GrantScope(
+            tools: ["web_search"],
+            jobTools: [],
+            liveToken: true,
+            maxJobs: 0,
+            jobOptions: [:],
+            voiceApprovals: false,
+            grantIDs: ["grant-1"],
+            expiresAt: ends
+        )
+        ledger.setGrant(scope, for: 9)
+        XCTAssertEqual(WatchDirectCallLedger(defaults: defaults).call(9)?.grant?.expiresAt, ends)
+
+        let stored = Data(#"{"tools":[],"jobTools":[],"liveToken":false,"maxJobs":0,"jobOptions":{},"voiceApprovals":false,"grantIDs":[]}"#.utf8)
+        XCTAssertNil(try JSONDecoder().decode(WatchDirectCallLedger.GrantScope.self, from: stored).expiresAt)
+    }
+
     /// Corrections on a Watch call (#455): the marker, the words and what
     /// the model hears match the phone's, for GPT-Live and Gemini/Grok.
     @MainActor
@@ -264,6 +321,21 @@ extension HermesVoiceGatewayTimeoutTests {
             XCTAssertEqual(watch?.number, phone?.number, text)
             XCTAssertEqual(watch?.rest, phone?.rest, text)
         }
+        // Additions steer the job (#1076), with the phone's marker.
+        for text in ["Add to job 2: a quiet table", "add to job #3, the receipts", "Job 2: make it Alex", "Add to job 2:30 reminder"] {
+            let watch = WatchBridgeDelegation.addToJobMarker(in: text)
+            let phone = GPTLiveDelegationBridge.addToJobMarker(in: text)
+            XCTAssertEqual(watch?.number, phone?.number, text)
+            XCTAssertEqual(watch?.rest, phone?.rest, text)
+        }
+        XCTAssertEqual(WatchBridgeDelegation.addToJobMarker(in: "Add to job 2: a quiet table")?.rest, "a quiet table")
+        XCTAssertEqual(WatchJobAnswer.arguments(name: WatchJobAnswer.interruptJob, ["job_id": "watch-2", "message": "a quiet table", "kind": " ADD "]) as? [String: String],
+                       ["job_id": "watch-2", "message": "a quiet table", "kind": "add"])
+        // No kind, or one Conduit doesn't know, redirects as before.
+        XCTAssertEqual(WatchJobAnswer.arguments(name: WatchJobAnswer.interruptJob, ["job_id": "watch-2", "message": "hold that", "kind": ""]) as? [String: String],
+                       ["job_id": "watch-2", "message": "hold that"])
+        XCTAssertEqual(WatchJobAnswer.arguments(name: WatchJobAnswer.interruptJob, ["job_id": "watch-2", "message": "hold that", "kind": "pause"]) as? [String: String],
+                       ["job_id": "watch-2", "message": "hold that"])
         XCTAssertEqual(WatchBridgeDelegation.followUpWords(userWords: " make it Alex ", delegated: "Alex"), "make it Alex")
         XCTAssertEqual(WatchBridgeDelegation.followUpWords(userWords: "", delegated: " hold that "), "hold that")
         XCTAssertEqual(WatchBridgeDelegation.followUpWords(userWords: "", delegated: "hold that" + WatchBridgeDelegation.contextMarker + "User: hi\n"), "hold that")
@@ -299,6 +371,27 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertTrue(WatchBridgeDelegation.working(title: "Tokyo weather", number: 2).contains("starting with \"Job 2:\""))
         XCTAssertFalse(WatchBridgeDelegation.working(title: "Tokyo weather").contains("Job "))
     }
+
+    /// The Grok and Local Live bridge's keepalive: a ping still unanswered
+    /// when the next is due, or one that failed, is a miss. Two in a row is
+    /// a dead socket (one can be a late pong after a suspension); an
+    /// answered ping clears them.
+    func testWatchBridgeKeepaliveCallsTwoMissedPingsADeadSocket() {
+        var pings = WatchPingWatchdog()
+        XCTAssertFalse(pings.pingDue(), "The first ping goes out")
+        XCTAssertFalse(pings.pingDue(), "Unanswered once: maybe a late pong")
+        XCTAssertTrue(pings.pingDue(), "Unanswered twice: the socket is dead")
+
+        pings = WatchPingWatchdog()
+        XCTAssertFalse(pings.pingDue())
+        XCTAssertFalse(pings.pingDue())
+        XCTAssertFalse(pings.answered(ok: true), "A pong clears the misses")
+        XCTAssertEqual(pings.misses, 0)
+        XCTAssertFalse(pings.pingDue())
+        XCTAssertFalse(pings.answered(ok: false), "A failed ping is one miss")
+        XCTAssertFalse(pings.pingDue())
+        XCTAssertTrue(pings.answered(ok: false), "Two failed in a row: dead")
+    }
 }
 
 private extension Data {
@@ -313,5 +406,36 @@ private extension Data {
             index = next
         }
         self.init(bytes)
+    }
+}
+
+/// A Watch call whose sockets get no network (#1346): it ends on the
+/// second refusal while none has opened, and never once one has.
+extension HermesVoiceGatewayTimeoutTests {
+    private static let watchOffline: [String: Any] = ["domain": NSURLErrorDomain, "code": URLError.notConnectedToInternet.rawValue]
+
+    func testWatchNoNetworkEndsOnTheSecondRefusalBeforeAnySocketOpened() {
+        var noNetwork = WatchNoNetwork()
+        XCTAssertFalse(noNetwork.socketEnded(Self.watchOffline))
+        XCTAssertTrue(noNetwork.socketEnded(Self.watchOffline))
+        XCTAssertEqual(noNetwork.refusals, 2)
+    }
+
+    func testWatchNoNetworkLeavesDropsAfterAnOpenSocketToTheCall() {
+        var noNetwork = WatchNoNetwork()
+        XCTAssertFalse(noNetwork.socketEnded(Self.watchOffline))
+        noNetwork.socketOpened()
+        XCTAssertFalse(noNetwork.socketEnded(Self.watchOffline))
+        XCTAssertFalse(noNetwork.socketEnded(Self.watchOffline))
+    }
+
+    func testWatchNoNetworkCountsOnlyOfflineErrors() {
+        var noNetwork = WatchNoNetwork()
+        let hostDown: [String: Any] = ["domain": NSURLErrorDomain, "code": URLError.cannotConnectToHost.rawValue]
+        XCTAssertFalse(noNetwork.socketEnded(hostDown))
+        XCTAssertFalse(noNetwork.socketEnded(["code": 1006, "reason": ""]))
+        XCTAssertFalse(noNetwork.socketEnded(hostDown))
+        XCTAssertEqual(noNetwork.refusals, 0)
+        XCTAssertTrue(WatchNoNetwork.isOffline(["domain": NSURLErrorDomain, "code": URLError.dataNotAllowed.rawValue]))
     }
 }

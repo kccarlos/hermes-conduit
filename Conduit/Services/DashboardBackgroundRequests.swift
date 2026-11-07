@@ -27,20 +27,44 @@ extension DashboardTicketBridge {
         timeoutMilliseconds: Int = 12_000
     ) async throws -> [String: Any] {
         guard !isInvalidated else { throw DashboardTicketBridgeError.notReady }
-        if let nativeOAuthSession {
-            return try await nativeOAuthSession.requestJSON(
+        noteWriteStarted()
+        defer { noteWriteEnded() }
+        return try await DashboardTicketBridgeError.explainingPluginRefusal(path: path) { () async throws -> [String: Any] in
+            if let nativeOAuthSession {
+                return try await nativeOAuthSession.requestJSON(
+                    path: path,
+                    method: method,
+                    encodedBody: encodedBody,
+                    timeoutMilliseconds: timeoutMilliseconds
+                )
+            }
+            return try await requestJSONWithoutPage(
                 path: path,
                 method: method,
                 encodedBody: encodedBody,
                 timeoutMilliseconds: timeoutMilliseconds
             )
         }
-        return try await requestJSONWithoutPage(
-            path: path,
-            method: method,
-            encodedBody: encodedBody,
-            timeoutMilliseconds: timeoutMilliseconds
-        )
+    }
+
+    /// A read that never goes through the page, so it neither waits for the
+    /// page nor loads it: with the native sign-in's token, else with the
+    /// page's cookies (`.notReady` while no store holds one). For reads sent
+    /// as a connection starts (StartupReads).
+    func readWithoutPage(path: String) async throws -> [String: Any] {
+        guard !isInvalidated else { throw DashboardTicketBridgeError.notReady }
+        return try await DashboardTicketBridgeError.explainingPluginRefusal(path: path) { () async throws -> [String: Any] in
+            if let nativeOAuthSession {
+                return try await nativeOAuthSession.requestJSON(
+                    path: path,
+                    method: "GET",
+                    body: nil,
+                    timeoutMilliseconds: 12_000,
+                    maxResponseBytes: DataURLLimits.maxJSONResponseBytes
+                )
+            }
+            return try await requestJSONWithoutPage(path: path)
+        }
     }
 
     /// The request the page's `fetch` would send, without the page: same
@@ -87,9 +111,18 @@ extension DashboardTicketBridge {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
 
-        let result: (Data, URLResponse)
+        let result: (data: Data, response: URLResponse, oversized: Bool)
         do {
-            result = try await Self.load(request, deadline: .milliseconds(max(1_000, timeoutMilliseconds)))
+            if let loadWithoutPageForTesting {
+                let (data, response) = try await loadWithoutPageForTesting(request)
+                result = (data, response, false)
+            } else {
+                result = try await Self.load(
+                    request,
+                    deadline: .milliseconds(max(1_000, timeoutMilliseconds)),
+                    maxResponseBytes: maxResponseBytes
+                )
+            }
         } catch let error as URLError {
             // A cancelled caller hears cancellation, as from the page path.
             if error.code == .cancelled || Task.isCancelled { throw CancellationError() }
@@ -97,7 +130,15 @@ extension DashboardTicketBridge {
             // abort: status 0.
             throw DashboardTicketBridgeError.http(status: 0, detail: error.localizedDescription)
         }
-        let (data, response) = result
+        // invalidate() doesn't cancel this request: an answer that lands
+        // after a dashboard switch is the old dashboard's, as on the page.
+        guard !isInvalidated else {
+            if let http = result.response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+                throw DashboardTicketBridgeError.answeredAfterSwitch
+            }
+            throw DashboardTicketBridgeError.notReady
+        }
+        let (data, response, oversized) = result
         guard let http = response as? HTTPURLResponse else {
             throw DashboardTicketBridgeError.http(status: 0, detail: "No response from the dashboard.")
         }
@@ -112,26 +153,39 @@ extension DashboardTicketBridge {
         }
         if (300...399).contains(http.statusCode) {
             // Same-origin redirects are followed, as the page's fetch does.
-            // One that comes back is to sign-in or another origin: a
-            // sign-in redirect means the session is gone, as the page
-            // landing on /login does.
-            let location = http.value(forHTTPHeaderField: "Location") ?? ""
-            if location.contains("/login") { throw DashboardTicketBridgeError.signInRequired }
+            // One that comes back is to sign-in or another origin. Either
+            // means the session is gone, as the page landing on sign-in
+            // does: an auth proxy sends a request without its session to
+            // its own sign-in host or the identity provider.
+            if let dashboardURL = URL(string: baseURL),
+               DashboardSignInRedirect.redirectIsSignIn(
+                location: http.value(forHTTPHeaderField: "Location"),
+                from: http.url ?? url,
+                forDashboard: dashboardURL
+               ) {
+                throw DashboardTicketBridgeError.signInRequired
+            }
             throw DashboardTicketBridgeError.http(
                 status: http.statusCode,
                 detail: AppLocalization.string("Dashboard request failed (\(String(http.statusCode))).")
             )
         }
         if http.statusCode == 401 || http.statusCode == 403 {
-            // Hermes' refusal of a session write is a verdict on the chat,
-            // not an expired sign-in (as in the page's response handler).
-            if http.statusCode == 403, data.count <= maxResponseBytes,
-               let detail = Self.errorDetail(data), SessionMutationIdentity.isRefusalDetail(detail) {
+            // Hermes' own 403 (a session write it refuses, a file it won't
+            // serve) is a verdict on the request, not an expired sign-in (as
+            // in the page's response handler).
+            if http.statusCode == 403, !oversized,
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let detail = Self.errorDetail(object),
+               !DashboardTicketBridgeError.meansSignIn(
+                   status: 403,
+                   hermesDetail: object["detail"] as? String ?? DashboardTicketBridgeError.structuredDetail(object["detail"]))
+                || SessionMutationIdentity.isRefusalDetail(detail) {
                 throw DashboardTicketBridgeError.http(status: 403, detail: detail)
             }
             throw DashboardTicketBridgeError.signInRequired
         }
-        guard data.count <= maxResponseBytes else {
+        guard !oversized else {
             throw DashboardTicketBridgeError.oversizedResponse(limit: maxResponseBytes)
         }
         let value = data.isEmpty ? nil : try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
@@ -153,19 +207,41 @@ extension DashboardTicketBridge {
 
     /// The error text a failed response carries, as the page reads it.
     private static func errorDetail(_ object: [String: Any]?) -> String? {
-        (object?["error"] ?? object?["message"] ?? object?["detail"]) as? String
-    }
-
-    private static func errorDetail(_ data: Data) -> String? {
-        errorDetail(try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let raw = object?["error"] ?? object?["message"] ?? object?["detail"]
+        return raw as? String ?? DashboardTicketBridgeError.structuredDetail(raw)
     }
 
     /// The response, or `URLError(.timedOut)` once `deadline` passes in
     /// total, as the page's AbortController does. A request's own timeout
-    /// only limits the wait between bytes.
-    private static func load(_ request: URLRequest, deadline: Duration) async throws -> (Data, URLResponse) {
-        try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
-            group.addTask { try await DashboardBackgroundSession.shared.data(for: request) }
+    /// only limits the wait between bytes. The body is read as it arrives
+    /// and no further than `maxResponseBytes` (`oversized` past it), so an
+    /// oversized one is never held whole: this runs in the background and
+    /// from CarPlay, where the memory limit is tightest.
+    static func load(
+        _ request: URLRequest,
+        deadline: Duration,
+        maxResponseBytes: Int,
+        session: URLSession = DashboardBackgroundSession.shared
+    ) async throws -> (data: Data, response: URLResponse, oversized: Bool) {
+        try await withThrowingTaskGroup(of: (data: Data, response: URLResponse, oversized: Bool).self) { group in
+            group.addTask {
+                let (bytes, response) = try await session.bytes(for: request)
+                if let length = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Length").flatMap(Int.init),
+                   length > maxResponseBytes {
+                    bytes.task.cancel()
+                    return (Data(), response, true)
+                }
+                var data = Data()
+                for try await byte in bytes {
+                    guard data.count < maxResponseBytes else {
+                        // The rest isn't wanted: stop the download.
+                        bytes.task.cancel()
+                        return (data, response, true)
+                    }
+                    data.append(byte)
+                }
+                return (data, response, false)
+            }
             group.addTask {
                 try await Task.sleep(for: deadline)
                 throw URLError(.timedOut)
@@ -192,7 +268,13 @@ extension DashboardTicketBridge {
     /// issued to requests sent without the page.
     func cookiesForRequestsWithoutPage() async -> [HTTPCookie] {
         var cookies = DashboardCookiePersistence.mirroredCookies(dashboardID: dashboardID)
-        if let webKit = await webKitCookies(timeout: .seconds(2)) {
+        // WebKit's store may hold a newer cookie than the mirror, but on
+        // screen, when the mirror already holds one, a slow store mustn't hold
+        // the request up long: it answers in milliseconds there, and a 401 goes
+        // on to the page. Off screen nothing can retry through the page, so it
+        // gets the full wait.
+        let webKitWait: Duration = cookies.isEmpty || !webViewCanRun() ? .seconds(2) : .milliseconds(500)
+        if let webKit = await webKitCookies(timeout: webKitWait) {
             cookies += webKit
         }
         cookies += DashboardCookiePersistence.nativeCookieStorage(for: dashboardID).cookies ?? []
@@ -297,7 +379,7 @@ enum DashboardBackgroundSession {
         guard let original, let source = original.url, let destination = proposed.url,
               ConnectionURLPolicy.isAllowedTransport(destination),
               ConnectionURLPolicy.originMatches(destination, expected: source),
-              !destination.path.contains("/login") else { return nil }
+              !DashboardSignInRedirect.isSignInPath(destination.path) else { return nil }
         var followed = proposed
         for (name, value) in original.allHTTPHeaderFields ?? [:]
             where followed.value(forHTTPHeaderField: name) == nil {

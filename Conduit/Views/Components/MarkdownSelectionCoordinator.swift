@@ -76,7 +76,7 @@ enum MarkdownSelectionSegmentPlan {
                     }
                 }
 
-            case .unorderedList(let items), .orderedList(let items):
+            case .unorderedList(let items), .orderedList(let items, _):
                 for (itemIndex, item) in items.enumerated() {
                     let id = items.count == 1
                         ? "block-\(blockIndex)"
@@ -122,7 +122,7 @@ enum MarkdownSelectionSegmentPlan {
                 }
                 _ = source
 
-            case .image, .math, .divider, .htmlPreview:
+            case .image, .math, .divider, .htmlPreview, .desktopCard:
                 order += 1
             }
         }
@@ -142,7 +142,7 @@ enum MarkdownSelectionSegmentPlan {
         case .quote(let lines):
             if let first = lines.first, MarkdownParser.calloutMarker(first.text) != nil { return 1 }
             return lines.count
-        case .unorderedList(let items), .orderedList(let items):
+        case .unorderedList(let items), .orderedList(let items, _):
             return items.count
         case .table(let headers, _, let rows):
             return ([headers] + rows).reduce(0) { $0 + $1.count }
@@ -150,7 +150,7 @@ enum MarkdownSelectionSegmentPlan {
             return columns.count
         case .code(let language, _):
             return MarkdownLanguage.normalized(language) == "mermaid" ? 0 : 1
-        case .image, .math, .divider, .htmlPreview:
+        case .image, .math, .divider, .htmlPreview, .desktopCard:
             return 0
         }
     }
@@ -252,7 +252,7 @@ final class MarkdownSelectionCoordinator: ObservableObject {
         orderedSegmentIDs = ordered.map(\.id)
         let currentIDs = Set(orderedSegmentIDs)
         recordsByID = recordsByID.filter { currentIDs.contains($0.key) }
-        deferredMounts = deferredMounts.filter { currentIDs.contains($0.key) }
+        deferredMounts = deferredMounts.filter { currentIDs.contains(Self.segmentID(ofDeferredKey: $0.key)) }
 
         for descriptor in ordered {
             if let record = recordsByID[descriptor.id] {
@@ -298,6 +298,18 @@ final class MarkdownSelectionCoordinator: ObservableObject {
     /// A segment that will register its text view once it has one; until
     /// then a selection can't reach it, so a selection that becomes visible
     /// mounts every deferred segment first (`mountDeferredSegments`).
+    /// What a table's own deferred mount waits under: its first cell's
+    /// segment with this after it, so it never takes the place of that
+    /// cell's, which waits under the bare segment when the cell is drawn
+    /// text (a cell with a link, #1596). Kept while the segment is.
+    static func tableMountKey(forSegmentID segmentID: String) -> String {
+        segmentID + "#table"
+    }
+
+    private static func segmentID(ofDeferredKey key: String) -> String {
+        key.hasSuffix("#table") ? String(key.dropLast("#table".count)) : key
+    }
+
     func deferRegistration(segmentID: String, owner: AnyObject, mount: @escaping () -> Void) {
         deferredMounts[segmentID] = DeferredMount(owner: owner, mount: mount)
     }
@@ -895,6 +907,17 @@ final class MarkdownSelectionCoordinator: ObservableObject {
         resetSelectionState()
         clearSelectionRanges()
         publishIfVisibleSelectionChanged(from: before)
+    }
+
+    /// The reply's pin action, from any of its mounted blocks: a selection
+    /// across blocks pins its passage from the pill (#1147).
+    var pinReplyAction: ChatPinReplyAction? {
+        for id in orderedSegmentIDs {
+            if let action = (recordsByID[id]?.textView?.delegate as? SelectableTextView.Coordinator)?.pinReplyAction {
+                return action
+            }
+        }
+        return nil
     }
 
     func copiedAttributedTextForActiveSelection() -> NSAttributedString {

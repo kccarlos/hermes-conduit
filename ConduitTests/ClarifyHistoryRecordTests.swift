@@ -88,7 +88,7 @@ extension ClarifyBatchStateTests {
 
         XCTAssertEqual(record.questions.map(\.status), [.answered, .answered, .expired])
         XCTAssertEqual(record.questions[0].resolvedAnswer, "staging")
-        XCTAssertEqual(record.questions[1].resolvedAnswer, AppLocalization.string("Skipped"))
+        XCTAssertTrue(record.questions[1].isSkipped, "shown as Skipped, as a form's field left blank")
         XCTAssertEqual(record.status, .expired)
         XCTAssertEqual(record.error, AppLocalization.string("These questions are no longer active."))
     }
@@ -156,5 +156,13 @@ extension ClarifyBatchStateTests {
             for: ToolActivity(id: "call_2", name: "terminal", input: nil,
                               output: #"{"question": "Ship it?", "user_response": "Yes"}"#, status: .complete),
             rowID: "row-2"))
+    }
+
+    func testAClarifyResultWithANullErrorReadsBack() throws {
+        let tool = clarifyHistoryRow(
+            input: #"{"question": "Ship it?", "choices": ["Yes", "No"]}"#,
+            output: #"{"question": "Ship it?", "choices_offered": ["Yes", "No"], "user_response": "Yes", "error": null}"#
+        )
+        XCTAssertEqual(try XCTUnwrap(ClarifyActivity.historyRecord(for: tool, rowID: "row-1")).questions.first?.resolvedAnswer, "Yes")
     }
 }

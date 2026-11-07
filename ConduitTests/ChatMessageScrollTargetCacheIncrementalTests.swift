@@ -82,6 +82,28 @@ final class ChatMessageScrollTargetCacheIncrementalTests: XCTestCase {
         )
     }
 
+    /// Load earlier messages: only the page put in above is hashed, and the
+    /// result is the full rebuild's, duplicates across the page included
+    /// (issue 1726).
+    func testPrependHashesOnlyThePrependedPage() {
+        let loaded = (120..<240).map { message("m\($0)", "settled content \($0)") }
+            + [message("dup-late", "ok", role: .user)]
+        var cache = prime(loaded)
+        let page = (0..<120).map { message("m\($0)", "settled content \($0)") }
+            + [message("dup-early", "ok", role: .user)]
+
+        TranscriptPerf.reset()
+        let result = cache.update(for: page + loaded)
+
+        XCTAssertEqual(result, .semanticsChanged)
+        XCTAssertEqual(
+            TranscriptPerf.lastFingerprintedMessageCount, page.count,
+            "a prepend must fingerprint only the prepended page"
+        )
+        XCTAssertEqual(cache.targets, referenceTargets(for: page + loaded))
+        XCTAssertEqual(cache.targets.map(\.order), Array(0..<(page.count + loaded.count)))
+    }
+
     func testUnchangedTranscriptHashesNothing() {
         let base = (0..<50).map { message("m\($0)", "content \($0)") }
         var cache = prime(base)
@@ -129,6 +151,32 @@ final class ChatMessageScrollTargetCacheIncrementalTests: XCTestCase {
         // differs from the first element, so the whole array is the suffix
         // here — but the reference comparison above proves correctness).
         XCTAssertGreaterThan(TranscriptPerf.lastFingerprintedMessageCount, 0)
+    }
+
+    func testRenderingOnlyUpdateReclassifiesAStepThatBecomesACard() throws {
+        // A conduit_show call is a step while it runs and part of the reply
+        // once its answer carries a card. The tool's status and output are
+        // not fingerprinted, so that change takes the rendering-only path,
+        // which must re-derive isStep rather than copy the cached value.
+        let user = message("u", "show me dinner", role: .user)
+        func show(_ status: ToolActivity.Status, output: String?) -> ChatMessage {
+            ChatMessage(
+                id: "t", role: .tool, content: "", timestamp: "2026-01-01T00:00:00Z",
+                tool: ToolActivity(id: "t1", name: "conduit_show", input: nil, output: output, status: status)
+            )
+        }
+        var cache = prime([user, show(.running, output: nil)])
+        let running = try XCTUnwrap(cache.targets.last)
+        XCTAssertTrue(running.isStep)
+        XCTAssertNotNil(running.step, "a running step is placed in its run")
+
+        let answer = #"{"ok": true, "cards": [{"type": "place", "places": [{"name": "Tartine"}]}]}"#
+        let result = cache.update(for: [user, show(.complete, output: answer)])
+
+        XCTAssertEqual(result, .renderingChanged)
+        let card = try XCTUnwrap(cache.targets.last)
+        XCTAssertFalse(card.isStep, "a shown card reads as part of the reply")
+        XCTAssertNil(card.step)
     }
 
     func testDuplicateContentsFallBackToFullRebuildAndMatchReference() {

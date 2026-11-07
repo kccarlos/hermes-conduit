@@ -37,8 +37,9 @@ final class SpeechServerTranscription: VoiceLiveTranscription {
     private let socket: any HermesSpeechSocket
     private let captureSampleRate: Double
     private let finishTimeout: Duration
-    /// How long to wait for a segment to start after the end of speech when
-    /// none has: a server that heard nothing never sends one.
+    /// How long to allow more segments to start after the last audio is
+    /// sent: earlier completed segments do not prove the final audio was
+    /// processed.
     private let quietGrace: Duration
     private let onPartial: @MainActor (String) -> Void
     private let onFailure: @MainActor (String) -> Void
@@ -276,18 +277,20 @@ final class SpeechServerTranscription: VoiceLiveTranscription {
         onPartial(text)
     }
 
-    /// After the end of speech: every started segment has finished, and
-    /// either some speech was heard or the quiet grace ran out.
+    /// After the final audio and the quiet grace: every started segment
+    /// has finished.
     private func resolveIfSettled() {
-        guard ended, outcome == nil, finishedSegments >= startedSegments else { return }
-        if startedSegments > 0 || quietGraceElapsed {
-            resolve(.finished(joinedTranscript))
-        }
+        guard ended, quietGraceElapsed, outcome == nil,
+              finishedSegments >= startedSegments else { return }
+        resolve(.finished(joinedTranscript))
     }
 
     private func handleClose() {
         guard outcome == nil else { return }
-        if ended, finishedSegments >= startedSegments, !segments.isEmpty {
+        // Every segment the server started has finished: what it heard is
+        // complete, even if that was nothing, so a close during the quiet
+        // grace is no failure.
+        if ended, startedSegments > 0, finishedSegments >= startedSegments {
             resolve(.finished(joinedTranscript))
         } else {
             resolve(.failed(lastError ?? AppLocalization.string("Lost the connection to your speech server.")))
@@ -373,13 +376,17 @@ extension HermesVoiceGateway: SpeechServerTranscriptionGateway {
         onFailure: @escaping @MainActor (String) -> Void
     ) async -> VoiceLiveTranscription? {
         guard let ticket = try? await bridge.mintTicket(),
-              let request = try? Self.speechServerRequest(
+              let unauthorized = try? Self.speechServerRequest(
                 baseURL: baseURL,
                 ticket: ticket,
                 profile: profile,
+                profileParameter: profileParameter,
                 cloudflareAccess: bridge.cloudflareAccess
-              ) else { return nil }
-        let task = URLSession.shared.webSocketTask(with: request)
+              ),
+              // The dashboard's own session cookies (cookie mode), on the
+              // cookie-less, redirect-refusing dashboard socket session.
+              let request = try? await bridge.requestAuthorizer.authorizeUpgrade(unauthorized) else { return nil }
+        let task = bridge.requestAuthorizer.webSocketTask(with: request)
         task.resume()
         return SpeechServerTranscription(
             socket: task,
@@ -394,12 +401,14 @@ extension HermesVoiceGateway: SpeechServerTranscriptionGateway {
         baseURL: String,
         ticket: String,
         profile: String,
+        profileParameter: String = "profile",
         cloudflareAccess: CloudflareAccessCredentials?
     ) throws -> URLRequest {
         let url = try ConnectionURLPolicy.webSocketURL(
             baseURL: baseURL,
             path: SpeechServerTranscription.socketPath,
-            queryItems: [URLQueryItem(name: "ticket", value: ticket), URLQueryItem(name: "profile", value: profile)]
+            queryItems: [URLQueryItem(name: "ticket", value: ticket)]
+                + DashboardPath.socketProfileItems(profile, parameter: profileParameter)
         )
         return URLRequest(url: url).applyingProxyHeaders(cloudflare: cloudflareAccess)
     }
@@ -414,6 +423,9 @@ struct SpeechServerStatus: Equatable {
     var hasKey: Bool
     var reason: String?
     var pluginMissing: Bool
+    /// Hermes didn't answer; `reason` says why. Not what's set: what was
+    /// shown stays (#1533).
+    var readFailed = false
 
     static var pluginMissingReason: String {
         AppLocalization.string("Update the Conduit plugin on your Hermes host to use your own speech server.")
@@ -422,6 +434,20 @@ struct SpeechServerStatus: Equatable {
     static var pluginMissing: SpeechServerStatus {
         SpeechServerStatus(configured: false, available: false, url: nil, hasKey: false,
                            reason: pluginMissingReason, pluginMissing: true)
+    }
+
+    /// The profile turned the plugin off: as `pluginMissing`, with `remedy`
+    /// (DashboardTicketBridgeError.pluginOffDetail) as the reason (issue 1671).
+    static func pluginOff(_ remedy: String) -> SpeechServerStatus {
+        SpeechServerStatus(configured: false, available: false, url: nil, hasKey: false,
+                           reason: remedy, pluginMissing: true)
+    }
+
+    static func failed(_ reason: String) -> SpeechServerStatus {
+        var status = SpeechServerStatus(configured: false, available: false, url: nil, hasKey: false,
+                                        reason: reason, pluginMissing: false)
+        status.readFailed = true
+        return status
     }
 
     init(configured: Bool, available: Bool, url: String?, hasKey: Bool, reason: String?, pluginMissing: Bool) {

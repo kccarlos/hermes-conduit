@@ -6,7 +6,7 @@
 import Foundation
 import os
 
-private let speechServerSpeechLog = Logger(subsystem: "com.milim.conduit", category: "SpeechServerSpeech")
+private let speechServerSpeechLog = Logger(subsystem: "com.milim.relay", category: "SpeechServerSpeech")
 
 /// Classic voice's replies spoken by the user's own speech server (Hugging
 /// Face speech-to-speech, the one Hermes Live Voice runs), so one server
@@ -207,7 +207,8 @@ final class SpeechServerSpeechStream: VoiceSpeechStream {
     // MARK: Responses
 
     private func enqueue(_ text: String) {
-        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Markdown marks are written, not said, as for on-device speech.
+        let words = PreviewText.plain(text).trimmingCharacters(in: .whitespacesAndNewlines)
         // Punctuation or emoji alone has nothing to read back or check.
         guard !Self.comparable(words).isEmpty else { return }
         queued.append(words)
@@ -377,19 +378,25 @@ extension HermesVoiceGateway {
         onPCM16: @escaping @MainActor (Data, Double) throws -> Void
     ) async throws -> VoiceSpeechStream {
         let ticket = try await bridge.mintTicket()
-        let request: URLRequest
+        let unauthorized: URLRequest
         do {
-            request = try Self.speechServerSpeechRequest(
+            unauthorized = try Self.speechServerSpeechRequest(
                 baseURL: baseURL,
                 ticket: ticket,
                 profile: profile,
+                profileParameter: profileParameter,
                 cloudflareAccess: bridge.cloudflareAccess
             )
         } catch {
             speechServerSpeechLog.notice("Speech server speak request failed: \(String(describing: error), privacy: .private)")
             throw VoiceAudioError.unavailable(AppLocalization.string("Could not open the speech stream."))
         }
-        let task = URLSession.shared.webSocketTask(with: request)
+        // The dashboard's own session cookies (cookie mode), on the
+        // cookie-less, redirect-refusing dashboard socket session, like the
+        // speech stream: a redirect never carries the ticket or the
+        // Cloudflare token anywhere.
+        let request = try await bridge.requestAuthorizer.authorizeUpgrade(unauthorized)
+        let task = bridge.requestAuthorizer.webSocketTask(with: request)
         task.resume()
         return SpeechServerSpeechStream(socket: task, onStart: onStart, onPCM16: onPCM16)
     }
@@ -400,13 +407,14 @@ extension HermesVoiceGateway {
         baseURL: String,
         ticket: String,
         profile: String,
+        profileParameter: String = "profile",
         cloudflareAccess: CloudflareAccessCredentials?
     ) throws -> URLRequest {
         let url = try ConnectionURLPolicy.webSocketURL(
             baseURL: baseURL,
             path: SpeechServerSpeechStream.socketPath,
             queryItems: [URLQueryItem(name: "ticket", value: ticket)]
-                + LocalLiveProtocol.profileQueryItems(profile)
+                + LocalLiveProtocol.profileQueryItems(profile, parameter: profileParameter)
                 + [URLQueryItem(name: "mode", value: "speak")]
         )
         return URLRequest(url: url).applyingProxyHeaders(cloudflare: cloudflareAccess)
@@ -415,6 +423,25 @@ extension HermesVoiceGateway {
 
 /// What the notifier says about speaking through the speech server
 /// (`/local-live/status`): whether it can, and what to set on the server.
+/// The host's fast model for Local (agent mode), from Local Live's status.
+struct LocalLiveFrontModelStatus: Equatable {
+    var configured: Bool
+    var available: Bool
+    var baseURL: String?
+    var model: String?
+    var hasKey: Bool
+    var reason: String?
+
+    init(response: [String: Any]) {
+        configured = response["configured"] as? Bool ?? false
+        available = response["available"] as? Bool ?? false
+        baseURL = (response["base_url"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        model = (response["model"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        hasKey = response["has_key"] as? Bool ?? false
+        reason = (response["reason"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+}
+
 struct SpeechServerVoiceStatus: Equatable {
     var available: Bool
     var reason: String?
@@ -428,6 +455,14 @@ struct SpeechServerVoiceStatus: Equatable {
     /// The speech server's address the Hermes host dials (Speech to text's).
     var speechServerURL: String?
     var pluginMissing: Bool
+    /// `pluginMissing` because the profile turned the plugin off: `reason`
+    /// says how to turn it on (issue 1671).
+    var pluginOff = false
+    /// Local's fast model (agent mode); nil from a plugin before it.
+    var frontModel: LocalLiveFrontModelStatus?
+    /// Hermes didn't answer; `reason` says why. The fast model shown stays
+    /// (#1533).
+    var readFailed = false
 
     static var pluginMissingReason: String {
         AppLocalization.string("Update the Conduit plugin on your Hermes host to have your speech server speak the replies.")
@@ -436,6 +471,14 @@ struct SpeechServerVoiceStatus: Equatable {
     static var pluginMissing: SpeechServerVoiceStatus {
         var status = SpeechServerVoiceStatus(unavailable: pluginMissingReason)
         status.pluginMissing = true
+        return status
+    }
+
+    /// The profile turned the plugin off: `remedy` (DashboardTicketBridgeError.pluginOffDetail).
+    static func pluginOff(_ remedy: String) -> SpeechServerVoiceStatus {
+        var status = SpeechServerVoiceStatus(unavailable: remedy)
+        status.pluginMissing = true
+        status.pluginOff = true
         return status
     }
 
@@ -448,6 +491,7 @@ struct SpeechServerVoiceStatus: Equatable {
         lastRequestAt = nil
         speechServerURL = nil
         pluginMissing = false
+        frontModel = nil
     }
 
     init(response: [String: Any], dashboardBaseURL: String?) {
@@ -460,6 +504,7 @@ struct SpeechServerVoiceStatus: Equatable {
         lastRequestAt = (response["last_request_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
         speechServerURL = ((response["speech_server"] as? [String: Any])?["url"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         pluginMissing = false
+        frontModel = (response["front_model"] as? [String: Any]).map(LocalLiveFrontModelStatus.init(response:))
     }
 
     /// `baseURL` (the dashboard, maybe with a path prefix) joined with the

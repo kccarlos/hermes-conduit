@@ -39,10 +39,34 @@ enum NotificationE2E {
         return Keys(push: derive(pushInfo), answer: derive(answerInfo))
     }
 
+    /// A key this old is rotated on the next dashboard connect, by hosts
+    /// whose plugin keeps the replaced key (notifier 0.71+); the host asks
+    /// with `rotate` and says the same age (plugin E2E_KEY_MAX_AGE_S).
+    static let keyMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    /// How long a replaced key is kept, here and on the host: pushes and
+    /// answers sealed with it before the rotation still open. Same as the
+    /// plugin's e2e.PREVIOUS_KEY_GRACE_S.
+    static let previousKeyGrace: TimeInterval = 7 * 24 * 60 * 60
+
+    /// The key this iPhone seals a pairing's answers with: the newest one
+    /// not replaced by a rotation.
+    static func currentRecord(gatewayID: String, installationID: String?, records: [E2EKeyRecord]) -> E2EKeyRecord? {
+        records
+            .filter { $0.gatewayID == gatewayID && $0.installationID == installationID && $0.retiredAt == nil }
+            .max { $0.createdAt < $1.createdAt }
+    }
+
+    /// Replaced keys past the grace period, which nothing opens with anymore.
+    static func expiredRecords(_ records: [E2EKeyRecord], now: Date = Date()) -> [E2EKeyRecord] {
+        records.filter { record in
+            record.retiredAt.map { now.timeIntervalSince($0) >= previousKeyGrace } ?? false
+        }
+    }
+
     /// A new pairing key: a random secret and an unrelated random key id.
     static func newRecord(installationID: String, gatewayID: String, dashboardID: String?, profile: String?, now: Date = Date()) -> E2EKeyRecord {
         E2EKeyRecord(
-            kid: randomBytes(16).map { String(format: "%02x", $0) }.joined(),
+            kid: newKid(),
             secret: randomBytes(32),
             installationID: installationID,
             gatewayID: gatewayID,
@@ -50,6 +74,11 @@ enum NotificationE2E {
             profile: profile,
             createdAt: now
         )
+    }
+
+    /// A random key id, unrelated to any secret: 32 lowercase hex digits.
+    static func newKid() -> String {
+        randomBytes(16).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func randomBytes(_ count: Int) -> Data {
@@ -137,8 +166,7 @@ enum NotificationE2E {
         /// provisioned for (never the relay's routing stub).
         var routingPayload: [String: Any] {
             var payload = content
-            payload.removeValue(forKey: "title")
-            payload.removeValue(forKey: "body")
+            for banner in ["title", "body", "title_label", "session_title", "headline"] { payload.removeValue(forKey: banner) }
             payload["type"] = type
             payload["gateway_id"] = record.gatewayID
             if let dashboardID = record.dashboardID { payload["dashboard_id"] = dashboardID }
@@ -246,23 +274,6 @@ enum NotificationE2E {
         return "\(answerPrefix)\(record.kid).\(base64URL(nonceData)).\(base64URL(box.ciphertext + box.tag))"
     }
 
-    // MARK: Generic copy
-
-    /// The private fallback for a notification Conduit can't verify. Kept
-    /// word for word with the relay's generic copy (English, like every
-    /// relay-written alert), so a push reads the same whether the relay or
-    /// the extension wrote it.
-    static func genericCopy(for type: String?) -> (title: String, body: String) {
-        switch type {
-        case "approval.needed": return ("Approval needed", "Hermes is waiting for your approval.")
-        case "input.needed": return ("Input needed", "Hermes needs your response before it can continue.")
-        case "turn.failed": return ("Turn failed", "A Hermes turn could not be completed.")
-        case "background_task.finished": return ("Background task finished", "A delegated task has finished.")
-        case "call.requested": return ("Hermes wants to talk", "Tap to talk to Hermes.")
-        default: return ("Response ready", "Hermes has finished responding.")
-        }
-    }
-
     // MARK: Base64url
 
     static func base64URL(_ data: Data) -> String {
@@ -291,6 +302,18 @@ struct E2EKeyRecord: Codable, Equatable {
     let dashboardID: String?
     let profile: String?
     let createdAt: Date
+    /// When a rotation replaced this key. It still opens pushes and seals
+    /// nothing; it is deleted after `NotificationE2E.previousKeyGrace`.
+    var retiredAt: Date? = nil
+    /// How the key was made: nil for one handed over through the dashboard,
+    /// else the inline rotation suite (`NotificationKeyRotation`).
+    var suite: String? = nil
+
+    func retired(at date: Date?) -> E2EKeyRecord {
+        var copy = self
+        copy.retiredAt = date
+        return copy
+    }
 }
 
 protocol E2EKeyStoring {
@@ -525,6 +548,39 @@ enum NotificationSharedSettings {
         set { defaults?.set(newValue, forKey: showPreviewsKey) }
     }
 
+    private static let showChatNamesKey = "conduit.notifications.showChatNames"
+
+    /// Show previews off but the chat's title and the profile shown (#1415).
+    static var showChatNames: Bool {
+        get { defaults?.bool(forKey: showChatNamesKey) ?? false }
+        set { defaults?.set(newValue, forKey: showChatNamesKey) }
+    }
+
+    private static let appLanguageKey = "conduit.notifications.appLanguage"
+
+    /// The App Language ("system" or a localization identifier), so the
+    /// extension writes a notification's words in it (#1144).
+    static var appLanguage: String? {
+        get { defaults?.string(forKey: appLanguageKey) }
+        set { defaults?.set(newValue, forKey: appLanguageKey) }
+    }
+
+    private static let mainProfileNamesKey = "conduit.notifications.mainProfileNames"
+    private static let activeDashboardIDKey = "conduit.notifications.activeDashboardID"
+
+    /// The main profile's Conduit name per dashboard (UUID string), so a
+    /// push from it names it as the app does (NotificationCopy.named).
+    static var mainProfileNames: [String: String] {
+        get { defaults?.dictionary(forKey: mainProfileNamesKey) as? [String: String] ?? [:] }
+        set { defaults?.set(newValue, forKey: mainProfileNamesKey) }
+    }
+
+    /// The dashboard open in the app, standing in for a push that names none.
+    static var activeDashboardID: String? {
+        get { defaults?.string(forKey: activeDashboardIDKey) }
+        set { defaults?.set(newValue, forKey: activeDashboardIDKey) }
+    }
+
     private static let knownGatewayIDsKey = "conduit.notifications.knownGatewayIDs"
     private static let keysProvisionedMarker = "e2e-keys-provisioned"
 
@@ -566,5 +622,41 @@ enum NotificationSharedSettings {
     static var knownGatewayIDs: Set<String> {
         get { Set(defaults?.stringArray(forKey: knownGatewayIDsKey) ?? []) }
         set { defaults?.set(newValue.sorted(), forKey: knownGatewayIDsKey) }
+    }
+
+    private static let pulseQuietGatewaysKey = "conduit.notifications.pulseQuietGateways"
+
+    /// The relay gateways whose host's plugin takes Quiet for today, so the
+    /// extension offers it on their Pulse pushes (PulseNotifications).
+    static var pulseQuietGateways: Set<String> {
+        get { Set(defaults?.stringArray(forKey: pulseQuietGatewaysKey) ?? []) }
+        set { defaults?.set(newValue.sorted(), forKey: pulseQuietGatewaysKey) }
+    }
+}
+
+/// The chat a delivered push belongs to, noted on it by the extension once
+/// the push verified (#1579). A sealed push stops verifying a day after it
+/// was sent, so Conduit finds an older notification's chat by this note to
+/// clear it once that chat is read. It routes nothing: a tap still opens
+/// only what verifies.
+enum ReadChatHint {
+    static let userInfoKey = "conduit_chat"
+
+    /// The routing fields that name the chat, its dashboard and the kind
+    /// of push (one that waits on the user isn't cleared).
+    static func note(_ routing: [String: Any]) -> [String: String] {
+        var note: [String: String] = [:]
+        for field in ["session_id", "stored_session_id", "session_key", "dashboard_id", "gateway_id", "type"] {
+            if let value = routing[field] as? String, !value.isEmpty { note[field] = value }
+        }
+        return note
+    }
+
+    /// Trusted as the extension's own: it drops any note a push arrives
+    /// with and writes one only on a push it verified. A push that skipped
+    /// the extension could carry one, which only clears; taps verify.
+    static func read(_ userInfo: [AnyHashable: Any]) -> [String: Any]? {
+        guard let note = userInfo[userInfoKey] as? [String: Any], note["session_id"] is String else { return nil }
+        return note
     }
 }

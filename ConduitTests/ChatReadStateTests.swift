@@ -112,6 +112,56 @@ final class ChatReadStateTests: XCTestCase {
         XCTAssertTrue(state.isUnread(laterReply, profile: profile, now: t0.addingTimeInterval(70)))
     }
 
+    /// Leaving a chat moments after opening it still counts the turn that
+    /// ran in between: the leave restamps the seen moment.
+    func testLeavingRightAfterOpeningCountsTheTurnInBetween() {
+        let opened = row("a", count: 4)
+        let turn = row("a", count: 6, lastActivityAt: t0.timeIntervalSince1970 + 40)
+        let leftAt = t0.addingTimeInterval(50)
+
+        var restamped = ChatReadState()
+        restamped.observe([opened], profile: profile, now: t0)
+        restamped.markSeen(opened, profile: profile, at: t0)
+        restamped.markSeen(opened, profile: profile, at: leftAt, restamp: true)
+        restamped.observe([turn], profile: profile, now: leftAt.addingTimeInterval(1))
+        XCTAssertFalse(restamped.isUnread(turn, profile: profile, now: leftAt.addingTimeInterval(1)))
+
+        // An ordinary re-look inside a minute keeps the first moment.
+        var kept = ChatReadState()
+        kept.observe([opened], profile: profile, now: t0)
+        kept.markSeen(opened, profile: profile, at: t0)
+        kept.markSeen(opened, profile: profile, at: leftAt)
+        kept.observe([turn], profile: profile, now: leftAt.addingTimeInterval(1))
+        XCTAssertTrue(kept.isUnread(turn, profile: profile, now: leftAt.addingTimeInterval(1)))
+    }
+
+    /// A listing that predates the turn (or a local edit of the catalog)
+    /// doesn't use up the seen moment before the real count arrives.
+    func testAStaleListingDoesNotSpendTheSeenMoment() {
+        var state = ChatReadState()
+        state.observe([row("a", count: 4)], profile: profile, now: t0)
+        state.markSeen(row("a", count: 4), profile: profile, at: t0)
+        state.observe([row("a", count: 4, lastActivityAt: t0.timeIntervalSince1970 - 30)], profile: profile, now: t0.addingTimeInterval(1))
+        let current = row("a", count: 6, lastActivityAt: t0.timeIntervalSince1970 - 1)
+        state.observe([current], profile: profile, now: t0.addingTimeInterval(2))
+        XCTAssertFalse(state.isUnread(current, profile: profile, now: t0.addingTimeInterval(2)))
+    }
+
+    func testObserveReportsRowsSeenThroughTheirLatestActivity() {
+        var state = ChatReadState()
+        state.observe([row("seen", count: 2), row("later", count: 2), row("other", count: 2)], profile: profile, now: t0)
+        state.markSeen(row("seen", count: 2), profile: profile, at: t0)
+        state.markSeen(row("later", count: 2), profile: profile, at: t0)
+
+        let reported = state.observe([
+            row("seen", count: 4, unread: true, lastActivityAt: t0.timeIntervalSince1970 - 1, watermark: 1_799_999_000),
+            row("later", count: 4, unread: true, lastActivityAt: t0.timeIntervalSince1970 + 60, watermark: 1_799_999_000),
+            row("other", count: 4, unread: true, lastActivityAt: t0.timeIntervalSince1970 - 1, watermark: 1_799_999_000),
+        ], profile: profile, now: t0.addingTimeInterval(70))
+
+        XCTAssertEqual(reported, ["seen"])
+    }
+
     func testOnlyAZeroWatermarkIsAnExplicitHermesMark() {
         let state = ChatReadState()
         let marked = row("a", count: 3, unread: true, watermark: 0)
@@ -340,9 +390,7 @@ final class ChatReadStateTests: XCTestCase {
 
     @MainActor
     func testProfileStripDotsMarkEachProfileWithAnUnreadChat() {
-        let suite = "ChatReadStateTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let defaults = makeScratchDefaults("ChatReadStateTests")
         let appState = AppState(
             defaults: defaults,
             loadSavedConnection: false,
@@ -376,5 +424,67 @@ final class ChatReadStateTests: XCTestCase {
         XCTAssertEqual(appState.profilesWithUnread(among: ["default", "work", "home"]), ["default", "work"])
         XCTAssertEqual(appState.profilesWithUnread(among: ["home"]), [])
         XCTAssertEqual(appState.profilesWithUnread(among: []), [])
+    }
+
+    @MainActor
+    func testProjectDotsMarkEachProjectWithAnUnreadChat() {
+        let defaults = makeScratchDefaults("ChatReadStateTests")
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {},
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults)
+        )
+        func chat(_ id: String, unread: Bool? = nil) -> SessionSummary {
+            var session = SessionSummary(
+                id: id,
+                alternateIds: [],
+                title: id,
+                model: "Hermes",
+                updatedLabel: "",
+                profile: "default",
+                source: .chat,
+                isActive: false,
+                isArchived: false
+            )
+            session.isUnread = unread
+            return session
+        }
+        func project(_ id: String, _ previews: [SessionSummary], isHome: Bool = false) -> ProjectSummary {
+            ProjectSummary(id: id, title: id, isHome: isHome, sessionCount: previews.count, previewSessions: previews)
+        }
+        appState.setActiveProfileForTesting("default")
+        let first = chat("first")
+        let second = chat("second")
+        // The tree's copy says unread; the catalog's, newer, says read.
+        let readSince = chat("read-since", unread: true)
+        // Compressed since the tree loaded: the catalog lists it under a new id.
+        var compressed = chat("compressed-new", unread: false)
+        compressed.alternateIds = ["compressed-old"]
+        // A newer branch answers to its parent's id as its lineage root, but
+        // the parent reads its own row.
+        var branch = chat("branch", unread: true)
+        branch.lineageRootId = "parent"
+        appState.sessions = [branch, first, second, chat("read-since", unread: false), compressed, chat("parent", unread: false)]
+        appState.setProjectsForTesting([
+            project("two-unread", [first, second]),
+            project("read", [readSince]),
+            project("compressed", [chat("compressed-old", unread: true)]),
+            project("parent", [chat("parent", unread: true)]),
+            project("tree-only", [chat("not-listed", unread: true)]),
+            // Home's chats are in no project, and Home gets the dot for them.
+            project("home", [chat("home-unread", unread: true)], isHome: true),
+            project("empty", []),
+        ])
+        appState.markSessionUnread(first)
+        appState.markSessionUnread(second)
+
+        XCTAssertEqual(appState.projectsWithUnread(), ["two-unread", "tree-only", "home"])
+
+        // Reading one chat leaves the dot while another is still unread.
+        appState.markSessionRead(first)
+        XCTAssertEqual(appState.projectsWithUnread(), ["two-unread", "tree-only", "home"])
+        appState.markSessionRead(second)
+        XCTAssertEqual(appState.projectsWithUnread(), ["tree-only", "home"])
     }
 }

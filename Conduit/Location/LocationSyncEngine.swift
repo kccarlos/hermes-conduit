@@ -32,6 +32,8 @@ struct LocationSyncState: Codable, Equatable {
 enum LocationSyncPause: Codable, Equatable {
     case signInRequired
     case pluginMissing
+    /// The profile turned the plugin off: how to turn it on (issue 1671).
+    case pluginOff(String)
     case refused(String)
 
     var message: String {
@@ -40,6 +42,8 @@ enum LocationSyncPause: Codable, Equatable {
             return AppLocalization.string("Paused: sign in to this dashboard again. Location is sent again once you open Conduit.")
         case .pluginMissing:
             return AppLocalization.string("Paused: update the Conduit plugin on this host to share your location.")
+        case .pluginOff(let remedy):
+            return AppLocalization.string("Paused: \(remedy)")
         case .refused(let detail):
             return AppLocalization.string("Paused: the host refused location data (\(detail)).")
         }
@@ -176,7 +180,7 @@ struct LocationSyncStateStore {
                 try (folder as NSURL).setResourceValue(true, forKey: .isExcludedFromBackupKey)
             } catch {
                 Logger(subsystem: "com.milim.relay", category: "location")
-                    .error("Location state folder backup exclusion failed: \(error.localizedDescription, privacy: .public)")
+                    .error("Location state folder backup exclusion failed: \(LogRedaction.message(error), privacy: .public)")
             }
             try JSONEncoder().encode(state).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         } catch {
@@ -226,6 +230,13 @@ final class LocationSyncEngine: ObservableObject {
     /// Conduit quits, so a failing Keychain doesn't make every send agree a
     /// new key with the host. (The extension can't answer a locate then.)
     private var unsavedKey: LocationCrypto.SessionKey?
+    /// Bumped by each new or forgotten key: the host drops the latest fix
+    /// it had from this phone then, so a message's fix can't count on it.
+    private(set) var keyAgreements = 0
+    /// The shops Pulse wants watched (LocationSpots), from the sealed reply
+    /// to a batch that carried `spot_entries`. Not called when the host
+    /// sent none (an older plugin) or it didn't open.
+    var spotsReplied: (([LocationSpotWatch]) -> Void)?
     private let now: () -> Date
     private let deviceName: () -> String
 
@@ -251,7 +262,8 @@ final class LocationSyncEngine: ObservableObject {
         case sent
         /// The host won't take this batch as it is: sending it again won't help.
         case refused
-        /// Not sent now (no connection, signed out, a timeout): try later.
+        /// Not sent now (no connection, signed out, a timeout, or a host
+        /// whose plugin needs an update): the batch is kept to try later.
         case failed
     }
 
@@ -272,19 +284,36 @@ final class LocationSyncEngine: ObservableObject {
             } catch DashboardTicketBridgeError.http(let status, let detail) where status == 409 && Self.needsNewKey(detail) {
                 // unknown_key or bad_seal: the host forgot or replaced this
                 // phone's key (a wipe, a new store). Agree a new one, once.
-                Self.log.info("Location ingest answered 409 \(detail, privacy: .public); agreeing the key again")
+                Self.log.info("Location ingest answered 409 \(detail, privacy: .private); agreeing the key again")
                 clearKey()
                 key = try await ensureKey(deviceID: config.deviceID, voice: voice, maps: maps, request: request)
                 batch.places = config.places
                 answer = try await post(batch, key: key, request: request)
             }
             acknowledge(batch, answer: answer)
+            if batch.spotEntries != nil,
+               let opened = LocationCrypto.openSpotsPlaintext(answer["reply"], key: key, batchID: batch.batchID) {
+                guard let reply = (try? JSONSerialization.jsonObject(with: opened)) as? [String: Any] else {
+                    Self.log.info("Pulse spots reply opened but wasn't a JSON object")
+                    return .sent
+                }
+                let watches = LocationSpotWatch.parse(reply, date: LocationHostDates.parse)
+                if watches.isEmpty, let listed = reply["spots"] as? [Any], !listed.isEmpty {
+                    Self.log.info("Pulse spots reply listed \(listed.count, privacy: .public) watches and none parsed")
+                }
+                spotsReplied?(watches)
+            } else if batch.spotEntries != nil, answer["reply"] != nil {
+                Self.log.info("Pulse spots reply didn't open")
+            }
             return .sent
         } catch let error as DashboardTicketBridgeError {
-            Self.log.info("Location send failed: \(Self.describe(error), privacy: .public)")
+            Self.log.info("Location send failed: \(LogRedaction.redactingURLs(Self.describe(error)), privacy: .public)")
             switch error {
             case .signInRequired:
                 state.pause = .signInRequired
+            case .http(let status, _) where status == 404 && DashboardTicketBridgeError.pluginOffDetail(of: error) != nil:
+                // The profile turned the plugin off: say how to turn it on.
+                state.pause = DashboardTicketBridgeError.pluginOffDetail(of: error).map(LocationSyncPause.pluginOff)
             case .http(let status, let detail) where status == 404:
                 // A bare 404 could be a proxy or a restarting host. The key
                 // is kept; the status route tells whether the plugin is gone.
@@ -292,18 +321,30 @@ final class LocationSyncEngine: ObservableObject {
                     Self.log.info("Location status answered 404 too: plugin missing")
                     state.pause = .pluginMissing
                 } else {
+                    // A fresher failure replaces an earlier pause, so its
+                    // error shows (as in the phone and health passes).
+                    state.pause = nil
                     lastError = detail
                 }
+            case .http(let status, let detail) where status == 409 && HostKeyConflict.isNewerPluginStore(detail):
+                // A store written by a newer plugin: updating the plugin
+                // fixes it. The batch stays to send after the update.
+                Self.log.info("Location host answered 409 schema: pausing for a plugin update, batch kept")
+                state.pause = .pluginMissing
             case .http(let status, let detail) where status == 400 || status == 413:
                 state.pause = .refused(detail)
                 return .refused
             case .http(let status, let detail) where status == 409:
                 // layer_off and the like: what the batch says doesn't match
-                // what's shared. Nothing to retry.
+                // what's shared. Nothing to retry. The request reached the
+                // host's store, so an earlier pause's cause (a plugin
+                // update, sign-in) is gone.
+                state.pause = nil
                 lastError = detail
                 return .refused
             default:
-                lastError = Self.describe(error)
+                state.pause = nil
+                lastError = UserFacingError.message(for: error)
             }
             return .failed
         } catch LocationSyncEngineError.keyRouteMissing {
@@ -312,8 +353,9 @@ final class LocationSyncEngine: ObservableObject {
             state.pause = .pluginMissing
             return .failed
         } catch {
-            lastError = Self.describe(error)
-            Self.log.info("Location send failed: \(Self.describe(error), privacy: .public)")
+            state.pause = nil
+            lastError = UserFacingError.message(for: error)
+            Self.log.info("Location send failed: \(LogRedaction.redactingURLs(Self.describe(error)), privacy: .public)")
             return .failed
         }
     }
@@ -341,8 +383,7 @@ final class LocationSyncEngine: ObservableObject {
 
     /// The host's 409s that mean it has no usable key for this phone.
     nonisolated static func needsNewKey(_ detail: String) -> Bool {
-        let lowered = detail.lowercased()
-        return lowered.contains("unknown_key") || lowered.contains("bad_seal") || lowered.contains("unknown key")
+        HostKeyConflict.isKeyLoss(detail)
     }
 
     private func post(_ batch: LocationBatch, key: LocationCrypto.SessionKey, request: Request) async throws -> [String: Any] {
@@ -390,7 +431,10 @@ final class LocationSyncEngine: ObservableObject {
                 "device_name": deviceName(),
                 "public_key": NotificationE2E.base64URL(devicePrivate.publicKey.rawRepresentation),
             ])
-        } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
+        } catch let error as DashboardTicketBridgeError {
+            // A profile that turned the plugin off answers 404 too: the
+            // pass says how to turn it on, not that the plugin is missing.
+            guard case .http(404, _) = error, DashboardTicketBridgeError.pluginOffDetail(of: error) == nil else { throw error }
             throw LocationSyncEngineError.keyRouteMissing
         }
         guard let hostPublic = answer["host_public_key"] as? String, let kid = answer["kid"] as? String else {
@@ -406,6 +450,7 @@ final class LocationSyncEngine: ObservableObject {
         }
         // The host has nothing from this key yet.
         state.placesDigest = nil
+        keyAgreements += 1
         if let generation = answer["generation"] as? String { state.generation = generation }
         return key
     }
@@ -419,6 +464,7 @@ final class LocationSyncEngine: ObservableObject {
     private func clearKey() {
         keys.clear()
         unsavedKey = nil
+        keyAgreements += 1
     }
 
     // MARK: Reading and deleting
@@ -446,8 +492,10 @@ final class LocationSyncEngine: ObservableObject {
     func wipe(deviceID: String, everything: Bool, request: Request) async throws {
         do {
             _ = try await request("\(Self.base)/wipe", "POST", everything ? ["all": true] : ["device_id": deviceID])
-        } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
+        } catch DashboardTicketBridgeError.http(let status, let detail)
+                    where status == 404 && !DashboardTicketBridgeError.isPluginOffDetail(detail) {
             // No location sync on this host any more: nothing left to delete.
+            // A profile that turned the plugin off deleted nothing: it throws.
         }
         forgetHost()
     }

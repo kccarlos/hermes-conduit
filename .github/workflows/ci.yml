@@ -1,49 +1,62 @@
 name: CI
 
-# CI v4 - GitHub-hosted CI is the only merge gate (see docs/CI.md):
+# CI v5 - GitHub-hosted CI is the only merge gate, and it is light on
+# purpose (see docs/CI.md):
 #
-#   PR / push (this file)   compile the app (without its Watch app and
-#                           extensions unless a PR touches them, see the plan
-#                           job's ui-spec) and all test targets, the
-#                           cheap Linux validation, EVERY unit class except the
-#                           nightly-only timing families (split into balanced
-#                           shards), and the curated UI smoke classes.
-#   Nightly (nightly.yml)   the timing/performance/dormancy families with
-#                           repeats, and the complete UI suite.
+#   PR / push (this file)   the cheap Linux validation beside ONE macOS job that
+#                           compiles the full app and all test targets once,
+#                           incrementally from main's latest build, and runs
+#                           the pinned unit smoke tests (scripts/smoke-suite.json)
+#                           on that build and simulator; a push to main also
+#                           runs the pinned UI smoke tests there.
+#   Nightly (nightly.yml)   EVERY unit class in balanced shards, the
+#                           timing/performance/dormancy families with repeats,
+#                           and the complete UI suite. Also how a release is
+#                           validated: dispatch it on the release ref.
 #
 # Jobs:
-#   plan       (ubuntu)  inventory/planner validation, localization coverage,
-#                        CI-tooling tests, the UI smoke selection
-#                        (scripts/smoke-suite.json) and the unit shards
-#                        (scripts/hosted-suite.json), both validated against
-#                        the discovered inventory.
-#   self-test  (ubuntu)  three fixed discovery groups in parallel.
-#   unit       (macos)   one job per unit shard. Each job builds its own test
-#                        products while its simulator boots in the background,
-#                        then runs its classes as sequential xcodebuild batches
-#                        (as few as $UNIT_BATCH_SIZE allows, split evenly),
-#                        continuing past a failed batch so one failure never
-#                        hides the rest.
-#   ui-smoke   (macos)   the curated UI classes, one invocation, same build.
+#   plan       (ubuntu)  only what smoke needs to start: the smoke selection
+#                        (scripts/smoke-suite.json, validated against the
+#                        discovered inventory) and whether the change needs
+#                        the macOS build at all.
+#   self-test  (ubuntu)  beside the build: inventory/planner validation,
+#                        localization coverage, plugin version, the feature
+#                        map, the nightly partition (scripts/hosted-suite.json)
+#                        and the CI-tooling suites, bash wrapper tests included.
+#   smoke      (macos)   builds its test products while its simulator boots in
+#                        the background, then runs the unit smoke tests (one
+#                        invocation, no retry) and, on a push to main, the UI
+#                        smoke tests (one invocation, one targeted retry). A
+#                        unit failure does not skip the UI step; the job fails
+#                        if either did.
 #   ci-gate    (ubuntu)  the single stable branch-protection check.
 #
-# Three macOS jobs per run: GitHub allows 5 concurrent macOS jobs per account,
-# and a PR's superseded runs are cancelled, so a run must leave room for the
-# next. A newer push to main never cancels an older one's run, so back-to-back
-# merges overlap and their macOS jobs queue behind the ceiling.
+# One macOS job per run: GitHub allows 5 concurrent macOS jobs per account,
+# and runner queueing, not test time, was what made the three-job CI v4 shape
+# slow. A PR's superseded runs are cancelled: a same-repository PR's by the
+# newer run's plan job, so it doesn't wait for them to wind down, a fork PR's
+# by its concurrency group. A newer push never cancels an
+# older one's run, so back-to-back merges overlap and each adds one macOS job.
 
 on:
   push:
-    branches: [main]
+    branches: [main, bot-workstreams]
   pull_request:
-    branches: [main]
+    # bot-workstreams: Bot Mode as a coordinator, kept off main until Eric says.
+    branches: [main, bot-workstreams]
 
-# A PR's newer push supersedes its older run. A push to main is grouped by its
-# own commit instead, so every merge gets a full run: branch protection does
-# not require PRs to be up to date with main, so this run is what catches two
-# PRs that pass alone but break together.
+# A PR's newer push supersedes its older run. A push is grouped by its own
+# commit instead, so every merge gets a full run: branch protection does not
+# require PRs to be up to date with main, so this run is what catches two PRs
+# that pass alone but break together.
+#
+# A PR from this repository gets a group of its own run, and its plan job
+# cancels the older runs (Cancel this PR's older runs): in a shared group the
+# new run waited, about 3.5 minutes, while the cancelled Smoke job wound down
+# (Eric, 2026-11-02). A fork's token can't cancel runs, so a fork PR keeps the
+# shared group and cancel-in-progress.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && format('run-{0}', github.run_id) || github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 permissions:
@@ -62,100 +75,145 @@ env:
 
 jobs:
   plan:
-    name: Plan & validate
+    # Only what the smoke job needs before it starts (its test selection and
+    # whether it runs at all), so the Mac build starts about a minute sooner;
+    # the Linux checks run in the self-test job, beside the build (Eric,
+    # 2026-11-02).
+    name: Plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # The smoke job's runs on this PR's earlier commits (Does the change
+      # need the macOS build), and cancelling this PR's older runs.
+      actions: write
+      pull-requests: read
     outputs:
-      unit-shards: "${{ steps.hosted.outputs.unit-shards }}"
+      unit-csv: "${{ steps.smoke.outputs.unit-csv }}"
       ui-csv: "${{ steps.smoke.outputs.ui-csv }}"
-      ui-spec: "${{ steps.spec.outputs.ui-spec }}"
+      smoke: "${{ steps.needs-build.outputs.smoke }}"
     steps:
+      - name: Cancel this PR's older runs
+        # A PR from this repository has a concurrency group of its own run
+        # (see concurrency above), so this run starts at once and cancels the
+        # PR's older runs here; they wind down beside it. Older only (a lower
+        # run number) and from this repository's branch, never a fork's of the
+        # same name, so two runs never cancel each other. Only a run whose one
+        # PR is this one (number and base): a branch with PRs into both main
+        # and linked-rooms (whose copy of this workflow shares its path) runs
+        # for each, and a run that lists both PRs is left alone. Best effort:
+        # a failed lookup leaves the older run going, which costs runner
+        # time, not correctness.
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          older=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f event=pull_request -f branch="$HEAD_REF" -f per_page=30 \
+            --jq ".workflow_runs[] | select(.status != \"completed\" and .run_number < $GITHUB_RUN_NUMBER and .head_repository.full_name == \"$GITHUB_REPOSITORY\" and (.pull_requests | length) == 1 and .pull_requests[0].number == $PR_NUMBER and .pull_requests[0].base.ref == \"$BASE_REF\") | .id") \
+            || { echo "::warning::could not list this PR's older runs"; exit 0; }
+          for id in $older; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" >/dev/null \
+              && echo "cancelled run $id" \
+              || echo "::warning::could not cancel run $id"
+          done
+
       - uses: actions/checkout@v7
         with:
           # A pull_request checkout is the merge commit: HEAD^1 is the base.
           fetch-depth: 2
-
-      - name: Validate inventory + planner regression tests
-        env:
-          # The minutes-long bash meta-suites (lane-runner state machine,
-          # destination lookup) run in the dedicated self-test job - they must
-          # never delay planning or risk this job's timeout.
-          CONDUIT_CI_SKIP_BASH_WRAPPER_TESTS: "1"
-        run: |
-          set -euo pipefail
-          # The planner still owns inventory discovery and is what the Mac
-          # exhaustive gate balances with, so its own completeness invariant
-          # (every discovered XCTestCase class planned exactly once) is checked
-          # on every run.
-          python3 scripts/plan-tests.py validate --repo-root . \
-            --baseline scripts/test-timings.json
-          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
-
-      - name: Localization catalog coverage
-        # Cheap Linux guard: every String(localized:) / SwiftUI literal call
-        # site must resolve to a key in Conduit/Localizable.xcstrings, so a
-        # translated string can never silently render English again.
-        run: python3 scripts/check-l10n-coverage.py --repo-root .
-
-      - name: Recommended plugin version matches the plugin
-        # Conduit only offers the plugin update to hosts below
-        # NotifierPluginStatus.recommendedVersion, so it must follow every
-        # plugin release on hermes-conduit-notifier main.
-        run: python3 scripts/check-plugin-version.py --repo-root .
 
       - name: Select the hosted smoke suite
         id: smoke
         run: |
           set -euo pipefail
           mkdir -p ci-artifacts
+          # HEAD^1 is the base (a PR's merge commit) or the branch's previous
+          # commit (a push; main takes squash merges, one commit each, and a
+          # merge of main into another branch brings main's changes too): the
+          # unit classes this change touches join the pinned tests, so a
+          # PR's new or edited tests run before merge.
           python3 scripts/plan-tests.py smoke --repo-root . \
-            --suite scripts/smoke-suite.json --out ci-artifacts/smoke.json
+            --suite scripts/smoke-suite.json --out ci-artifacts/smoke.json \
+            --changed-from HEAD^1
+          echo "unit-csv=$(jq -r '.unit_csv' ci-artifacts/smoke.json)" >> "$GITHUB_OUTPUT"
           echo "ui-csv=$(jq -r '.ui_csv' ci-artifacts/smoke.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Select the hosted unit shards
-        id: hosted
-        run: |
-          set -euo pipefail
-          mkdir -p ci-artifacts
-          python3 scripts/plan-tests.py hosted --repo-root . \
-            --suite scripts/hosted-suite.json --out ci-artifacts/hosted.json
-          # Matrix include entries carry a 1-based shard number: expressions
-          # have no arithmetic, so a job name can't compute job-index + 1.
-          echo "unit-shards=$(jq -c '.unit_shards | to_entries | map({shard: (.key + 1), classes: .value})' ci-artifacts/hosted.json)" >> "$GITHUB_OUTPUT"
-          {
-            echo "### Hosted unit shards"
-            echo
-            jq -r '.unit_shards | to_entries[] | "- shard \(.key + 1): \(.value | split(",") | length) classes"' ci-artifacts/hosted.json
-            echo "- nightly only: $(jq -r '.nightly_unit_csv' ci-artifacts/hosted.json)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Choose the UI smoke project
-        # The unit shards always build project-tests.yml (the app without its
-        # Watch app and extensions, which no test runs). UI smoke builds the
-        # whole app as shipped when the change could break those targets:
-        # their own folders, the shared code they compile, the project spec,
-        # or any push to main.
-        id: spec
+      - name: Does the change need the macOS build
+        # A PR skips the smoke job, and CI Gate passes it on this step's word,
+        # when it changes only what the app build and the smoke tests never
+        # read (Markdown, docs/, LICENSE, review config, .github/ other than
+        # this workflow), or when its change (scripts/pr-change-id.py) is the
+        # same as at an earlier commit of it whose smoke job passed: merging
+        # main, or resolving a feature map conflict, doesn't rebuild (Eric,
+        # 2026-10-29, #1467). So a merge commit can pass without being built,
+        # as a PR that isn't up to date with main always could; main's own run
+        # after the merge still builds and catches two PRs that break
+        # together. A file under an app or test folder (Markdown included)
+        # always builds, and a rename counts by both names. Fails closed:
+        # any push, anything but this PR's merge commit, an unreadable or
+        # empty diff, or a lookup that fails builds.
+        id: needs-build
         env:
           EVENT: ${{ github.event_name }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Fails closed: anything but GitHub's merge commit for this PR (its
-          # second parent, HEAD^2, is the PR head) or an unreadable or empty
-          # diff builds the full app.
-          spec=project.yml
+          smoke=true
+          why=''
           if [ "$EVENT" = "pull_request" ] && [ -n "$PR_HEAD" ] \
             && [ "$(git rev-parse -q --verify 'HEAD^2' || true)" = "$PR_HEAD" ] \
-            && changed=$(git diff --name-only HEAD^1 HEAD) && [ -n "$changed" ]; then
-            # grep reads all its input (no -q): stopping at the first match could
-            # kill printf with SIGPIPE, which pipefail would read as "no match".
-            if ! printf '%s\n' "$changed" | grep -E '^(ConduitWatch|ConduitWidgets|ConduitNotificationService|ConduitLocationPush|Shared)/|^project(-tests)?\.yml$|^Conduit/Voice/GPTLive/GPTLiveProtocol\.swift$' >/dev/null; then
-              spec=project-tests.yml
+            && changed=$(git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD) && [ -n "$changed" ]; then
+            # grep reads all its input (no -q), so printf never meets a closed pipe.
+            if ! printf '%s\n' "$changed" \
+              | grep -Ev '\.md$|^docs/|^LICENSE$|^opencode\.json$|^\.coderabbit\.ya?ml$|^\.github/' >/dev/null \
+              && ! printf '%s\n' "$changed" | grep -E '^\.github/workflows/ci\.yml$|^(Conduit[^/]*|Shared)/' >/dev/null; then
+              smoke=false
+              why="the change is only docs and config"
             fi
           fi
-          echo "ui-spec=$spec" >> "$GITHUB_OUTPUT"
-          echo "- UI smoke project: \`$spec\`" >> "$GITHUB_STEP_SUMMARY"
+          # The change id counts Markdown by its words, so Markdown under an
+          # app or test folder (which may ship in the app) always builds.
+          if [ "$smoke" = true ] && [ "$EVENT" = "pull_request" ] && [ -n "$PR_NUMBER" ] \
+            && [ "$(git rev-parse -q --verify 'HEAD^2' || true)" = "$PR_HEAD" ] \
+            && changed=$(git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD) && [ -n "$changed" ] \
+            && ! printf '%s\n' "$changed" | grep -E '^"?(Conduit[^/]*|Shared)/.*\.md"?$' >/dev/null; then
+            repo="repos/$GITHUB_REPOSITORY"
+            change_id() {
+              local diff
+              diff=$(gh api -H 'Accept: application/vnd.github.diff' "$repo/compare/$BASE_REF...$1") || diff=''
+              python3 scripts/pr-change-id.py <<<"$diff" || true
+            }
+            # The newest of the PR's last 20 commits whose smoke job passed.
+            commits=$(gh api --paginate "$repo/pulls/$PR_NUMBER/commits" --jq '.[].sha') || commits=''
+            passed=''
+            for sha in $(tail -n 20 <<<"$commits" | tac); do
+              [ "$sha" != "$PR_HEAD" ] || continue
+              runs=$(gh api -X GET "$repo/actions/workflows/ci.yml/runs" \
+                -f event=pull_request -f head_sha="$sha" --jq '.workflow_runs[].id') || runs=''
+              for run_id in $runs; do
+                ok=$(gh api "$repo/actions/runs/$run_id/jobs" \
+                  --jq '[.jobs[] | select(.name == "Smoke" and .conclusion == "success")] | length') || ok=0
+                if [ "$ok" -gt 0 ]; then passed=$sha; break 2; fi
+              done
+            done
+            if [ -n "$passed" ]; then
+              now=$(change_id "$PR_HEAD")
+              if [ -n "$now" ] && [ "$now" = "$(change_id "$passed")" ]; then
+                smoke=false
+                why="the change is the same as at $passed, whose smoke job passed"
+              fi
+            fi
+          fi
+          echo "smoke=$smoke" >> "$GITHUB_OUTPUT"
+          echo "- smoke job: \`$smoke\`${why:+ ($why)}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Smoke selection summary
         run: |
@@ -164,46 +222,151 @@ jobs:
             --selection ci-artifacts/smoke.json >> "$GITHUB_STEP_SUMMARY"
 
   self-test:
-    name: CI tooling self-test (${{ matrix.group }})
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [fast, lane, local-gate]
-    # No `needs`: the meta-suites test the CI tooling itself, not this run's
-    # selection, so they start immediately and run CONCURRENTLY with the macOS
-    # build instead of serially delaying it.
+    name: Validate & self-test
+    # No `needs`: the Linux checks and the CI tooling suites don't depend on
+    # this run's selection, so they start immediately and run CONCURRENTLY
+    # with the macOS build instead of serially delaying it.
     runs-on: ubuntu-latest
-    # Raised from 12 to 16 minutes when the gate's two-worker, merge-mode and
-    # per-worker-evidence cases grew the gate integration suite, and again to 30
-    # when its cap moved to 1200s: the same suite also runs inside the gate's
-    # overlapped static phase, alongside two live xcodebuild chains, where it
-    # measured ~900s on our Mac against ~410s standalone. The hierarchy still
-    # holds with room to spare - every suite's own subprocess cap (1200s for the
-    # gate suite, 480s for the lane runner) < this ceiling - so a suite always
-    # reports its own failure before GitHub kills the job.
-    timeout-minutes: 30
+    # About two minutes in all; 10 leaves room for a slow runner.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          # A pull_request checkout is the merge commit: HEAD^1 is the base
+          # (the feature map check reads the base's map).
+          fetch-depth: 2
 
-      - name: Run CI tooling regression suites
-        # The three groups partition full discovery exactly once. The timeout
-        # layering must hold: per-case synthetic-hang watchdogs (<= 6s) < each
-        # wrapper's subprocess cap (1200s for the gate integration suite, 480s
-        # for the lane-runner state machine) < this job ceiling (30m) - GitHub
-        # must never be the first layer to kill a regression suite.
+      - name: Validate inventory + planner
         run: |
           set -euo pipefail
-          python3 scripts/ci-self-test.py --group "${{ matrix.group }}"
+          # The planner owns inventory discovery, so its own completeness
+          # invariant (every discovered XCTestCase class planned exactly once)
+          # is checked on every run. Its regression tests run in
+          # ci-self-test.py below.
+          python3 scripts/plan-tests.py validate --repo-root . \
+            --baseline scripts/test-timings.json
 
-  unit:
-    name: Unit tests (shard ${{ matrix.shard }})
+      - name: Localization catalog coverage
+        # Cheap Linux guard: every String(localized:) / SwiftUI literal call
+        # site must resolve to a key in Conduit/Localizable.xcstrings, so a
+        # translated string can never silently render English again.
+        run: python3 scripts/check-l10n-coverage.py --repo-root .
+
+      - name: Text follows Text Size
+        # Text set in a fixed point size stays small at accessibility text
+        # sizes while the text around it grows (#830).
+        run: python3 scripts/check-fixed-text-sizes.py --repo-root .
+
+      - name: Every shipped target keeps Date's comparisons
+        # Foundation's back-deployed Date <= and >= crash on early iOS 27.2
+        # betas; each app and extension compiles Shared/DateOrder instead.
+        run: python3 scripts/check-weak-imports.py targets --repo-root .
+
+      - name: Transcript rows get the chat's environment
+        # Each transcript row draws in a hosting controller of its own, so
+        # it inherits nothing from ChatView: every Conduit environment key
+        # is copied through TranscriptCellEnvironment or set in the rows
+        # (#1533).
+        run: python3 scripts/check-transcript-environment.py --repo-root .
+
+      - name: Recommended plugin version matches the plugin
+        # Conduit only offers the plugin update to hosts below
+        # NotifierPluginStatus.recommendedVersion, so it must follow every
+        # plugin release on hermes-conduit-notifier main.
+        run: python3 scripts/check-plugin-version.py --repo-root .
+
+      - name: Card schema matches the plugin's
+        # Conduit/Cards/card-schema.json and the shared test vectors are
+        # copies of hermes-conduit-notifier main's cards/, so the two sides
+        # read one definition.
+        run: python3 scripts/check-card-schema.py --repo-root .
+
+      - name: Feature map paths exist
+        # docs/FEATURE_MAP.md tells a change which siblings to update and
+        # where their code lives; a path that moved would send it to the
+        # wrong file. notifier/ paths are checked on the plugin's main. On a
+        # PR, an entry it adds or edits names it on its Checked line. A PR
+        # into pulse or linked-rooms (that branch's copy of this workflow
+        # runs on those) that merges main, so it leaves fewer of main's
+        # commits to take than its base does, also passes main's maps where
+        # the PR and its base meet main (their merge bases): an entry main
+        # changed between the two that matches main's copy came in with the
+        # merge and keeps main's Checked line. If GitHub can't say, the check
+        # warns and runs without them, as it would have before.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PR_NUMBER" ]; then
+            if ! git show HEAD^1:docs/FEATURE_MAP.md > "$RUNNER_TEMP/base-map.md"; then
+              echo "::error::Couldn't read docs/FEATURE_MAP.md at HEAD^1, the PR's base."
+              exit 1
+            fi
+            main_maps=()
+            if [ "$BASE_REF" != "main" ]; then
+              compare="repos/$GITHUB_REPOSITORY/compare/main..."
+              meets='"\(.merge_base_commit.sha) \(.behind_by)"'
+              if ! head=$(gh api "$compare$HEAD_SHA?per_page=1" --jq "$meets") \
+                  || ! base=$(gh api "$compare$BASE_SHA?per_page=1" --jq "$meets"); then
+                echo "::warning::Couldn't ask GitHub whether the PR merges main, so entries that came in from main count as this PR's edits."
+              elif [ "${head#* }" -lt "${base#* }" ]; then
+                if git fetch --no-tags --depth=1 origin "${head% *}" "${base% *}" \
+                    && git show "${head% *}:docs/FEATURE_MAP.md" > "$RUNNER_TEMP/main-map.md" \
+                    && git show "${base% *}:docs/FEATURE_MAP.md" > "$RUNNER_TEMP/main-base-map.md"; then
+                  main_maps=(--main-map "$RUNNER_TEMP/main-map.md" --main-base-map "$RUNNER_TEMP/main-base-map.md")
+                else
+                  echo "::warning::Couldn't read docs/FEATURE_MAP.md on main at ${head% *} and ${base% *}, so entries that came in from main count as this PR's edits."
+                fi
+              fi
+            fi
+            python3 scripts/check-feature-map.py --repo-root . \
+              --pr "$PR_NUMBER" --base-map "$RUNNER_TEMP/base-map.md" "${main_maps[@]}"
+          else
+            python3 scripts/check-feature-map.py --repo-root .
+          fi
+
+      - name: Validate the nightly partition
+        # These shards never run on a PR, but a PR that renames a nightly-only
+        # class fails now instead of at night: every discovered unit class must land
+        # in exactly one nightly unit shard or the nightly-only timing list,
+        # and every UI class in a nightly UI shard. nightly.yml runs the same
+        # command for its own matrices.
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          python3 scripts/plan-tests.py hosted --repo-root . \
+            --suite scripts/hosted-suite.json --out ci-artifacts/hosted.json
+          {
+            echo "### Nightly unit shards"
+            echo
+            jq -r '.unit_shards | to_entries[] | "- shard \(.key + 1): \(.value | split(",") | length) classes"' ci-artifacts/hosted.json
+            echo "- timing families (nightly only): $(jq -r '.nightly_unit_csv' ci-artifacts/hosted.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run CI tooling regression suites
+        # Full discovery, the bash wrapper tests included. Per-case
+        # synthetic-hang watchdogs (<= 6s) stay well under this job ceiling,
+        # so GitHub is never the first layer to kill a regression suite.
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-self-test.py
+
+  smoke:
+    # The only macOS job of a PR or push run: one build, one booted simulator,
+    # then the unit smoke tests and, on a push, the UI smoke tests on them.
+    name: Smoke
     needs: plan
+    if: needs.plan.outputs.smoke != 'false'
     runs-on: macos-26
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.plan.outputs.unit-shards) }}
+    # 75: the UI smoke job alone needed 45 (a stalled first attempt plus the
+    # one targeted retry ran past 30 minutes, which GitHub reports as
+    # "cancelled" instead of a failure), and the unit smoke invocation now
+    # runs on the same runner first.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
 
@@ -211,19 +374,20 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode.app
 
       - name: Pick the build cache
-        # DerivedData from the newest main build of the same project and
-        # Xcode (the same runner image preferred), so ci-build-for-testing.sh
-        # recompiles only what changed since. A new Xcode starts clean.
+        # DerivedData from the newest build of the same project and Xcode
+        # that this run can reach (see "Save the build cache"), the same
+        # runner image preferred, so ci-build-for-testing.sh recompiles only
+        # what changed since. A new Xcode starts clean.
         id: cache-key
-        env:
-          SPEC: project-tests.yml
         run: |
           set -euo pipefail
+          # The full app, as every push to main builds and saves it: a PR
+          # recompiles only what changed since main's latest merge. The
+          # app-only build (project-tests.yml, kind slim) is nightly's.
           kind=full
-          if [ "$SPEC" = project-tests.yml ]; then kind=slim; fi
           xcode=$(xcodebuild -version | awk 'NR==1 {v=$2} /Build version/ {b=$3} END {print v "-" b}')
           prefix="dd-v1-$kind-$xcode-${ImageVersion:-image}"
-          echo "build cache: $prefix (spec $SPEC, runner image ${ImageOS:-?} ${ImageVersion:-?})"
+          echo "build cache: $prefix (runner image ${ImageOS:-?} ${ImageVersion:-?})"
           echo "kind=$kind" >> "$GITHUB_OUTPUT"
           echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
           echo "xcode-prefix=dd-v1-$kind-$xcode" >> "$GITHUB_OUTPUT"
@@ -246,8 +410,7 @@ jobs:
         run: brew install xcodegen
 
       - name: Generate Xcode project
-        # The app without its Watch app and extensions (project-tests.yml).
-        run: xcodegen generate --spec project-tests.yml
+        run: xcodegen generate --spec project.yml
 
       - name: Build and boot the simulator in parallel
         id: build
@@ -262,33 +425,39 @@ jobs:
           BUILD_CACHE: ${{ steps.cache.outputs.cache-matched-key || format('none saved under {0}', steps.cache-key.outputs.prefix) }}
         run: bash scripts/ci-hosted-build.sh
 
-      - name: Run this shard's unit classes
-        # The shard's classes run as SEQUENTIAL batches, each a fresh
-        # xcodebuild on the same booted simulator: the fewest batches of at
-        # most $UNIT_BATCH_SIZE classes, split evenly. Each invocation spends
-        # 40-100 s before its first test (2026-10-15), so a small leftover
-        # batch is mostly overhead. A failing batch does not stop the shard:
-        # every batch runs, the failed ones are listed, and the job fails at
-        # the end. No native flake retry - a genuine assertion must fail the
-        # run.
+      - name: No back-deployed Date comparisons or strong framework loads in the build
+        # The smoke build's app, its .debug.dylib and its extensions: none may
+        # weak-import Foundation's Date <= or >=, which early iOS 27.2 betas
+        # lack (TestFlight 251, 2026-11-05; Shared/DateOrder/DateOrder.swift),
+        # or load ActivityKit or ImagePlayground strongly, which macOS 14 and
+        # iOS 17 lack (issue 1877).
+        run: python3 scripts/check-weak-imports.py binaries --products "${DERIVED_DATA_PATH:-$PWD/ci-derived-data}/Build/Products/Debug-iphonesimulator"
+
+      - name: Run the curated unit smoke classes
+        # A few pinned tests per risk area (scripts/smoke-suite.json, capped),
+        # plus the static source contracts and the change's own unit classes
+        # (within a time budget), as ONE xcodebuild invocation on the booted
+        # simulator: each
+        # invocation has a fixed 40-100 s hosted cost before its first test
+        # (2026-10-15). Every other unit class runs in the nightly unit shards
+        # (nightly.yml).
         #
-        # -test-timeouts-enabled bounds a hung test: XCTest kills it after the
-        # allowance and reports it, instead of the job burning its ceiling.
-        # -collect-test-diagnostics never: Xcode's on-failure default gathers a
-        # simulator payload under its own 600s timeout (docs/CI.md).
-        # Accepted tradeoff: there is no wall-clock watchdog around a whole
-        # invocation, so a wedged xcodebuild or simulator (not a hung test)
-        # runs to the job ceiling and reads as "cancelled".
+        # No retry of any kind: a unit failure is a test bug to fix, not
+        # runner noise. -test-timeouts-enabled bounds a hung test; and
+        # -collect-test-diagnostics never, because Xcode's on-failure default
+        # gathers a simulator payload under its own 600s timeout (docs/CI.md).
+        id: unit
         env:
-          UNIT_CLASSES: "${{ matrix.classes }}"
-          UNIT_BATCH_SIZE: "45"
+          UNIT_CLASSES: "${{ needs.plan.outputs.unit-csv }}"
+          UNIT_SMOKE_LOG: ci-lane/unit-smoke.log
           UNIT_TEST_ALLOWANCE_S: "180"
         run: |
           set -euo pipefail
           # Fail closed: an empty list would expand to no -only-testing filter,
-          # and a bare xcodebuild would run the ENTIRE suite instead of nothing.
+          # and a bare xcodebuild would run the ENTIRE unit suite instead of the
+          # pinned tests.
           if [ -z "$UNIT_CLASSES" ]; then
-            echo "::error::unit shard selection is empty - refusing to run unfiltered"
+            echo "::error::unit smoke selection is empty - refusing to run unfiltered"
             exit 1
           fi
           if [ -z "${DESTINATION:-}" ]; then
@@ -296,200 +465,79 @@ jobs:
             exit 1
           fi
           IFS=',' read -r -a CLASSES <<< "$UNIT_CLASSES"
-          # Default only when UNSET: an explicitly empty value is malformed, not
-          # a request for the default.
-          UNIT_BATCH_SIZE="${UNIT_BATCH_SIZE-45}"
-          case "$UNIT_BATCH_SIZE" in
-            ''|*[!0-9]*)
-              echo "::error::UNIT_BATCH_SIZE must be a positive integer, got '$UNIT_BATCH_SIZE'"
-              exit 1
-              ;;
-          esac
-          # 10# forces base 10, so "00" and "08" are not read as octal.
-          if [ "$((10#$UNIT_BATCH_SIZE))" -lt 1 ]; then
-            echo "::error::UNIT_BATCH_SIZE must be greater than zero, got '$UNIT_BATCH_SIZE'"
-            exit 1
-          fi
-          UNIT_BATCH_SIZE=$((10#$UNIT_BATCH_SIZE))
-          batches=$(( (${#CLASSES[@]} + UNIT_BATCH_SIZE - 1) / UNIT_BATCH_SIZE ))
-          per_batch=$(( (${#CLASSES[@]} + batches - 1) / batches ))
-          echo "unit shard: ${#CLASSES[@]} classes in $batches batch(es) of at most $per_batch (cap $UNIT_BATCH_SIZE)"
-          printf '### Unit shard classes (%s)\n\n`%s`\n' "${#CLASSES[@]}" "$UNIT_CLASSES" \
-            >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-          failed_batches=()
-          # Each batch posts how long it took and how much of that ran tests:
-          # on a freshly booted simulator the first batch spent 154 s outside
-          # its tests and the second 20 s (#629), and the job log API cuts off
-          # an early batch's lines.
-          batch_timing_notice() {
-            local total executed tests wall
-            total=$(( $(date +%s) - $1 ))
-            executed=$(grep -E '^[[:space:]]*Executed [0-9]+ tests?, with' "$batch_log" | tail -n 1 || true)
-            tests=$(printf '%s\n' "$executed" | sed -nE 's/^[[:space:]]*Executed ([0-9]+) tests?.*/\1/p')
-            wall=$(printf '%s\n' "$executed" | sed -nE 's/.* \(([0-9]+)(\.[0-9]+)?\) seconds$/\1/p')
-            if [ -n "$tests" ] && [ -n "$wall" ]; then
-              echo "::notice title=unit batch $batch_no took ${total}s::$tests tests ran for ${wall}s of it"
-            else
-              echo "::notice title=unit batch $batch_no took ${total}s::its output has no test totals"
-            fi
-          }
-          run_batch() {
-            batch_no="$1"
-            shift
-            if [ "$#" -eq 0 ]; then
-              return 0
-            fi
-            batch_args=()
-            for cls in "$@"; do
-              batch_args+=("-only-testing:ConduitTests/${cls}")
-            done
-            batch_log="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/unit-batch-$batch_no.log"
-            batch_start=$(date +%s)
-            echo "::group::unit batch $batch_no ($# classes)"
-            if ! xcodebuild test-without-building \
-              -xctestrun "$XCRUN_FILE" \
-              -destination "$DESTINATION" \
-              -parallel-testing-enabled NO \
-              -collect-test-diagnostics never \
-              -test-timeouts-enabled YES \
-              -default-test-execution-time-allowance "${UNIT_TEST_ALLOWANCE_S:-180}" \
-              "${batch_args[@]}" 2>&1 | tee "$batch_log"; then
-              echo "::endgroup::"
-              batch_timing_notice "$batch_start"
-              echo "::error::unit batch $batch_no failed: $*"
-              # The failing cases go in an annotation too: the job log API
-              # returns only a job's last 5,000 lines, which an early batch's
-              # failures do not reach. xcodebuild's own list of failing tests
-              # comes first (its first 40 lines, then a marker if it is longer),
-              # then the first messages and crashes.
-              failing_list=$(awk '/^Failing tests:/ { on = 1; print; next }
-                on && /^[[:space:]]+[^[:space:]]/ { print; next }
-                { on = 0 }' "$batch_log" \
-                | awk 'NR <= 40 { print } NR == 41 { print "\t(more failing tests in the job log)" }' || true)
-              details=$(grep -E ": error: -\[|Test Case '.*' failed|Restarting after unexpected exit|✘" "$batch_log" \
-                | head -n 20 || true)
-              failures=$(printf '%s\n%s\n' "$failing_list" "$details" | sed '/^$/d')
-              if [ -n "$failures" ]; then
-                echo "::error title=unit batch $batch_no failures::$(printf '%s\n' "$failures" | sed 's/%/%25/g' | awk '{printf "%s%s", (NR > 1 ? "%0A" : ""), $0}')"
-              fi
-              failed_batches+=("$batch_no")
-              return 0
-            fi
-            echo "::endgroup::"
-            batch_timing_notice "$batch_start"
-          }
-
-          batch=0
-          group=()
+          UNIT_SMOKE_LOG="${UNIT_SMOKE_LOG:-ci-lane/unit-smoke.log}"
+          mkdir -p "$(dirname "$UNIT_SMOKE_LOG")"
+          args=()
           for cls in "${CLASSES[@]}"; do
-            group+=("$cls")
-            if [ "${#group[@]}" -ge "$per_batch" ]; then
-              batch=$((batch + 1))
-              run_batch "$batch" "${group[@]}"
-              group=()
-            fi
+            args+=("-only-testing:ConduitTests/${cls}")
           done
-          if [ "${#group[@]}" -gt 0 ]; then
-            batch=$((batch + 1))
-            run_batch "$batch" "${group[@]}"
+
+          echo "unit smoke: ${#CLASSES[@]} tests and classes in one invocation"
+          started=$(date +%s)
+          rc=0
+          xcodebuild test-without-building \
+            -xctestrun "$XCRUN_FILE" \
+            -destination "$DESTINATION" \
+            -parallel-testing-enabled NO \
+            -collect-test-diagnostics never \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance "${UNIT_TEST_ALLOWANCE_S:-180}" \
+            "${args[@]}" 2>&1 | tee "$UNIT_SMOKE_LOG" || rc=$?
+          # How long the invocation took and how much of that ran tests.
+          total=$(( $(date +%s) - started ))
+          executed=$(grep -E '^[[:space:]]*Executed [0-9]+ tests?, with' "$UNIT_SMOKE_LOG" | tail -n 1 || true)
+          tests=$(printf '%s\n' "$executed" | sed -nE 's/^[[:space:]]*Executed ([0-9]+) tests?.*/\1/p')
+          wall=$(printf '%s\n' "$executed" | sed -nE 's/.* \(([0-9]+)(\.[0-9]+)?\) seconds$/\1/p')
+          if [ -n "$tests" ] && [ -n "$wall" ]; then
+            echo "::notice title=unit smoke took ${total}s::$tests tests ran for ${wall}s of it"
+          else
+            echo "::notice title=unit smoke took ${total}s::its output has no test totals"
           fi
-          if [ "${#failed_batches[@]}" -gt 0 ]; then
-            echo "::error::unit shard: ${#failed_batches[@]} of $batch batch invocation(s) failed (batches ${failed_batches[*]})"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::unit smoke failed: $UNIT_CLASSES"
+            # The failing cases go in an annotation too, readable without the
+            # log: xcodebuild's own list of failing tests first (its first 40
+            # lines, then a marker if it is longer), then the first messages
+            # and crashes.
+            failing_list=$(awk '/^Failing tests:/ { on = 1; print; next }
+              on && /^[[:space:]]+[^[:space:]]/ { print; next }
+              { on = 0 }' "$UNIT_SMOKE_LOG" \
+              | awk 'NR <= 40 { print } NR == 41 { print "\t(more failing tests in the job log)" }' || true)
+            details=$(grep -E ": error: -\[|Test Case '.*' failed|Restarting after unexpected exit|✘" "$UNIT_SMOKE_LOG" \
+              | head -n 20 || true)
+            failures=$(printf '%s\n%s\n' "$failing_list" "$details" | sed '/^$/d')
+            if [ -n "$failures" ]; then
+              echo "::error title=unit smoke failures::$(printf '%s\n' "$failures" | sed 's/%/%25/g' | awk '{printf "%s%s", (NR > 1 ? "%0A" : ""), $0}')"
+            fi
             exit 1
           fi
-          echo "unit shard: $batch batch invocation(s) completed"
 
-      - name: Save the build cache
-        # Main's builds only (PRs restore the newest of them), one job per
-        # project kind: shard 1 saves the app-only build. After the tests, so a
-        # test failure still saves a good build.
-        if: >-
-          always() && steps.build.outcome == 'success'
-          && steps.cache.outputs.cache-hit != 'true'
-          && matrix.shard == 1
-          && github.event_name == 'push'
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            ci-derived-data
-            !ci-derived-data/Logs
-          key: ${{ steps.cache-key.outputs.prefix }}-${{ github.sha }}
-
-      - name: Dump simulator state (failure diagnostics)
-        if: failure()
+      - name: Remove the app before UI smoke
+        # The unit classes run inside the app as their test host, so its data
+        # container (defaults, saved chats, files) holds whatever they left.
+        # UI smoke used to get a fresh simulator; uninstalling gives it a
+        # fresh container instead (test-without-building installs the app
+        # again). Keychain items outlive an uninstall on the simulator.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && github.event_name == 'push' }}
         run: |
-          xcrun simctl list runtimes available || true
-          xcrun simctl list devices available
-
-  ui-smoke:
-    name: UI smoke
-    needs: plan
-    runs-on: macos-26
-    # 45, not 30: a stalled first attempt plus the one targeted retry has run
-    # past 30 minutes, which GitHub reports as "cancelled" instead of a failure.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
-
-      - name: Pick the build cache
-        # DerivedData from the newest main build of the same project and
-        # Xcode (the same runner image preferred), so ci-build-for-testing.sh
-        # recompiles only what changed since. A new Xcode starts clean.
-        id: cache-key
-        env:
-          SPEC: ${{ needs.plan.outputs.ui-spec }}
-        run: |
-          set -euo pipefail
-          kind=full
-          if [ "$SPEC" = project-tests.yml ]; then kind=slim; fi
-          xcode=$(xcodebuild -version | awk 'NR==1 {v=$2} /Build version/ {b=$3} END {print v "-" b}')
-          prefix="dd-v1-$kind-$xcode-${ImageVersion:-image}"
-          echo "build cache: $prefix (spec $SPEC, runner image ${ImageOS:-?} ${ImageVersion:-?})"
-          echo "kind=$kind" >> "$GITHUB_OUTPUT"
-          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
-          echo "xcode-prefix=dd-v1-$kind-$xcode" >> "$GITHUB_OUTPUT"
-
-      - name: Restore the build cache
-        id: cache
-        uses: actions/cache/restore@v5
-        with:
-          path: |
-            ci-derived-data
-            !ci-derived-data/Logs
-          key: ${{ steps.cache-key.outputs.prefix }}-${{ github.sha }}
-          # Same runner image first; while GitHub rolls out a new image, any
-          # build from the same Xcode (a mismatch only rebuilds more).
-          restore-keys: |
-            ${{ steps.cache-key.outputs.prefix }}-
-            ${{ steps.cache-key.outputs.xcode-prefix }}-
-
-      - name: Install xcodegen
-        run: brew install xcodegen
-
-      - name: Generate Xcode project
-        # project.yml or project-tests.yml, chosen by the plan job.
-        run: xcodegen generate --spec "${{ needs.plan.outputs.ui-spec }}"
-
-      - name: Build and boot the simulator in parallel
-        id: build
-        # ci-prepare-smoke.sh (bounded device lookup, boot and bootstatus) runs
-        # in the background while this runner compiles, so the ~2.5 min boot
-        # hides behind the build. Exports XCRUN_FILE, DESTINATION and
-        # SIMULATOR_UDID for the steps below.
-        env:
-          # 1200 like the nightly: 800-900 s builds were common (2026-10-13).
-          BUILD_TIMEOUT_SECS: 1200
-          # Named in the build's timing notice, to explain a clean build.
-          BUILD_CACHE: ${{ steps.cache.outputs.cache-matched-key || format('none saved under {0}', steps.cache-key.outputs.prefix) }}
-        run: bash scripts/ci-hosted-build.sh
+          # com.milim.relay is project.yml's PRODUCT_BUNDLE_IDENTIFIER for Conduit.
+          if ! xcrun simctl uninstall "${SIMULATOR_UDID:-booted}" com.milim.relay; then
+            echo "::warning::could not remove the app before UI smoke; UI smoke runs on the unit classes' app container"
+          fi
 
       - name: Run the curated UI smoke suite
         # Basic launch/navigation smoke only: the full UI suite runs in the
         # nightly workflow (nightly.yml).
+        #
+        # On a push to main only, not on a PR (Eric, 2026-11-02): it took
+        # 3-5 of a PR's 18-22 minutes and was its flakiest step. The unit
+        # tests run inside the app, so a PR that breaks its launch still
+        # fails; a UI regression shows up in main's run after the merge, or
+        # that night, and whoever merged it fixes main forward.
+        #
+        # Runs after a unit smoke failure too, so one red step never hides the
+        # other's verdict (a failed step still fails the job); only a failed
+        # build or a cancelled run skips it.
         #
         # UI classes are the one part of this gate with a measured flake rate on
         # shared runners: over three runs of this PR, two different UI tests
@@ -501,8 +549,10 @@ jobs:
         # result attribution is uncertain, and the original failure reported.
         # A class that fails twice fails this job - this is
         # deliberately not rerun-until-green, and no Xcode-native retry flags are
-        # used anywhere. The unit shards get no such retry: a unit failure is a
-        # test bug to fix, not runner noise.
+        # used anywhere. The unit smoke step gets no such retry: a unit failure
+        # is a test bug to fix, not runner noise.
+        id: ui
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && github.event_name == 'push' }}
         env:
           UI_CLASSES: "${{ needs.plan.outputs.ui-csv }}"
           UI_SMOKE_LOG: ci-lane/ui-smoke.log
@@ -511,7 +561,7 @@ jobs:
           set -euo pipefail
           # Fail closed: an empty list would expand to no -only-testing filter,
           # and a bare xcodebuild would run the ENTIRE UI suite instead of the
-          # two curated classes.
+          # pinned tests.
           if [ -z "$UI_CLASSES" ]; then
             echo "::error::UI smoke selection is empty - refusing to run unfiltered"
             exit 1
@@ -548,7 +598,7 @@ jobs:
               "${args[@]}"
           }
 
-          echo "UI smoke: ${#CLASSES[@]} classes"
+          echo "UI smoke: ${#CLASSES[@]} tests"
           rc=0
           run_classes "$RESULT_DIR/initial.xcresult" "${CLASSES[@]}" 2>&1 | tee "$UI_SMOKE_LOG" || rc=$?
           if [ "$rc" -ne 0 ]; then
@@ -572,13 +622,15 @@ jobs:
           fi
 
       - name: Save the build cache
-        # Main's builds only (PRs restore the newest of them), one job per
-        # project kind: UI smoke saves the full app. After the tests, so a
-        # test failure still saves a good build.
+        # Pushes' builds only. A PR restores the newest it can reach: main's,
+        # and on a PR into pulse or linked-rooms (each runs its own copy of
+        # this workflow) that branch's too, never another branch's. Smoke
+        # always builds the full app (project.yml); the app-only (slim) build
+        # the nightly unit shards restore is saved by nightly unit shard 1.
+        # After the tests, so a test failure still saves a good build.
         if: >-
           always() && steps.build.outcome == 'success'
           && steps.cache.outputs.cache-hit != 'true'
-          && steps.cache-key.outputs.kind == 'full'
           && github.event_name == 'push'
         uses: actions/cache/save@v5
         with:
@@ -593,13 +645,14 @@ jobs:
           xcrun simctl list runtimes available || true
           xcrun simctl list devices available
 
-      - name: Upload hosted UI diagnostics
+      - name: Upload hosted smoke diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ui-smoke-diagnostics
+          name: smoke-diagnostics
           path: |
             ci-lane/destination/preparation.json
+            ci-lane/unit-smoke.log
             ci-lane/ui-smoke.log
             ci-lane/ui-retry.json
           retention-days: 3
@@ -608,7 +661,7 @@ jobs:
   # Single stable branch-protection check: every hosted job must succeed.
   ci-gate:
     name: CI Gate
-    needs: [plan, unit, ui-smoke, self-test]
+    needs: [plan, smoke, self-test]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -619,6 +672,6 @@ jobs:
         run: |
           python3 scripts/ci-gate.py \
             --plan "${{ needs.plan.result }}" \
-            --unit "${{ needs.unit.result }}" \
-            --ui-smoke "${{ needs.ui-smoke.result }}" \
+            --smoke "${{ needs.smoke.result }}" \
+            --smoke-needed "${{ needs.plan.outputs.smoke }}" \
             --self-test "${{ needs.self-test.result }}"

@@ -4,14 +4,15 @@
 //
 //  Tasks: a glass segmented control over the Kanban board (its lanes as
 //  side-by-side columns) and the scheduled jobs (schedule, next run, and an
-//  on/off switch). Each scheduled run lands in Chats as its own
-//  conversation.
+//  on/off switch). Each scheduled run is its own conversation, listed in
+//  Chats under the Scheduled filter.
 //
 
 import SwiftUI
 
 struct V2TasksView: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    @EnvironmentObject private var appState: AppState
     @Environment(\.v2Shell) private var shell
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.layoutDirection) private var layoutDirection
@@ -63,7 +64,7 @@ struct V2TasksView: View {
         // at a hard line below the control.
         .v2EdgeBar(.top) {
             VStack(spacing: 2) {
-                V2TopBar().withoutScrollEdge()
+                V2TopBar()
                 V2SegmentedControl(
                     selection: segment,
                     options: [
@@ -74,13 +75,16 @@ struct V2TasksView: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 10)
             }
-            .modifier(V2LegacyScrollEdge())
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             MinimisedLiveVoiceBar()
         }
         .toolbar(.hidden, for: .navigationBar)
         .navigationTitle(V2Tab.tasks.title)
+        // A task to show (a Pulse card's) is on the Board.
+        .onChange(of: appState.kanbanTaskOpenRequest, initial: true) { _, request in
+            if request != nil { segmentRaw = Segment.board.rawValue }
+        }
     }
 
     /// Under Reduce Motion the pages only crossfade.
@@ -115,6 +119,11 @@ struct V2ScheduledList: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.v2Shell) private var shell
     @State private var selectedJob: CronJob?
+    @State private var jobPendingDeletion: CronJob?
+    @State private var editorTarget: CronJobEditorSheet.Target?
+    @State private var showingBlueprints = false
+    /// A job a blueprint just made, opened once the gallery has closed.
+    @State private var createdJob: CronJob?
     /// Pinned jobs, per profile: "profile\tjobID" lines. Kept on the phone;
     /// Hermes has no pin for a job.
     @AppStorage("conduit.v2.pinnedCronJobs") private var pinnedRaw = ""
@@ -158,8 +167,14 @@ struct V2ScheduledList: View {
             if all.isEmpty && !appState.cronJobsLoading {
                 let empty = CronJobFilter.emptyState(filter: .all, hasJobs: false, isSearching: false)
                 ScrollView {
-                    ContentUnavailableView(empty.title, systemImage: "clock", description: Text(empty.description))
-                        .padding(.top, 60)
+                    ContentUnavailableView {
+                        Label(empty.title, systemImage: "clock")
+                    } description: {
+                        Text(empty.description)
+                    } actions: {
+                        createButtons
+                    }
+                    .padding(.top, 60)
                 }
             } else if all.isEmpty {
                 // In a scroll view so pull to refresh still works while loading.
@@ -169,6 +184,12 @@ struct V2ScheduledList: View {
                 }
             } else {
                 List {
+                    Section {
+                        createButtons
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
                     if !pinned.isEmpty {
                         Section {
                             ForEach(pinned) { row($0, pinned: true) }
@@ -205,7 +226,7 @@ struct V2ScheduledList: View {
             }
         }
         // A hidden Tasks tab stays mounted; it loads when shown, like Chats.
-        .task(id: "\(appState.activeProfile)|\(shell.isTabActive)") {
+        .task(id: "\(appState.activeProfile)|\(appState.isConnected)|\(shell.isTabActive)") {
             guard shell.isTabActive else { return }
             await appState.refreshCronContent()
         }
@@ -214,18 +235,86 @@ struct V2ScheduledList: View {
             CronJobDetailSheet(job: $0)
                 .environmentObject(appState)
         }
+        .sheet(item: $editorTarget) {
+            CronJobEditorSheet(target: $0)
+                .environmentObject(appState)
+        }
+        .sheet(isPresented: $showingBlueprints, onDismiss: {
+            if let createdJob {
+                self.createdJob = nil
+                selectedJob = createdJob
+            }
+        }) {
+            CronBlueprintGallerySheet { createdJob = $0 }
+                .environmentObject(appState)
+        }
+        .alert("Delete scheduled job?", isPresented: Binding(
+            get: { jobPendingDeletion != nil },
+            set: { if !$0 { jobPendingDeletion = nil } }
+        )) {
+            Button("Delete", role: .destructive) {
+                guard let job = jobPendingDeletion else { return }
+                jobPendingDeletion = nil
+                let key = pinKey(job)
+                Task {
+                    let deleted = await appState.deleteCronJob(job)
+                    Haptics.mutationCompleted(deleted)
+                    if deleted {
+                        pinnedRaw = pinKeys.filter { $0 != key }.joined(separator: "\n")
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { jobPendingDeletion = nil }
+        } message: {
+            Text(AppLocalization.string("This removes \(jobPendingDeletion?.displayName ?? "") from Hermes, so it won't run again. Chats from its past runs are kept."))
+        }
     }
 
+    /// New job and From a blueprint, over the list (or in its empty state).
+    private var createButtons: some View {
+        HStack(spacing: 10) {
+            Button {
+                Haptics.light()
+                editorTarget = .create
+            } label: {
+                Label(AppLocalization.string("New job"), systemImage: "plus")
+            }
+            .buttonStyle(.settingsPrimary)
+            Button {
+                Haptics.light()
+                showingBlueprints = true
+            } label: {
+                Label(AppLocalization.string("From a blueprint"), systemImage: "square.grid.2x2")
+            }
+            .buttonStyle(.settings)
+        }
+        .disabled(appState.dashboardTicketBridge == nil)
+    }
+
+    /// Runs are kept out of the All list in Chats, so a job running every
+    /// few minutes doesn't bury the conversations; the Scheduled filter
+    /// there lists them, one tap away.
     private var listFooter: some View {
-        Text(AppLocalization.string("Each run lands in Chats as its own conversation. Ask Hermes to add or change a schedule."))
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-            .padding(.top, 6)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(AppLocalization.string("Each run is saved as its own conversation. Chats lists them under the Scheduled filter. Ask Hermes to add or change a schedule."))
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Button {
+                Haptics.light()
+                shell.showScheduledRuns()
+            } label: {
+                Label(AppLocalization.string("Show runs in Chats"), systemImage: "bubble.left.and.bubble.right")
+                    .scaledFont(.footnote.weight(.semibold))
+            }
+            .buttonStyle(.borderless)
+            .tint(.conduitAccent)
+        }
+        .padding(.top, 6)
     }
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
-            .font(.footnote.weight(.semibold))
+            .scaledFont(.footnote.weight(.semibold))
             .foregroundStyle(.secondary)
             .textCase(nil)
             .accessibilityAddTraits(.isHeader)
@@ -265,6 +354,18 @@ struct V2ScheduledList: View {
         } label: {
             Label(AppLocalization.string("Details"), systemImage: "info.circle")
         }
+        Button {
+            editorTarget = .edit(job)
+        } label: {
+            Label(AppLocalization.string("Edit"), systemImage: "pencil")
+        }
+        .disabled(appState.dashboardTicketBridge == nil)
+        Button(role: .destructive) {
+            jobPendingDeletion = job
+        } label: {
+            Label(AppLocalization.string("Delete"), systemImage: "trash")
+        }
+        .disabled(appState.cronJobActionID != nil)
     }
 
     private func row(_ job: CronJob, pinned: Bool) -> some View {
@@ -277,28 +378,28 @@ struct V2ScheduledList: View {
                     HStack(spacing: 5) {
                         if pinned {
                             Image(systemName: "pin.fill")
-                                .font(.caption2.weight(.bold))
+                                .scaledFont(.caption2.weight(.bold))
                                 .foregroundStyle(Color.conduitAccent)
                                 .accessibilityLabel(AppLocalization.string("Pinned"))
                         }
                         Text(job.displayName)
-                            .font(.body.weight(.semibold))
+                            .scaledFont(.body.weight(.semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
                     }
-                    Text(job.scheduleDisplay ?? job.schedule?.display ?? job.schedule?.expr ?? AppLocalization.string("No schedule"))
-                        .font(.subheadline)
+                    Text(CronScheduleText.describe(job, zoneLabel: scheduleZoneLabel) ?? AppLocalization.string("No schedule"))
+                        .scaledFont(.subheadline)
                         .foregroundStyle(Color.primary.opacity(0.58))
                         .lineLimit(1)
                     HStack(spacing: 5) {
                         Image(systemName: "clock")
-                            .font(.caption.weight(.semibold))
+                            .scaledFont(.caption.weight(.semibold))
                             .conduitFixedGlyph()
                             .accessibilityHidden(true)
                         Text(nextRunLine(job))
                             .lineLimit(1)
                     }
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(job.isActive ? Color.conduitScheduled : Color.primary.opacity(0.45))
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -338,6 +439,17 @@ struct V2ScheduledList: View {
                 )
             }
             .tint(.conduitAccent)
+            // On the side away from Run now, so it isn't hit by accident.
+            // Not a destructive role: that removes the row before the
+            // confirmation is answered.
+            Button {
+                Haptics.light()
+                jobPendingDeletion = job
+            } label: {
+                Label(AppLocalization.string("Delete"), systemImage: "trash")
+            }
+            .tint(.red)
+            .disabled(appState.cronJobActionID != nil)
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             if !job.isFinished {
@@ -364,37 +476,20 @@ struct V2ScheduledList: View {
         }
     }
 
-    /// "Next run in 3 hours", the job's state when it won't run again.
+    /// The profile zone Hermes runs schedules in, when it isn't this
+    /// iPhone's (a schedule's times are that zone's wall clock).
+    private var scheduleZoneLabel: String? {
+        ProfileTimeZone.scheduleZoneLabel(profileSetting: appState.activeProfileTimeZoneSetting)
+    }
+
+    /// "Next run in 3 hours" or "Next run Monday 8:00 AM", the job's state
+    /// when it won't run again.
     private func nextRunLine(_ job: CronJob) -> String {
         guard job.isActive else { return job.statusLabel }
         guard let raw = job.nextRunAt, !raw.isEmpty else { return job.statusLabel }
-        guard let date = Self.parseDate(raw) else {
+        guard let date = CronScheduleText.parseDate(raw) else {
             return AppLocalization.string("Next run \(raw)")
         }
-        let formatter = Self.relativeFormatter
-        formatter.locale = AppLocalization.formattingLocale
-        return AppLocalization.string("Next run \(formatter.localizedString(for: date, relativeTo: Date()))")
-    }
-
-    // Shared per list; rows read them on the main actor only.
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .full
-        return formatter
-    }()
-
-    private static let fractionalISOFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    private static let plainISOFormatter = ISO8601DateFormatter()
-
-    private static func parseDate(_ raw: String) -> Date? {
-        if let date = fractionalISOFormatter.date(from: raw) { return date }
-        if let date = plainISOFormatter.date(from: raw) { return date }
-        if let seconds = Double(raw) { return Date(timeIntervalSince1970: seconds > 10_000_000_000 ? seconds / 1000 : seconds) }
-        return nil
+        return AppLocalization.string("Next run \(CronScheduleText.runTimeText(date))")
     }
 }

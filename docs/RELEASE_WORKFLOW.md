@@ -46,30 +46,16 @@ The PR description should include the marketing version, build number, starting 
 
 Build and test from the release branch itself. Do not test a moving `main` checkout and assume it represents the candidate.
 
-**Which gate certifies a candidate.** Hosted CI is a broad smoke gate — it
-compiles everything and runs a curated slice (`docs/CI.md`) — and is *not* a
-release verdict. A candidate is certified by the **Mac local exhaustive gate**
-(`scripts/local-ci-gate.sh`) run against the **exact release-head SHA**: the
-complete unit and UI suites, the timing/dormancy repeats, and bounded
-infrastructure recovery. Hosted-green on a different SHA certifies nothing, and
-neither does a gate run from before a rebase.
-
-Run it in **release mode** — that is the mode whose coverage the release needs
-(it is also the default, so the flag only has to be explicit when you are *not*
-certifying a release):
-
-```bash
-ssh ios-mac 'bash ~/projects/conduit-gate-tooling/scripts/local-ci-gate.sh \
-  --mode release --ref <exact-release-head-sha>'
-```
-
-Check `gate-result.json` for `"mode": "release"`, `"verdict": "PASS"`,
-`"tested_sha"` equal to the head being shipped, and `"partial": false`. A
-`--mode merge` result is complete for a PR merge but is **not** a release
-certificate: it deliberately omits the repeat/stress policy, which the release
-needs. The SHA registry keeps one authoritative run per `(SHA, mode)`, so a
-merge run earlier in the process does not block the release run for the same
-commit.
+**Which run certifies a candidate.** PR CI (`ci.yml`) is a light smoke gate —
+it compiles the app and runs a curated slice (`docs/CI.md`, CI v5) — and is
+*not* a release verdict. A candidate is validated by **dispatching the Nightly
+workflow on the release branch** (Actions > Nightly > Run workflow, pick the
+branch, or `gh workflow run nightly.yml --ref <release-branch>`): the complete
+unit suite, the timing/dormancy repeats and the complete UI suite on the exact
+release head. Every job must pass. `nightly-rerun.yml` never reruns a
+dispatched run, so the result is the run you dispatched. A Nightly run on a different SHA certifies
+nothing, and neither does one from before a rebase. There is no separate
+release workflow.
 
 If testing finds a bug:
 
@@ -118,6 +104,23 @@ When the release candidate passes final QA:
    ```
 
 4. Archive and upload the app to App Store Connect from that exact tagged commit.
+   Before uploading, check the archive: no shipped binary may weak-import a
+   back-deployed Foundation symbol an early beta lacks (build 251 crashed at
+   launch on iOS 27.2 betas that way; see "Back-deployed Foundation API in
+   shipped targets" in FEATURE_MAP.md), and none may load ActivityKit or
+   ImagePlayground strongly (2.3.0 build 252 didn't launch on macOS 14 that
+   way, issue 1877). Upload only when this passes:
+
+   ```bash
+   python3 scripts/check-weak-imports.py binaries --products <archive>.xcarchive/Products
+   ```
+
+   On the Mac, `conduit-save-dsyms` runs it after shelving the dSYMs. When it
+   fails, it renames the archive to `<name>.xcarchive.blocked-weak-imports`,
+   so `-exportArchive` can't find it, and exits non-zero. The rename is what
+   blocks the upload: the generated per-build scripts don't stop on that exit.
+   A build script that runs the check itself still adds `|| exit 1`, so its own
+   step fails too.
 5. Record the tag, commit SHA, marketing version, and build number in the release PR or release notes.
 6. After the candidate has been uploaded and accepted for release, mark the release PR ready and merge it into `main`.
 

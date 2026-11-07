@@ -43,7 +43,7 @@ struct HermesTurnAttributes: ActivityAttributes {
     /// Conduit's UI language (`AppLanguageStore`), so the activity speaks
     /// the same language as the app.
     var language: String
-    /// Opens the chat (`conduit://session/<id>?profile=<name>`).
+    /// Opens the chat (`conduit://session/<id>?profile=<name>&dashboard=<uuid>`).
     var link: URL
     /// Every id the chat is known under (runtime, stored, lineage), so the
     /// app can tell which chat's events update it after a relaunch.
@@ -53,6 +53,10 @@ struct HermesTurnAttributes: ActivityAttributes {
     /// build decode without them.
     var profileName: String? = nil
     var glowHex: String? = nil
+    /// The saved dashboard the turn ran on (`SavedDashboard.id`), so a
+    /// relaunched Conduit settles it only against that dashboard's live
+    /// sessions. Optional: activities started by an older build have none.
+    var dashboardID: String? = nil
 
     /// The glow color (`#rrggbb` only, as `ProfileGlowRGB.hex` writes it),
     /// nil when there is none or it doesn't parse.
@@ -90,7 +94,7 @@ enum HermesToolCategory: String, Codable, CaseIterable {
         "web_search": .web, "web_extract": .web, "web_crawl": .web,
         "delegate_task": .agents, "memory": .memory, "session_search": .memory,
         "vision_analyze": .images, "image_generate": .images, "text_to_speech": .audio,
-        "todo": .planning, "cronjob": .schedule, "send_message": .messages,
+        "todo": .planning, "cronjob": .schedule, "send_message": .messages, "message_agent": .messages,
         "skill_view": .skills, "skills_list": .skills, "skill_manage": .skills,
     ]
     private static let prefixes: [(String, HermesToolCategory)] = [

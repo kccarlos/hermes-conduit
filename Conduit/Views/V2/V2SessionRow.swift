@@ -6,8 +6,9 @@
 //  between rows than between a row's own lines so each conversation reads
 //  as one block. A Chats row leads with a round icon for where the
 //  conversation came from, the gold unread dot on its corner. Line one is
-//  the title and time; line two a dimmer one-line preview, and a status
-//  glyph and action word only when the row needs one (Running, Approve).
+//  the title and time, with a star before the time on a starred chat; line
+//  two a dimmer one-line preview, and a status glyph and action word only
+//  when the row needs one (Running, Approve).
 //
 
 import SwiftUI
@@ -97,7 +98,7 @@ struct V2StatusGlyph: View {
                     .tint(Color.conduitAccent)
             } else if let symbol = status.symbol {
                 Image(systemName: symbol)
-                    .font(.caption.weight(.semibold))
+                    .scaledFont(.caption.weight(.semibold))
                     .conduitFixedGlyph()
                     .foregroundStyle(status.color)
             }
@@ -115,7 +116,7 @@ struct V2SessionIcon: View {
 
     var body: some View {
         Image(systemName: symbol)
-            .font(.callout.weight(.semibold))
+            .scaledFont(.callout.weight(.semibold))
             .conduitFixedGlyph()
             .foregroundStyle(tint)
             .frame(width: 38, height: 38)
@@ -145,6 +146,13 @@ struct V2SessionIcon: View {
     }
 }
 
+/// The profile a row in All belongs to, on the corner of its icon.
+struct V2ProfileBadge: Equatable {
+    let profile: String
+    let name: String
+    let url: URL?
+}
+
 struct V2SessionRow: View {
     /// Where a Chats row's text starts (16 pt in, the 38 pt icon, 12 pt):
     /// its hairline and nest summary line up here.
@@ -156,7 +164,8 @@ struct V2SessionRow: View {
     let status: V2SessionStatus
     var isUnread = false
     var isPinned = false
-    var isSelected = false
+    var isStarred = false
+    var selection = V2RowSelection.none
     /// Project pages draw the status glyph ahead of the title, in the unread
     /// column, instead of ahead of the preview.
     var leadingGlyph = false
@@ -167,13 +176,31 @@ struct V2SessionRow: View {
     /// A Chats row with its "3 jobs" summary under it: the summary sits
     /// close, as part of this row, rather than a row's gap away.
     var hasNestBelow = false
+    /// All, mixing profiles: whose chat this is. On the icon's corner, or
+    /// without an icon (a project page gathering profiles, issue 1761)
+    /// ahead of the title.
+    var profileBadge: V2ProfileBadge? = nil
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .callout) private var titleFaceSize: CGFloat = 16
 
     var body: some View {
         HStack(alignment: icon == nil ? .top : .center, spacing: 0) {
             if let icon {
                 V2SessionIcon(source: icon, isUnread: isUnread)
+                    .overlay(alignment: .bottomTrailing) {
+                        if let profileBadge {
+                            ProfileAvatarView(
+                                profile: profileBadge.profile,
+                                displayName: profileBadge.name,
+                                url: profileBadge.url,
+                                size: 18
+                            )
+                            .overlay { Circle().strokeBorder(Color.black.opacity(0.35), lineWidth: 1) }
+                            .offset(x: 4, y: 4)
+                            .accessibilityHidden(true)
+                        }
+                    }
                     .padding(.leading, 16)
                     .padding(.trailing, 12)
             } else {
@@ -182,13 +209,31 @@ struct V2SessionRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if icon == nil, let profileBadge {
+                        ProfileAvatarView(
+                            profile: profileBadge.profile,
+                            displayName: profileBadge.name,
+                            url: profileBadge.url,
+                            size: titleFaceSize
+                        )
+                        // On the title's line rather than above its baseline.
+                        .alignmentGuide(.firstTextBaseline) { $0[.bottom] - titleFaceSize * 0.2 }
+                        .accessibilityHidden(true)
+                        .padding(.trailing, -3)
+                    }
                     Text(title)
-                        .font(.callout.weight(.semibold))
+                        .scaledFont(.callout.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
                     Spacer(minLength: 4)
+                    if isStarred {
+                        Image(systemName: "star.fill")
+                            .scaledFont(.caption2)
+                            .foregroundStyle(Color.conduitAccent)
+                            .accessibilityHidden(true)
+                    }
                     Text(time)
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(Color.primary.opacity(0.45))
                         .lineLimit(1)
                         .layoutPriority(1)
@@ -198,13 +243,13 @@ struct V2SessionRow: View {
                         V2StatusGlyph(status: status)
                     }
                     Text(preview)
-                        .font(.subheadline)
+                        .scaledFont(.subheadline)
                         .foregroundStyle(Color.primary.opacity(0.5))
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     if !leadingGlyph, let word = status.actionWord {
                         Text(word)
-                            .font(.footnote.weight(.semibold))
+                            .scaledFont(.footnote.weight(.semibold))
                             .foregroundStyle(status.color)
                             .lineLimit(1)
                             .layoutPriority(1)
@@ -216,16 +261,13 @@ struct V2SessionRow: View {
         .padding(.bottom, hasNestBelow ? 4 : 13)
         .padding(.trailing, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background {
-            if isSelected {
-                Color.primary.opacity(0.05)
-            }
-        }
+        .v2RowSelection(selection)
         .contentShape(Rectangle())
         .dynamicTypeSize(...DynamicTypeSize.listRowCap)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(title))
         .accessibilityValue(Text(accessibilityValue))
+        .v2SelectedTrait(selection)
     }
 
     /// The glyph before the preview. Beside an icon that already names the
@@ -266,10 +308,89 @@ struct V2SessionRow: View {
 
     private var accessibilityValue: String {
         [
+            profileBadge.map { AppLocalization.string("\($0.name) profile") },
             isUnread ? AppLocalization.string("Unread") : nil,
             isPinned ? AppLocalization.string("Pinned") : nil,
+            isStarred ? AppLocalization.string("Starred") : nil,
             status.accessibilityWord,
             preview.isEmpty ? nil : preview,
+            time.isEmpty ? nil : time
+        ]
+        .compactMap { $0 }
+        .joined(separator: ", ")
+    }
+}
+
+/// A chat the search found by its messages: the title, then up to two lines
+/// of the matching text (four at accessibility text sizes) with the matched
+/// words picked out.
+struct V2ContentMatchRow: View {
+    let title: String
+    let time: String
+    let snippet: SessionSearchSnippet
+    var isUnread = false
+    var isStarred = false
+    var selection = V2RowSelection.none
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            ZStack {
+                if isUnread {
+                    Circle()
+                        .fill(Color.conduitAccent)
+                        .frame(width: 7, height: 7)
+                }
+            }
+            .frame(width: 12)
+            .frame(minHeight: 21)
+            .padding(.trailing, 4)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(title)
+                        .scaledFont(.callout.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                    Spacer(minLength: 4)
+                    if isStarred {
+                        Image(systemName: "star.fill")
+                            .scaledFont(.caption2)
+                            .foregroundStyle(Color.conduitAccent)
+                            .accessibilityHidden(true)
+                    }
+                    Text(time)
+                        .scaledFont(.footnote)
+                        .foregroundStyle(Color.primary.opacity(0.45))
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                }
+                if !snippet.runs.isEmpty {
+                    Text(snippet.attributed())
+                        .scaledFont(.subheadline)
+                        .foregroundStyle(Color.primary.opacity(0.58))
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? 4 : 2)
+                }
+            }
+        }
+        .padding(.vertical, 9)
+        .padding(.trailing, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .v2RowSelection(selection)
+        .contentShape(Rectangle())
+        .dynamicTypeSize(...DynamicTypeSize.listRowCap)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(title))
+        .accessibilityValue(Text(accessibilityValue))
+        .v2SelectedTrait(selection)
+    }
+
+    private var accessibilityValue: String {
+        [
+            isUnread ? AppLocalization.string("Unread") : nil,
+            isStarred ? AppLocalization.string("Starred") : nil,
+            snippet.plainText.isEmpty ? nil : snippet.plainText,
             time.isEmpty ? nil : time
         ]
         .compactMap { $0 }
@@ -309,7 +430,10 @@ extension AppState {
     /// the old row showed there (a saved call's engine, the call a job came
     /// from), else the model.
     func v2RowPreview(for session: SessionSummary) -> String {
-        if let preview = session.preview, !preview.isEmpty { return preview }
+        if let preview = session.preview {
+            let plain = PreviewText.plain(preview)
+            if !plain.isEmpty { return plain }
+        }
         return voiceSessionDetail(for: session) ?? session.model
     }
 

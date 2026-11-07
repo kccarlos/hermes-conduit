@@ -87,12 +87,140 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(turns.first?["at"] as? Double, 10)
     }
 
+    func testVoiceHistorySaveGoesInPartsTheHostTakes() async throws {
+        // The plugin takes at most 500 turns and 1 MiB per save
+        // (dashboard/api/voice_calls.py VOICE_MAX_TURNS, VOICE_MAX_BODY_BYTES).
+        let turns = (0..<1_201).map {
+            VoiceTranscriptTurn(index: $0, role: $0 % 2 == 0 ? .user : .assistant, text: "Turn \($0)", at: Date(timeIntervalSince1970: 10))
+        }
+        let script = ScriptedVoiceHistoryRequests()
+        script.responses = [
+            .success(["ok": true, "session_id": "row-1", "written": 500]),
+            .success(["ok": true, "session_id": "row-1", "written": 1_000]),
+            .success(["ok": true, "session_id": "row-1", "written": 1_201]),
+        ]
+        let client = VoiceHistoryClient(request: script.request)
+        let result = try await client.save(
+            VoiceTranscriptSaveRequest(callID: "c1", engine: .gptLive, sessionID: nil, title: "Long call", turns: turns),
+            profile: "default"
+        )
+        XCTAssertEqual(result, VoiceTranscriptSaveResult(sessionID: "row-1", written: 1_201))
+        XCTAssertEqual(script.calls.count, 3)
+        let sent = script.calls.map { ($0.body?["turns"] as? [[String: Any]] ?? []).compactMap { $0["index"] as? Int } }
+        XCTAssertEqual(sent.map(\.count), [500, 500, 201])
+        XCTAssertEqual(sent.flatMap { $0 }, Array(0..<1_201))
+        XCTAssertEqual(script.calls.map { $0.body?["call_id"] as? String }, ["c1", "c1", "c1"])
+        // The first save makes the row; the rest append to it.
+        XCTAssertEqual(script.calls.map { $0.body?["session_id"] as? String }, [nil, "row-1", "row-1"])
+        XCTAssertEqual(script.calls.first?.body?["title"] as? String, "Long call")
+
+        // A call kept with a chat goes to the chat each time.
+        let chat = ScriptedVoiceHistoryRequests()
+        chat.responses = [
+            .success(["ok": true, "chat_id": "chat-1", "written": 500]),
+            .success(["ok": true, "chat_id": "chat-1", "written": 600]),
+        ]
+        let chatResult = try await VoiceHistoryClient(request: chat.request).save(
+            VoiceTranscriptSaveRequest(callID: "c2", engine: .gptLive, sessionID: nil, title: nil,
+                                       turns: Array(turns.prefix(600)), chatID: "chat-1", chatProfile: "coder"),
+            profile: "default"
+        )
+        XCTAssertEqual(chatResult, VoiceTranscriptSaveResult(sessionID: nil, written: 600, chatID: "chat-1"))
+        XCTAssertEqual(chat.calls.map { $0.body?["chat_id"] as? String }, ["chat-1", "chat-1"])
+        XCTAssertEqual(chat.calls.map(\.path), Array(repeating: DashboardPath.withProfile(VoiceHistoryClient.sessionsPath, profile: "coder"), count: 2))
+
+        // A plugin that makes a row for the chat's first part: the rest
+        // append to that row in the chat's profile, where it is.
+        let rowed = ScriptedVoiceHistoryRequests()
+        rowed.responses = [
+            .success(["ok": true, "session_id": "row-9", "written": 500]),
+            .success(["ok": true, "session_id": "row-9", "written": 600]),
+        ]
+        _ = try await VoiceHistoryClient(request: rowed.request).save(
+            VoiceTranscriptSaveRequest(callID: "c5", engine: .gptLive, sessionID: nil, title: nil,
+                                       turns: Array(turns.prefix(600)), chatID: "chat-1", chatProfile: "coder"),
+            profile: "default"
+        )
+        XCTAssertEqual(rowed.calls.map { $0.body?["session_id"] as? String }, [nil, "row-9"])
+        XCTAssertEqual(rowed.calls.map(\.path), Array(repeating: DashboardPath.withProfile(VoiceHistoryClient.sessionsPath, profile: "coder"), count: 2))
+
+        // Long turns: every body stays under 1 MiB.
+        let long = (0..<40).map {
+            VoiceTranscriptTurn(index: $0, role: .assistant, text: String(repeating: "é", count: 16_000), at: Date(timeIntervalSince1970: 10))
+        }
+        let sized = ScriptedVoiceHistoryRequests()
+        sized.responses = (1...40).map { .success(["ok": true, "session_id": "row-2", "written": $0]) }
+        _ = try await VoiceHistoryClient(request: sized.request).save(
+            VoiceTranscriptSaveRequest(callID: "c3", engine: .gptLive, sessionID: "row-2", title: nil, turns: long),
+            profile: "default"
+        )
+        XCTAssertGreaterThan(sized.calls.count, 1)
+        for call in sized.calls {
+            let bytes = try JSONSerialization.data(withJSONObject: try XCTUnwrap(call.body)).count
+            XCTAssertLessThan(bytes, 1024 * 1024)
+        }
+        XCTAssertEqual(sized.calls.flatMap { ($0.body?["turns"] as? [[String: Any]] ?? []).compactMap { $0["index"] as? Int } }, Array(0..<40))
+
+        // A part the host refuses fails the save: retried, the host skips
+        // the turns it already has.
+        let failing = ScriptedVoiceHistoryRequests()
+        failing.responses = [
+            .success(["ok": true, "session_id": "row-3", "written": 500]),
+            .failure(DashboardTicketBridgeError.http(status: 503, detail: "busy")),
+        ]
+        do {
+            _ = try await VoiceHistoryClient(request: failing.request).save(
+                VoiceTranscriptSaveRequest(callID: "c4", engine: .gptLive, sessionID: nil, title: "Long call", turns: turns),
+                profile: "default"
+            )
+            XCTFail("A refused part fails the save")
+        } catch {}
+        XCTAssertEqual(failing.calls.count, 2)
+    }
+
+    func testRecorderClipsAScreenTurnToWhatTheHostKeeps() throws {
+        let recorder = RecorderHarness().makeRecorder()
+        let markdown = "Here's the script:\n\n```swift\n" + String(repeating: "let value = 42\n", count: 1_300)
+        let card = VoiceScreenCard(id: UUID(), title: "Script", markdown: markdown,
+                                   callAnchor: VoiceJobCallAnchor(callID: UUID(), transcriptIndex: 0), shownAt: Date())
+        recorder.screen(card)
+        let text = try XCTUnwrap(recorder.turns.last?.text)
+        // dashboard/api/voice_calls.py VOICE_MAX_TURN_CHARS
+        XCTAssertLessThanOrEqual(text.count, 16_000)
+        XCTAssertTrue(text.hasPrefix("Script\n\nHere's the script:"))
+        XCTAssertTrue(text.hasSuffix("\n```"), "The cut closes the code block it left open")
+
+        // The cut counts code points, as the plugin does: 9,000 "é" written
+        // as "e" plus a combining accent are 18,000 code points.
+        let accents = String(repeating: "e\u{0301}", count: 9_000)
+        let clipped = VoiceTranscriptRecorder.clipped(accents)
+        XCTAssertLessThanOrEqual(clipped.unicodeScalars.count, VoiceTranscriptRecorder.maxTurnCharacters)
+        XCTAssertTrue(accents.hasPrefix(clipped))
+        // One character longer than the limit on its own is cut too.
+        let one = "e" + String(repeating: "\u{0301}", count: 20_000)
+        XCTAssertLessThanOrEqual(VoiceTranscriptRecorder.clipped(one).unicodeScalars.count, VoiceTranscriptRecorder.maxTurnCharacters)
+        XCTAssertEqual(VoiceTranscriptRecorder.clipped("Short"), "Short")
+        // A long fence left open gets a closer as long, still within the
+        // limit; a ``` line inside it doesn't close it.
+        let fence = String(repeating: "`", count: 30)
+        let nested = VoiceTranscriptRecorder.clipped(fence + "md\n```\n" + String(repeating: "z\n", count: 9_000))
+        XCTAssertLessThanOrEqual(nested.unicodeScalars.count, VoiceTranscriptRecorder.maxTurnCharacters)
+        XCTAssertTrue(nested.hasSuffix("\n" + fence))
+
+        // Spoken lines are as they were.
+        recorder.note("Short line")
+        XCTAssertEqual(recorder.turns.last?.text, "Short line")
+    }
+
     func testVoiceHistoryMapsThePluginsStatuses() {
         XCTAssertEqual(VoiceHistoryClient.mapped(.http(status: 404, detail: "")), .pluginMissing)
         XCTAssertEqual(VoiceHistoryClient.mapped(.http(status: 501, detail: "")), .unsupported)
         XCTAssertEqual(VoiceHistoryClient.mapped(.http(status: 409, detail: "")), .busy)
         XCTAssertEqual(VoiceHistoryClient.mapped(.http(status: 422, detail: "")), .rowUnavailable)
         XCTAssertNil(VoiceHistoryClient.mapped(.http(status: 500, detail: "")))
+        // A profile that turned the plugin off isn't a host that can't save
+        // calls: the call waits, and the error says how to turn it on (issue 1671).
+        XCTAssertNil(VoiceHistoryClient.mapped(.http(status: 404, detail: "Plugin not found")))
     }
 
     func testVoiceHistoryParsesTagsAndSkipsUnknownKinds() throws {
@@ -109,6 +237,23 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertNil(tags["d"])
         XCTAssertNil(tags["e"])
         XCTAssertThrowsError(try VoiceHistoryClient.tags(from: ["ok": false]))
+    }
+
+    func testVoiceHistoryParsesEveryChatsCallsAndSkipsBadEntries() {
+        let calls = VoiceHistoryClient.hostChatCalls(from: ["ok": true, "tags": [String: Any](), "chat_calls": [
+            ["call_id": "c1", "chat_id": "chat-1", "engine": "gpt-live", "started_at": 1_000, "ended_at": 1_095.5],
+            ["call_id": "c2", "chat_id": "chat-2", "started_at": 2_000],
+            ["call_id": "c3", "chat_id": "chat-3"],
+            ["call_id": "", "chat_id": "chat-4", "started_at": 1],
+            "not a call"
+        ] as [Any]])
+        XCTAssertEqual(calls, [
+            VoiceHostChatCall(callID: "c1", chatID: "chat-1", startedAt: Date(timeIntervalSince1970: 1_000),
+                              endedAt: Date(timeIntervalSince1970: 1_095.5)),
+            VoiceHostChatCall(callID: "c2", chatID: "chat-2", startedAt: Date(timeIntervalSince1970: 2_000),
+                              endedAt: Date(timeIntervalSince1970: 2_000))
+        ])
+        XCTAssertEqual(VoiceHistoryClient.hostChatCalls(from: ["ok": true, "tags": [String: Any]()]), [], "an older plugin")
     }
 
     func testVoiceHistorySummaryNeedsTextAndCoveredTurns() {
@@ -458,9 +603,7 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(AppState.missingLinkedBotMessage(for: .idle), AppLocalization.string("Could not load bots."))
 
         // Offline, the link asks for a connection instead.
-        let suite = "VoiceBotLinkOffline.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let defaults = makeScratchDefaults("VoiceBotLinkOffline")
         let appState = AppState(defaults: defaults, loadSavedConnection: false)
         XCTAssertFalse(appState.isConnected)
         appState.openAppLink(.bot(profile: "fam"))
@@ -516,13 +659,13 @@ extension HermesVoiceGatewayTimeoutTests {
     func testVoiceFiltersJoinASavedOrderAfterChat() {
         XCTAssertEqual(
             AppState.normalizedSessionFilterOrder(["telegram", "chat", "discord", "api", "webhook", "other"]),
-            [.telegram, .chat, .voice, .voiceJob, .discord, .api, .webhook, .cron, .other]
+            [.telegram] + SessionSource.gatewayPlatforms + [.chat, .voice, .voiceJob, .discord, .api, .webhook, .cron, .other]
         )
         XCTAssertEqual(AppState.normalizedSessionFilterOrder([]), AppState.defaultSessionFilterOrder)
         // A moved Voice filter keeps its place.
         XCTAssertEqual(
             AppState.normalizedSessionFilterOrder(["voice", "chat", "voice_job", "discord", "telegram", "api", "webhook", "other"]),
-            [.voice, .chat, .voiceJob, .discord, .telegram, .api, .webhook, .cron, .other]
+            [.voice, .chat, .voiceJob, .discord, .telegram] + SessionSource.gatewayPlatforms + [.api, .webhook, .cron, .other]
         )
     }
 }
@@ -531,9 +674,7 @@ extension HermesVoiceGatewayTimeoutTests {
 
 extension HermesVoiceGatewayTimeoutTests {
     func testOutboxKeepsCallsAHostCantSaveYetAndSavesThemOnceItCan() async throws {
-        let suite = "VoiceOutboxBlockedHost.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let defaults = makeScratchDefaults("VoiceOutboxBlockedHost")
         defaults.set("default", forKey: "conduit.activeProfile")
         let appState = AppState(defaults: defaults, loadSavedConnection: false)
         appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
@@ -562,6 +703,76 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertTrue(VoiceTranscriptOutbox.load(from: defaults).entries.isEmpty)
         XCTAssertEqual(appState.pendingVoiceCallSaves, 0)
         XCTAssertFalse(appState.voiceCallSavesBlocked)
+    }
+}
+
+// MARK: - A call the host refuses doesn't hold up the rest
+
+extension HermesVoiceGatewayTimeoutTests {
+    func testRefusedLocalLiveCallIsKeptAndTheCallsBehindItStillSave() async throws {
+        let defaults = makeScratchDefaults("VoiceOutboxRefusedCall")
+        defaults.set("default", forKey: "conduit.activeProfile")
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
+        let script = ScriptedVoiceHistoryRequests()
+        appState.voiceHistoryClient = VoiceHistoryClient(request: script.request)
+        let dashboard = appState.activeDashboardID?.uuidString ?? "-"
+        let turn = VoiceTranscriptTurn(index: 0, role: .user, text: "Hi", at: Date())
+        var outbox = VoiceTranscriptOutbox()
+        for (id, engine) in [("local", VoiceCallEngine.localLive), ("gemini", .geminiLive)] {
+            outbox.add(.init(
+                dashboard: dashboard, profile: appState.activeProfile,
+                request: VoiceTranscriptSaveRequest(callID: id, engine: engine, sessionID: nil, title: "Call", turns: [turn]),
+                queuedAt: Date()
+            ))
+        }
+        outbox.store(in: defaults)
+
+        // A plugin before 0.44.1 refuses the local-live engine.
+        script.responses = [
+            .failure(DashboardTicketBridgeError.http(status: 400, detail: "engine is missing or invalid")),
+            .success(["ok": true, "session_id": "row-1", "written": 1])
+        ]
+        await appState.saveQueuedVoiceCallsNow()
+
+        XCTAssertEqual(script.calls.count, 2, "the refused call doesn't stop the one behind it")
+        XCTAssertEqual(VoiceTranscriptOutbox.load(from: defaults).entries.map(\.request.callID), ["local"], "the refused call is kept")
+        XCTAssertEqual(appState.pendingVoiceCallSaves, 1)
+        XCTAssertTrue(appState.voiceCallSavesBlocked, "Voice settings asks for a plugin update")
+        let result = try XCTUnwrap(appState.voiceCallSaveNowResult, "Save Now says what happened")
+        XCTAssertTrue(result.contains("engine is missing or invalid"), result)
+
+        // Once the plugin takes it, the card clears with nothing left to say.
+        script.responses = [.success(["ok": true, "session_id": "row-2", "written": 1])]
+        await appState.saveQueuedVoiceCallsNow()
+        XCTAssertTrue(VoiceTranscriptOutbox.load(from: defaults).entries.isEmpty)
+        XCTAssertFalse(appState.voiceCallSavesBlocked)
+        XCTAssertNil(appState.voiceCallSaveNowResult)
+    }
+
+    func testSaveNowSaysWhyNothingSavedWhenHermesFails() async throws {
+        let defaults = makeScratchDefaults("VoiceOutboxSaveNowFailure")
+        defaults.set("default", forKey: "conduit.activeProfile")
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
+        let script = ScriptedVoiceHistoryRequests()
+        appState.voiceHistoryClient = VoiceHistoryClient(request: script.request)
+        var outbox = VoiceTranscriptOutbox()
+        outbox.add(.init(
+            dashboard: appState.activeDashboardID?.uuidString ?? "-", profile: appState.activeProfile,
+            request: VoiceTranscriptSaveRequest(callID: "c1", engine: .gptLive, sessionID: nil, title: "Call",
+                                                turns: [VoiceTranscriptTurn(index: 0, role: .user, text: "Hi", at: Date())]),
+            queuedAt: Date()
+        ))
+        outbox.store(in: defaults)
+
+        script.responses = [.failure(DashboardTicketBridgeError.http(status: 500, detail: ""))]
+        await appState.saveQueuedVoiceCallsNow()
+
+        XCTAssertEqual(appState.pendingVoiceCallSaves, 1)
+        XCTAssertFalse(appState.voiceCallSavesBlocked, "a server error isn't a missing plugin")
+        let result = try XCTUnwrap(appState.voiceCallSaveNowResult)
+        XCTAssertTrue(result.contains("500"), result)
     }
 }
 
@@ -596,6 +807,45 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(links.merge(into: merged, chatIDs: ["st-1"], openIDs: ["st-1"], profile: "default").count, 3)
         // A call later than every message goes last.
         XCTAssertEqual(links.merge(into: Array(history.prefix(1)), chatIDs: ["st-1"], openIDs: ["st-1"], profile: "default").last?.id, "voice-call-c1")
+    }
+
+    func testCallsAnotherDeviceKeptWithAChatGetTheirCardsHere() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let iso = ISO8601DateFormatter()
+        var links = VoiceCallChatLinks()
+        links.add(chatLink(call: "mine", row: "", chat: "rt-1", stored: "st-1", at: start.addingTimeInterval(600)))
+        let host = [
+            VoiceHostChatCall(callID: "mine", chatID: "st-1", startedAt: start.addingTimeInterval(600), endedAt: start.addingTimeInterval(700)),
+            VoiceHostChatCall(callID: "theirs", chatID: "st-1", startedAt: start, endedAt: start.addingTimeInterval(90)),
+            VoiceHostChatCall(callID: "elsewhere", chatID: "st-2", startedAt: start, endedAt: start)
+        ]
+        XCTAssertTrue(links.adopt(host, profile: "default") { $0 == "st-1" ? "Build" : nil })
+        XCTAssertFalse(links.adopt(host, profile: "default") { _ in nil }, "known calls aren't added twice")
+        XCTAssertEqual(links.links.map(\.callID), ["theirs", "elsewhere", "mine"], "in the order the calls started")
+        let theirs = links.links.first
+        XCTAssertEqual(theirs?.storedWithChat, true)
+        XCTAssertEqual(theirs?.chatTitle, "Build")
+        XCTAssertEqual(links.links[1].chatTitle, "")
+
+        let history = [ChatMessage(id: "a", role: .user, content: "later", timestamp: iso.string(from: start.addingTimeInterval(60)))]
+        let merged = links.merge(into: history, chatIDs: ["st-1"], openIDs: ["st-1"], profile: "default")
+        XCTAssertEqual(merged.map(\.id), ["voice-call-theirs", "a", "voice-call-mine"])
+        XCTAssertEqual(links.chatIDs(profile: "default"), ["st-1", "st-2"])
+        XCTAssertEqual(links.chatIDs(profile: "work"), [])
+    }
+
+    func testAdoptedCallsKeepTheLinkCap() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var links = VoiceCallChatLinks()
+        links.add(chatLink(call: "newest", row: "", chat: "rt", stored: "st", at: start.addingTimeInterval(10_000)))
+        let host = (0..<VoiceCallChatLinks.maximumLinks).map {
+            VoiceHostChatCall(callID: "c\($0)", chatID: "st", startedAt: start.addingTimeInterval(Double($0)), endedAt: start)
+        }
+        XCTAssertTrue(links.adopt(host, profile: "default") { _ in nil })
+        XCTAssertEqual(links.links.count, VoiceCallChatLinks.maximumLinks)
+        XCTAssertEqual(links.links.first?.callID, "c1", "the oldest call goes first")
+        XCTAssertEqual(links.links.last?.callID, "newest")
+        XCTAssertFalse(links.adopt(host, profile: "default") { _ in nil }, "the call the cap dropped is no change")
     }
 
     func testCallTranscriptLeadsBackToItsChatAndNeverShowsTheChatsCard() {
@@ -679,9 +929,7 @@ extension HermesVoiceGatewayTimeoutTests {
                 lineageRootId: nil
             )
         }
-        let suite = "VoiceChatOwnIDs.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let defaults = makeScratchDefaults("VoiceChatOwnIDs")
         defaults.set("default", forKey: "conduit.activeProfile")
         let index = ConversationIdentityIndex()
         let appState = AppState(defaults: defaults, loadSavedConnection: false, conversationIdentityIndex: index)
@@ -791,9 +1039,7 @@ extension HermesVoiceGatewayTimeoutTests {
 
 extension HermesVoiceGatewayTimeoutTests {
     func testCallSavedFromTheOutboxStillGetsItsChatMarker() async throws {
-        let suite = "VoiceOutboxChatLink.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let defaults = makeScratchDefaults("VoiceOutboxChatLink")
         defaults.set("default", forKey: "conduit.activeProfile")
         let appState = AppState(defaults: defaults, loadSavedConnection: false)
         appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
@@ -938,6 +1184,82 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(harness.requests.first?.chatProfile, "coder")
         recorder.capture(said + [entry(.user, "Bye")], unsettled: [])
         XCTAssertEqual(recorder.outboxRequest?.chatProfile, "coder")
+    }
+
+    func testABotChatsCallMadeIntoARowKeepsSavingToTheBotsProfile() async {
+        let harness = RecorderHarness()
+        let recorder = harness.makeRecorder()
+        recorder.chatID = "st-bot"
+        recorder.chatProfile = "coder"
+        // A plugin that predates chat calls makes a row of it, in the bot's profile.
+        harness.results = [.success(VoiceTranscriptSaveResult(sessionID: "row-1", written: 1))]
+        let hello = entry(.user, "Hello")
+        recorder.capture([hello], unsettled: [])
+        await recorder.flush()
+        XCTAssertNil(harness.requests[0].rowProfile, "the first save goes by the chat's profile")
+        XCTAssertEqual(recorder.rowProfile, "coder")
+
+        let bye = entry(.user, "Bye")
+        recorder.capture([hello, bye], unsettled: [])
+        XCTAssertEqual(recorder.outboxRequest?.rowProfile, "coder")
+        await recorder.flush()
+        XCTAssertEqual(harness.requests[1].sessionID, "row-1")
+        XCTAssertEqual(harness.requests[1].rowProfile, "coder")
+        XCTAssertEqual(recorder.savedCallReplay?.rowProfile, "coder")
+
+        // A reconnect goes on in the same row.
+        let reconnect = harness.makeRecorder(continuing: recorder)
+        let more = entry(.user, "One more")
+        reconnect.capture([more], unsettled: [])
+        await reconnect.flush()
+        XCTAssertEqual(harness.requests[2].sessionID, "row-1")
+        XCTAssertEqual(harness.requests[2].rowProfile, "coder")
+
+        // The row is gone: the call is kept with its chat again.
+        harness.results = [.failure(VoiceHistoryError.rowUnavailable)]
+        reconnect.capture([more, entry(.user, "Last")], unsettled: [])
+        await reconnect.flush()
+        XCTAssertNil(reconnect.rowProfile)
+        XCTAssertNil(harness.requests.last?.sessionID)
+        XCTAssertNil(harness.requests.last?.rowProfile)
+        XCTAssertEqual(harness.requests.last?.chatProfile, "coder")
+    }
+
+    func testABotChatsCallMadeIntoARowIsSavedThereFromTheOutbox() async throws {
+        let harness = RecorderHarness()
+        let recorder = harness.makeRecorder()
+        recorder.chatID = "st-bot"
+        recorder.chatProfile = "coder"
+        // A plugin that predates chat calls makes a row of it, in the bot's profile.
+        harness.results = [.success(VoiceTranscriptSaveResult(sessionID: "row-1", written: 1))]
+        let hello = entry(.user, "Hello")
+        recorder.capture([hello], unsettled: [])
+        await recorder.flush()
+        XCTAssertEqual(harness.requests.first?.chatProfile, "coder")
+        recorder.capture([hello, entry(.user, "Bye")], unsettled: [])
+        let request = try XCTUnwrap(recorder.outboxRequest)
+        XCTAssertEqual(request.sessionID, "row-1")
+
+        let defaults = makeScratchDefaults("VoiceOutboxBotChatRow")
+        defaults.set("default", forKey: "conduit.activeProfile")
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
+        let script = ScriptedVoiceHistoryRequests()
+        appState.voiceHistoryClient = VoiceHistoryClient(request: script.request)
+        var outbox = VoiceTranscriptOutbox()
+        outbox.add(.init(
+            dashboard: appState.activeDashboardID?.uuidString ?? "-", profile: appState.activeProfile,
+            request: request, queuedAt: Date()
+        ))
+        outbox.store(in: defaults)
+
+        script.responses = [.success(["ok": true, "session_id": "row-1", "written": 2])]
+        await appState.saveQueuedVoiceCallsNow()
+
+        XCTAssertEqual(script.calls.first?.path, DashboardPath.withProfile(VoiceHistoryClient.sessionsPath, profile: "coder"),
+                       "appended to the row where it was made, not on the call's profile")
+        XCTAssertEqual(script.calls.first?.body?["session_id"] as? String, "row-1")
+        XCTAssertTrue(VoiceTranscriptOutbox.load(from: defaults).entries.isEmpty)
     }
 
     func testVoiceHistoryReadsAChatsCalls() async throws {
@@ -1094,5 +1416,34 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(links.merge(into: [], chatIDs: ["st-1"], openIDs: ["st-1", ""], profile: "default").map(\.id), ["voice-call-c1"])
         // Nothing nests under the call: it has no row.
         XCTAssertNil(links.chatKey(forCallIDs: ["", "st-1"], profile: "default"))
+    }
+}
+
+// MARK: - Cards a live model showed
+
+extension HermesVoiceGatewayTimeoutTests {
+    func testRecorderKeepsWhatTheLiveModelShowedWithItsCards() throws {
+        let harness = RecorderHarness()
+        let recorder = harness.makeRecorder()
+        let normalized: [[String: Any]] = [["type": "place", "places": [["name": "Tartine"]]]]
+        let card = VoiceScreenCard(
+            id: UUID(), title: "Breakfast", markdown: "", callAnchor: VoiceJobCallAnchor(callID: UUID(), transcriptIndex: 0),
+            shownAt: Date(), cards: RichCard.cards(normalized), cardsJSON: try JSONSerialization.data(withJSONObject: normalized)
+        )
+        recorder.screen(card)
+        let turn = try XCTUnwrap(recorder.turns.last)
+        XCTAssertEqual(turn.role, .assistant)
+        XCTAssertEqual(turn.text, "Breakfast")
+        let sent = try XCTUnwrap(turn.payload["cards"] as? [[String: Any]])
+        XCTAssertEqual((sent.first?["places"] as? [[String: Any]])?.first?["name"] as? String, "Tartine")
+
+        let table = VoiceScreenCard(id: UUID(), title: "Forecast", markdown: "| Day | High |", callAnchor: card.callAnchor, shownAt: Date())
+        recorder.screen(table)
+        XCTAssertEqual(recorder.turns.last?.text, "Forecast\n\n| Day | High |")
+        XCTAssertNil(recorder.turns.last?.payload["cards"], "Markdown alone sends no cards")
+
+        // The outbox keeps turns as Codable: the cards survive it.
+        let decoded = try JSONDecoder().decode(VoiceTranscriptTurn.self, from: JSONEncoder().encode(turn))
+        XCTAssertEqual(decoded, turn)
     }
 }

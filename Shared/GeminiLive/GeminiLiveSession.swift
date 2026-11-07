@@ -99,11 +99,34 @@ extension GeminiLiveSocket {
 private final class GeminiLiveSocketDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: GeminiLiveServerClose?
+    private var refusedRedirect: Int?
 
     var serverClose: GeminiLiveServerClose? {
         lock.lock()
         defer { lock.unlock() }
         return recorded
+    }
+
+    /// The 3xx of a redirect this socket refused to follow.
+    var redirectStatus: Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return refusedRedirect
+    }
+
+    /// Never followed: a redirect would carry the upgrade's headers (the
+    /// relay's dashboard credentials) to wherever it points.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        lock.lock()
+        refusedRedirect = response.statusCode
+        lock.unlock()
+        completionHandler(nil)
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
@@ -126,10 +149,19 @@ final class URLSessionGeminiLiveSocket: GeminiLiveSocket {
     }
 
     /// `request` carries any headers the upgrade needs (Cloudflare Access
-    /// in front of the Hermes dashboard, for Grok Live's relay).
+    /// in front of the Hermes dashboard and, for a native sign-in, its
+    /// bearer, for Grok Live's relay). Nothing else is added: the session
+    /// keeps no cookies and follows no redirect, whether the socket goes to
+    /// the relay or to Google.
     init(request: URLRequest) {
         // A session of its own, so its delegate hears this socket's close.
-        session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        configuration.urlCache = nil
+        configuration.urlCredentialStorage = nil
+        session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         task = session.webSocketTask(with: request)
         // Model audio frames are larger than URLSession's 1 MB default.
         task.maximumMessageSize = 16 * 1024 * 1024
@@ -170,6 +202,9 @@ final class URLSessionGeminiLiveSocket: GeminiLiveSocket {
                 return GeminiLiveServerClose(code: task.closeCode.rawValue, reason: text)
             }
             // No close frame, but the upgrade itself was refused.
+            if let redirect = delegate.redirectStatus {
+                return GeminiLiveServerClose(code: redirect, reason: "", isHTTPStatus: true)
+            }
             if let http = task.response as? HTTPURLResponse, http.statusCode != 101 {
                 return GeminiLiveServerClose(code: http.statusCode, reason: "", isHTTPStatus: true)
             }
@@ -216,6 +251,11 @@ final class GeminiLiveSession {
     /// A new connection took over. Function calls opened on the previous
     /// connection can no longer be answered on this one.
     var onConnectionReplaced: (@MainActor () -> Void)?
+    /// Privacy-safe steps for the call's trace. Only Qwen's socket reports
+    /// them (its server's turn detection, #1418); Gemini sends no such events.
+    var onTrace: (@MainActor (String) -> Void)?
+    /// The connection that already traced dropping microphone audio.
+    private var tracedAudioDrop: UUID?
     /// Counts connections that took over: a function call made under one
     /// value can't be answered once it changes.
     private(set) var connectionGeneration = 0
@@ -232,7 +272,7 @@ final class GeminiLiveSession {
     private var startingFresh: Bool?
 
     private let tokens: GeminiLiveTokenProviding
-    private let openSocket: @MainActor (URL) -> GeminiLiveSocket
+    private let openSocket: @MainActor (URLRequest) -> GeminiLiveSocket
     private let systemInstruction: String
     private let functions: [GeminiLiveProtocol.FunctionDeclaration]
     /// Whether this session's lookups use Google Search at all (the user may
@@ -245,7 +285,19 @@ final class GeminiLiveSession {
     /// `Task.yield` settles cannot always cover on a loaded runner.
     private let reconnectDelay: @MainActor @Sendable (Int) async throws -> Void
 
-    private var socket: GeminiLiveSocket?
+    private var socket: GeminiLiveSocket? {
+        // Frames queued for a socket that's no longer the session's fail
+        // instead of going out on it. The old writer is let go before it
+        // fails them: a failure handler that sends again gets a writer for
+        // the new socket, which must outlive this.
+        didSet {
+            guard let old = writer, old.socket !== socket else { return }
+            writer = nil
+            old.close()
+        }
+    }
+    /// Sends the current socket's frames in order, with bounded audio.
+    private var writer: LiveVoiceSocketWriter?
     /// Identity of the connection whose frames are current. Frames from any
     /// other connection are ignored.
     private var connectionID = UUID()
@@ -260,6 +312,7 @@ final class GeminiLiveSession {
     private var handoffReceiveTask: Task<Void, Never>?
     private var connectTask: Task<Void, Never>?
     private var hasConnectedOnce = false
+    private(set) var transcribesWholeUtterances = false
     /// The connection still waiting for setupComplete, and which attempt it
     /// is. A socket that closes before setup is a failed attempt, not a
     /// lost connection, so it counts toward the retry limit.
@@ -277,7 +330,7 @@ final class GeminiLiveSession {
         functions: [GeminiLiveProtocol.FunctionDeclaration],
         googleSearch: Bool = true,
         voice: String? = nil,
-        openSocket: @escaping @MainActor (URL) -> GeminiLiveSocket = { URLSessionGeminiLiveSocket(url: $0) },
+        openSocket: @escaping @MainActor (URLRequest) -> GeminiLiveSocket = { URLSessionGeminiLiveSocket(request: $0) },
         reconnectDelay: @escaping @MainActor @Sendable (Int) async throws -> Void = { attempt in
             try await Task.sleep(for: .seconds(min(8, 1 << attempt)))
         }
@@ -346,15 +399,29 @@ final class GeminiLiveSession {
             return
         }
         let id = connectionID
-        Task { [weak self] in
-            do {
-                try await socket.send(text)
+        let queued = socketWriter(for: socket).enqueue([text], isAudio: message.isAudio) { [weak self] error in
+            guard let error else {
                 onSent?()
-            } catch {
-                onFailure?()
-                self?.connectionFailed(id, error: error)
+                return
             }
+            onFailure?()
+            // A closed writer's frames belong to a connection already gone.
+            if !(error is CancellationError) { self?.connectionFailed(id, error: error) }
         }
+        if !queued {
+            if message.isAudio, let onTrace, tracedAudioDrop != id {
+                tracedAudioDrop = id
+                onTrace("Microphone audio dropped: the connection fell behind")
+            }
+            onFailure?()
+        }
+    }
+
+    private func socketWriter(for socket: GeminiLiveSocket) -> LiveVoiceSocketWriter {
+        if let writer, writer.socket === socket { return writer }
+        let writer = LiveVoiceSocketWriter(socket: socket)
+        self.writer = writer
+        return writer
     }
 
     // MARK: Connection
@@ -379,7 +446,23 @@ final class GeminiLiveSession {
             return
         }
         guard !Task.isCancelled, state != .stopped else { return }
-        let socket = openSocket(token.connectURL)
+        let socket: GeminiLiveSocket
+        transcribesWholeUtterances = token.isQwen
+        if token.isQwen {
+            // Qwen has no Google resumption handle. A reconnect must tell
+            // the controller to restore context instead of claiming resume.
+            resumptionHandle = nil
+            if hasConnectedOnce { startingFresh = true }
+            do {
+                let request = try QwenLiveSocket.request(token: token)
+                socket = QwenLiveSocket(upstream: openSocket(request), voice: voice.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 } ?? token.qwenVoice, onTrace: onTrace)
+            } catch {
+                fail(UserFacingError.message(for: error))
+                return
+            }
+        } else {
+            socket = openSocket(URLRequest(url: token.connectURL))
+        }
         let id = UUID()
         let setup = GeminiLiveProtocol.setupMessage(
             model: token.model,
@@ -511,6 +594,10 @@ final class GeminiLiveSession {
 
     private func connectionFailed(_ id: UUID, error: Error, serverClose: GeminiLiveServerClose? = nil) {
         guard state != .stopped, !isFailed else { return }
+        if error is QwenLiveError {
+            fail(UserFacingError.message(for: error))
+            return
+        }
         if id == handoffID {
             handoffFailed(error: error, serverClose: serverClose)
             return
@@ -582,7 +669,7 @@ final class GeminiLiveSession {
             // The current connection keeps serving while a fresh session
             // sets up to take over.
             if startFreshIfResumptionRefused(serverClose, attempt: attempt, heardDropout: false) { return }
-            fail(Self.refusalMessage(serverClose))
+            fail(Self.refusalMessage(serverClose, provider: tokens.directProvider))
             return
         }
         if let serverClose { lastSetupClose = serverClose }
@@ -612,7 +699,7 @@ final class GeminiLiveSession {
         // still serves, so the user heard no break.
         let heardDropout = !(isHandingOff && socket != nil)
         if startFreshIfResumptionRefused(close, attempt: attempt, heardDropout: heardDropout) { return }
-        fail(Self.refusalMessage(close))
+        fail(Self.refusalMessage(close, provider: tokens.directProvider))
     }
 
     /// A setup that carried a resumption handle was refused because Google
@@ -636,7 +723,10 @@ final class GeminiLiveSession {
 
     /// What a final refusal says: plain words for the cases people hit,
     /// Google's own reason for the rest.
-    static func refusalMessage(_ close: GeminiLiveServerClose) -> String {
+    static func refusalMessage(_ close: GeminiLiveServerClose, provider: DirectLiveProvider = .gemini) -> String {
+        if provider == .qwen {
+            return AppLocalization.string("Qwen Live refused the connection: \(close.summary)")
+        }
         if close.isResumptionLost {
             return AppLocalization.string("Gemini Live lost this conversation on its side. Tap Try again to start a new one.")
         }
@@ -646,9 +736,9 @@ final class GeminiLiveSession {
     private func retry(after attempt: Int, error: Error) async {
         guard attempt < Self.maximumReconnectAttempts else {
             if let close = lastSetupClose {
-                fail(AppLocalization.string("Couldn't connect to Gemini Live: \(close.summary)"))
+                fail(tokens.directProvider == .qwen ? AppLocalization.string("Couldn't connect to Qwen Live: \(close.summary)") : AppLocalization.string("Couldn't connect to Gemini Live: \(close.summary)"))
             } else {
-                fail(AppLocalization.string("Couldn't connect to Gemini Live."))
+                fail(tokens.directProvider == .qwen ? AppLocalization.string("Couldn't connect to Qwen Live.") : AppLocalization.string("Couldn't connect to Gemini Live."))
             }
             return
         }

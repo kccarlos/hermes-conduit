@@ -6,7 +6,8 @@
 //  plugin opens xAI's realtime socket with the host's SuperGrok sign-in
 //  (or its XAI_API_KEY) and relays Conduit's events both ways. The xAI
 //  credential never reaches Conduit; the socket is opened with the same
-//  single-use dashboard ticket the speech stream uses.
+//  single-use dashboard ticket the speech stream uses. The xAI upstream is
+//  the host's connection: Conduit never opens it.
 //
 
 import Foundation
@@ -43,14 +44,18 @@ final class GrokLiveClient: GrokLiveConnecting {
     private let makeSocketRequest: SocketRequest
     /// The Hermes profile whose sign-in and settings the host uses.
     private let profile: @MainActor () -> String
+    /// The query parameter naming it on the socket (DashboardPath.conduitProfileParameter).
+    private let profileParameter: @MainActor () -> String
 
     init(
         profile: @escaping @MainActor () -> String = { "default" },
+        profileParameter: @escaping @MainActor () -> String = { "profile" },
         request: @escaping Request,
         mintTicket: @escaping MintTicket,
         socketRequest: @escaping SocketRequest
     ) {
         self.profile = profile
+        self.profileParameter = profileParameter
         self.request = request
         self.mintTicket = mintTicket
         self.makeSocketRequest = socketRequest
@@ -61,6 +66,7 @@ final class GrokLiveClient: GrokLiveConnecting {
         do {
             response = try await request(DashboardPath.withProfile(Self.statusPath, profile: profile()), "GET", nil, 30_000)
         } catch let error as DashboardTicketBridgeError {
+            if let remedy = DashboardTicketBridgeError.pluginOffDetail(of: error) { return .unavailable(reason: remedy) }
             if GeminiLiveTokenClient.isMissingRoute(error) { return .pluginMissing }
             throw error
         }
@@ -69,10 +75,8 @@ final class GrokLiveClient: GrokLiveConnecting {
 
     func socketRequest() async throws -> URLRequest {
         let ticket = try await mintTicket()
-        return try await makeSocketRequest(Self.socketPath, [
-            URLQueryItem(name: "ticket", value: ticket),
-            URLQueryItem(name: "profile", value: profile()),
-        ])
+        return try await makeSocketRequest(Self.socketPath, [URLQueryItem(name: "ticket", value: ticket)]
+            + DashboardPath.socketProfileItems(profile(), parameter: profileParameter()))
     }
 
     // MARK: Parsing (static for tests)

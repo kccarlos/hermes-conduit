@@ -25,68 +25,87 @@ struct ContextSheet: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                ConduitBackdrop()
-                ScrollView {
-                    VStack(spacing: 14) {
-                        ConduitSettingsSection(title: AppLocalization.string("Context"), symbol: "circle.dotted.circle", tint: .conduitAura) {
-                            SettingsMetricRow(label: AppLocalization.string("Used"), value: AppLocalization.string("\(Int(appState.runtime.contextUsed)) tokens"))
-                            SettingsMetricRow(label: AppLocalization.string("Capacity"), value: AppLocalization.string("\(Int(appState.runtime.contextMax)) tokens"))
-                            VStack(alignment: .leading, spacing: 7) {
-                                HStack {
-                                    Text("Window usage")
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Text("\(String(Int(appState.runtime.contextPercent.rounded())))%")
-                                        .font(.caption.monospacedDigit().weight(.semibold))
-                                }
-                                ProgressView(value: appState.runtime.contextPercent, total: 100)
-                                    .tint(.conduitAccent)
-                            }
-                            .padding(.top, 4)
+            // V2: laid out as a settings page, its cards on the profile's
+            // glow and fading under the bar; compact to fit the half sheet.
+            SettingsDetailContainer(compact: true) {
+                ConduitSettingsSection(title: AppLocalization.string("Context"), symbol: "circle.dotted.circle", tint: .conduitAura) {
+                    SettingsMetricRow(label: AppLocalization.string("Used"), value: AppLocalization.string("\(Int(appState.runtime.contextUsed)) tokens"))
+                    SettingsMetricRow(label: AppLocalization.string("Capacity"), value: AppLocalization.string("\(Int(appState.runtime.contextMax)) tokens"))
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text("Window usage")
+                                .scaledFont(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(String(Int(appState.runtime.contextPercent.rounded())))%")
+                                .scaledFont(.caption.monospacedDigit().weight(.semibold))
                         }
+                        ContextWindowBar(
+                            segments: segments,
+                            capacity: Double(max(Int(appState.runtime.contextMax), breakdown?.contextMax ?? 0)),
+                            fallbackFraction: appState.runtime.contextPercent / 100
+                        )
+                        .accessibilityElement()
+                        .accessibilityLabel(Text("Window usage"))
+                        .accessibilityValue(Text("\(String(Int(appState.runtime.contextPercent.rounded())))%"))
+                    }
+                    .padding(.top, 4)
+                }
 
-                        if let breakdown {
-                            ConduitSettingsSection(title: AppLocalization.string("Breakdown"), symbol: "chart.pie", tint: .conduitAccent) {
-                                ForEach(breakdown.categories, id: \.id) { category in
-                                    HStack(spacing: 10) {
-                                        Circle()
-                                            .fill(colorFor(category.color))
-                                            .frame(width: 9, height: 9)
-                                        Text(category.label)
-                                        Spacer()
-                                        Text("\(category.tokens)")
-                                            .font(.caption.monospacedDigit())
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .padding(.vertical, 3)
-                                }
+                if breakdown != nil {
+                    ConduitSettingsSection(title: AppLocalization.string("Breakdown"), symbol: "chart.pie", tint: .conduitAccent) {
+                        ForEach(segments) { category in
+                            HStack(spacing: 10) {
+                                Circle()
+                                    .fill(category.color)
+                                    .frame(width: 9, height: 9)
+                                Text(category.label)
+                                Spacer()
+                                Text("\(category.tokens)")
+                                    .scaledFont(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
                             }
+                            .padding(.vertical, 3)
                         }
                     }
-                    .padding(16)
                 }
             }
             .navigationTitle("Context")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(.hidden, for: .navigationBar)
         }
+        // The open chat's glow: a Bot Chat's is its bot's.
+        .environment(\.settingsGlowTint, appState.profileGlowTint(appState.conversationIdentityProfile))
         .task { await loadBreakdown() }
     }
 
     private func loadBreakdown() async {
-        guard let client = appState.client, let sid = appState.activeSessionId else { return }
-        do {
-            let loaded = try await client.contextBreakdown(sid)
-            breakdown = loaded
-            appState.applyContextBreakdown(loaded)
-        } catch {
-            // Context detail is supplementary to the live ring in the composer.
+        // Only the open chat's breakdown, and only while it's still open.
+        // Context detail is supplementary to the live ring in the composer.
+        guard let loaded = await appState.refreshContextUsage() else { return }
+        breakdown = loaded
+    }
+
+    /// The breakdown's categories with the color each takes in the bar and
+    /// beside its row. Hermes's own colors only when each is one Conduit
+    /// knows and no two share one; otherwise (it often names one for all,
+    /// or names Conduit doesn't map) they take the palette in turn, so the
+    /// categories never all come out amber.
+    private var segments: [ContextWindowBar.Segment] {
+        guard let categories = breakdown?.categories else { return [] }
+        let named = categories.map { colorFor($0.color) }
+        let useNamed = named.allSatisfy { $0 != nil }
+            && Set(categories.map { $0.color.lowercased() }).count == categories.count
+        return categories.enumerated().map { index, category in
+            ContextWindowBar.Segment(
+                id: category.id,
+                label: category.label,
+                tokens: category.tokens,
+                color: (useNamed ? named[index] : nil)
+                    ?? ContextWindowBar.palette[index % ContextWindowBar.palette.count]
+            )
         }
     }
 
-    private func colorFor(_ name: String) -> Color {
+    private func colorFor(_ name: String) -> Color? {
         switch name.lowercased() {
         case "blue": return .blue
         case "green": return .green
@@ -96,8 +115,53 @@ struct ContextSheet: View {
         case "pink": return .pink
         case "cyan": return .cyan
         case "amber", "yellow": return .yellow
-        default: return .conduitAccent
+        default: return nil
         }
+    }
+}
+
+/// The context window as one bar: a segment per category, sized by its
+/// share of the capacity, on a quiet track for what is still free. Before
+/// the breakdown loads, one gold segment for the used share.
+struct ContextWindowBar: View {
+    struct Segment: Identifiable {
+        let id: String
+        let label: String
+        let tokens: Int
+        let color: Color
+    }
+
+    static let palette: [Color] = [.conduitAccent, .conduitAura, .teal, .pink, .blue, .green, .orange, .purple]
+
+    let segments: [Segment]
+    let capacity: Double
+    let fallbackFraction: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            let shown = segments.filter { $0.tokens > 0 }
+            let total = max(capacity, Double(shown.reduce(0) { $0 + $1.tokens }), 1)
+            HStack(spacing: 2) {
+                if shown.isEmpty {
+                    Rectangle()
+                        .fill(Color.conduitAccent)
+                        .frame(width: proxy.size.width * min(max(fallbackFraction, 0), 1))
+                } else {
+                    ForEach(shown) { segment in
+                        Rectangle()
+                            .fill(segment.color)
+                            // A sliver stays visible however small its share.
+                            .frame(width: max(3, (proxy.size.width - CGFloat(shown.count) * 2) * Double(segment.tokens) / total))
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.08))
+            .clipShape(Capsule())
+        }
+        .frame(height: 10)
+        .animation(.easeOut(duration: 0.25), value: segments.map(\.tokens))
     }
 }
 
@@ -109,6 +173,8 @@ struct SettingsSnapshot: Identifiable {
     let isConnected: Bool
     let profile: String
     let defaultProfileName: String
+    /// The active profile as people see it: Hermes' display name when set.
+    let profileDisplayName: String
     let theme: ThemePreference
     let busyInputMode: BusyInputMode
     let chatResumeBehavior: ChatResumeBehavior
@@ -203,7 +269,7 @@ private struct LegacySettingsView: View {
                 }
             } label: {
                 Label(isReconnecting ? AppLocalization.string("Reconnecting…") : AppLocalization.string("Reconnect"), systemImage: "arrow.clockwise")
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6).frame(minHeight: 44)
             }
@@ -216,7 +282,7 @@ private struct LegacySettingsView: View {
     private var appearanceSection: some View {
         ConduitSettingsSection(title: AppLocalization.string("Appearance"), symbol: "circle.lefthalf.filled", tint: .conduitAccent) {
             Text("Choose how Conduit appears across the app.")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
 
             ConduitGlassGroup(spacing: 8) {
@@ -232,12 +298,16 @@ private struct LegacySettingsView: View {
     private var chatSection: some View {
         ConduitSettingsSection(title: AppLocalization.string("During a response"), symbol: "bubble.left.and.bubble.right", tint: .conduitAccent) {
             Text("Choose what a typed message does while Hermes is still working.")
-                .font(.footnote)
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Text("Touch and hold the send button to choose another way for one message.")
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
 
             ConduitGlassGroup(spacing: 10) {
                 AdaptiveStack(spacing: 10) {
                     busyModeChoice(.steer, symbol: BusyInputMode.steer.symbol, detail: AppLocalization.string("Guide safely"))
+                    busyModeChoice(.queue, symbol: BusyInputMode.queue.symbol, detail: AppLocalization.string("Send next"))
                     busyModeChoice(.interrupt, symbol: BusyInputMode.interrupt.symbol, detail: AppLocalization.string("Stop and correct"))
                 }
             }
@@ -247,14 +317,14 @@ private struct LegacySettingsView: View {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text("Saving preference…")
-                        .font(.caption)
+                        .scaledFont(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
 
             if let busyInputModeError {
                 Label(busyInputModeError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.red)
             }
         }
@@ -262,7 +332,7 @@ private struct LegacySettingsView: View {
 
     private var aboutSection: some View {
         ConduitSettingsSection(title: AppLocalization.string("About"), symbol: "info.circle", tint: .conduitAura) {
-            SettingsMetricRow(label: AppLocalization.string("Profile"), value: snapshot.profile.capitalized)
+            SettingsMetricRow(label: AppLocalization.string("Profile"), value: snapshot.profileDisplayName)
             SettingsMetricRow(label: AppLocalization.string("Version"), value: ConduitAppVersion.display)
         }
     }
@@ -270,16 +340,15 @@ private struct LegacySettingsView: View {
     private var chatDisplaySection: some View {
         ConduitSettingsSection(title: AppLocalization.string("Chat display"), symbol: "text.bubble", tint: .conduitAura) {
             Text("These choices follow the active workspace.")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
 
-            displayToggle(.reasoning, title: AppLocalization.string("Show reasoning"), detail: AppLocalization.string("Include available agent reasoning in replies."))
             displayToggle(.toolProgress, title: AppLocalization.string("Show tool activity"), detail: AppLocalization.string("Show tool calls and their progress in chat."))
             displayToggle(.expandTools, title: AppLocalization.string("Keep tool cards expanded"), detail: AppLocalization.string("Open completed tool details by default."))
 
             if let displayPreferenceError {
                 Label(displayPreferenceError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.red)
             }
         }
@@ -291,7 +360,7 @@ private struct LegacySettingsView: View {
             dismiss()
         } label: {
             Label("Disconnect from Hermes", systemImage: "rectangle.portrait.and.arrow.right")
-                .font(.subheadline.weight(.semibold))
+                .scaledFont(.subheadline.weight(.semibold))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6).frame(minHeight: 48)
         }
@@ -307,9 +376,9 @@ private struct LegacySettingsView: View {
         } label: {
             VStack(spacing: 5) {
                 Image(systemName: symbol)
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                 Text(title)
-                    .font(.caption.weight(.semibold))
+                    .scaledFont(.caption.weight(.semibold))
             }
             .foregroundStyle(theme == value ? .primary : .secondary)
             .frame(maxWidth: .infinity)
@@ -334,17 +403,17 @@ private struct LegacySettingsView: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
                     Image(systemName: symbol)
-                        .font(.subheadline.weight(.semibold))
+                        .scaledFont(.subheadline.weight(.semibold))
                     Spacer(minLength: 4)
                     if busyInputMode == value {
                         Image(systemName: "checkmark.circle.fill")
-                            .font(.caption)
+                            .scaledFont(.caption)
                     }
                 }
                 Text(value.title)
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                 Text(detail)
-                    .font(.caption2)
+                    .scaledFont(.caption2)
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -367,8 +436,8 @@ private struct LegacySettingsView: View {
             set: { saveDisplayPreference(key, enabled: $0) }
         )) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.subheadline.weight(.medium))
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(title).scaledFont(.subheadline.weight(.medium))
+                Text(detail).scaledFont(.caption).foregroundStyle(.secondary)
             }
         }
         .tint(.conduitAccent)
@@ -378,7 +447,6 @@ private struct LegacySettingsView: View {
 
     private func displayValue(for key: DisplayPreferenceKey) -> Bool {
         switch key {
-        case .reasoning: return displayPreferences.showReasoning
         case .toolProgress: return displayPreferences.showToolProgress
         case .expandTools: return displayPreferences.expandToolsByDefault
         }
@@ -402,7 +470,6 @@ private struct LegacySettingsView: View {
 
     private func setDisplayValue(_ key: DisplayPreferenceKey, enabled: Bool) {
         switch key {
-        case .reasoning: displayPreferences.showReasoning = enabled
         case .toolProgress: displayPreferences.showToolProgress = enabled
         case .expandTools: displayPreferences.expandToolsByDefault = enabled
         }
@@ -435,7 +502,7 @@ private struct LegacySettingsView: View {
 // MARK: - Settings home and detail routes
 
 private enum SettingsDestination: Hashable {
-    case profile, model, chat, voice, hermesCalls, workspace, memory, advanced, capabilities, gateway, conduitPlugin, savedDashboards, appearance, notifications, health, location, phone, screenQuestion, about
+    case profile, model, usage, chat, voice, hermesCalls, workspace, memory, advanced, capabilities, pulse, gateway, conduitPlugin, savedDashboards, appearance, notifications, syncedPreferences, health, location, phone, shortcutInbox, screenQuestion, about
 
     init(_ link: ConduitAppLink.SettingsLink) {
         switch link {
@@ -458,6 +525,10 @@ enum ProfileSettingControl {
     case number(defaultValue: Double)
     /// One string per line, saved as a list.
     case stringList
+    /// An IANA time zone name, blank for the server's local time
+    /// (ProfileTimeZone): a text field with this iPhone's zone one tap away,
+    /// checked before it is saved.
+    case timeZone
 }
 
 struct ProfileSettingField: Identifiable {
@@ -505,7 +576,6 @@ struct SettingsView: View {
     let loadProfileConfigOptions: () async -> ProfileConfigOptions
     let loadProfileModelDefaults: () async -> ProfileModelDefaults?
     let persistProfileMainModel: (String, String, String) async -> Bool
-    let saveDefaultProfileName: (String) -> Void
     let reconnect: () async -> Bool
     let disconnect: () -> Void
     /// V2's Settings tab: the home page shows this bar (the profile picker)
@@ -514,24 +584,38 @@ struct SettingsView: View {
 
     @State private var path: [SettingsDestination] = []
     @State private var openedAtLink = false
+    /// Counts main-model saves, so Fast mode's model-dependent choices
+    /// reload for the new model.
+    @State private var mainModelSaves = 0
+    /// Counts provider changes, so the model lists on the page read Hermes'
+    /// catalog again.
+    @State private var providerChanges = 0
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack(path: $path) {
             SettingsHome(snapshot: snapshot, path: $path, v2Layout: homeHeader != nil)
                 .toolbar(.hidden, for: .navigationBar)
-                .safeAreaInset(edge: .top, spacing: 0) {
+                // The page scrolls under the header and fades out beneath
+                // it, as the lists do under theirs.
+                .v2EdgeBar(.top) {
                     if let homeHeader {
                         homeHeader
                     } else {
                         ConduitSheetHeader(title: AppLocalization.string("Settings"), close: { dismiss() })
                     }
                 }
+                // On a wide window every page keeps to a readable column,
+                // which widens with a maximized window, its text a size or
+                // more larger as it does. Inside the stack: a margin
+                // outside it doesn't reach the pages it hosts.
+                .readableSettingsColumn()
                 // V2's Settings tab: each screen stops above the floating
                 // tab bar and fades under it. Nothing in the sheet.
                 .v2TabBarClearance()
                 .navigationDestination(for: SettingsDestination.self) { destination in
                     destinationView(destination)
+                        .readableSettingsColumn()
                         .v2TabBarClearance()
                 }
         }
@@ -573,7 +657,25 @@ struct SettingsView: View {
                 )
             },
             setListensOnCarPlay: { appState.setWakeListensOnCarPlay($0) },
-            setListensOverOtherAudio: { appState.setWakeListensOverOtherAudio($0) }
+            setListensOverOtherAudio: { appState.setWakeListensOverOtherAudio($0) },
+            listenedPhrases: { appState.wakeListenedPhrases(replacing: $0, forProfile: profile) }
+        )
+    }
+
+    /// Models & providers > Helper models, for the profile in use.
+    private var helperModelSettings: HelperModelsSettingsModel {
+        HelperModelsSettingsModel(
+            kept: { appState.keptHelperModels() },
+            load: { try await appState.loadHelperModels() },
+            slot: { slot in
+                VoiceReplyModelSettingsModel(
+                    kept: { appState.keptHelperModel(task: slot.id) },
+                    keptProviders: { appState.keptModelProviders() },
+                    load: { try await appState.loadHelperModel(task: slot.id) },
+                    loadProviders: { await appState.loadModelProviders() },
+                    save: { await appState.setHelperModel($0, confirmed: $1) }
+                )
+            }
         )
     }
 
@@ -583,24 +685,67 @@ struct SettingsView: View {
         case .profile:
             ProfileSettingsDetail(
                 profile: snapshot.profile,
-                displayName: snapshot.profile == "default" ? snapshot.defaultProfileName : snapshot.profile.capitalized,
-                saveDefaultProfileName: saveDefaultProfileName
+                displayName: snapshot.profileDisplayName
             )
         case .model:
             ProfileConfigSettingsPage(
-                title: AppLocalization.string("Model"),
+                title: AppLocalization.string("Models & providers"),
                 subtitle: "",
                 fields: Self.modelFields,
                 load: loadProfileSettings,
+                keptValues: { appState.keptProfileSettings(keys: $0) },
                 save: persistProfileSetting,
                 fieldsHeader: AppLocalization.string("Speed & limits"),
-                leadingSection: AnyView(ProfileModelSettingsDetail(load: loadProfileModelDefaults, save: persistProfileMainModel)),
-                trailingSection: AnyView(FallbackModelsSettings(
-                    loadModels: loadProfileModelDefaults,
-                    load: { await appState.loadProfileFallbackModels() },
-                    save: { await appState.setProfileFallbackModels($0) }
-                )),
-                loadSchema: { await appState.loadProfileConfigSchema() }
+                leadingSection: AnyView(VStack(alignment: .leading, spacing: 24) {
+                    if let bridge = appState.dashboardTicketBridge {
+                        ModelPageProviders(
+                            bridge: bridge,
+                            profile: snapshot.profile,
+                            profileName: appState.profileDisplayName(snapshot.profile),
+                            answers: appState.screenAnswers(profile: snapshot.profile),
+                            profiles: { appState.profiles },
+                            kept: { appState.keptProfileModelDefaults() },
+                            load: loadProfileModelDefaults,
+                            makeDefault: { provider, model, reasoning in
+                                let saved = await persistProfileMainModel(provider, model, reasoning)
+                                if saved { await MainActor.run { mainModelSaves += 1 } }
+                                return saved
+                            },
+                            onChange: { providerChanges += 1 },
+                            refresh: mainModelSaves
+                        )
+                        .id(snapshot.profile)
+                    }
+                    ProfileModelSettingsDetail(
+                        kept: { appState.keptProfileModelDefaults() },
+                        load: loadProfileModelDefaults,
+                        save: { provider, model, reasoning in
+                            let saved = await persistProfileMainModel(provider, model, reasoning)
+                            if saved { await MainActor.run { mainModelSaves += 1 } }
+                            return saved
+                        },
+                        refresh: providerChanges + mainModelSaves
+                    )
+                }),
+                trailingSection: AnyView(VStack(alignment: .leading, spacing: 24) {
+                    FallbackModelsSettings(
+                        keptModels: { appState.keptProfileModelDefaults() },
+                        kept: { appState.keptProfileFallbackModels() },
+                        loadModels: loadProfileModelDefaults,
+                        load: { await appState.loadProfileFallbackModels() },
+                        save: { await appState.setProfileFallbackModels($0) },
+                        refresh: providerChanges
+                    )
+                    HelperModelsSettingsSection(settings: helperModelSettings)
+                        .id(snapshot.profile)
+                }),
+                loadSchema: { await appState.loadProfileConfigSchema() },
+                keptSchema: { appState.keptProfileConfigSchema() },
+                loadExtraOptions: {
+                    Self.modelExtraOptions(await loadProfileModelDefaults() ?? appState.keptProfileModelDefaults())
+                },
+                keptExtraOptions: { appState.keptProfileModelDefaults().map { Self.modelExtraOptions($0) } },
+                extraOptionsRefresh: mainModelSaves + providerChanges
             )
         case .chat:
             ChatSettingsDetail(
@@ -611,9 +756,12 @@ struct SettingsView: View {
                 chatReturnSurface: snapshot.chatReturnSurface,
                 persistChatReturnSurface: persistChatReturnSurface,
                 load: loadProfileSettings,
+                keptValues: { appState.keptProfileSettings(keys: $0) },
                 save: persistProfileSetting,
                 loadOptions: loadProfileConfigOptions,
-                loadSchema: { await appState.loadProfileConfigSchema() }
+                keptOptions: { appState.keptProfileConfigOptions() },
+                loadSchema: { await appState.loadProfileConfigSchema() },
+                keptSchema: { appState.keptProfileConfigSchema() }
             )
         case .voice:
             if let bridge = appState.dashboardTicketBridge {
@@ -622,12 +770,18 @@ struct SettingsView: View {
                 VoiceSettingsRoute(
                     bridge: bridge,
                     profile: snapshot.profile,
+                    profileParameter: { appState.notifierPlugin.dashboardProfileParameter },
+                    // Opens on what it showed last time while Hermes is asked.
+                    answers: appState.voiceSettingsAnswers(profile: snapshot.profile),
+                    profileName: appState.profileDisplayName(snapshot.profile),
                     conversationController: appState.voiceConversationController,
                     actions: VoiceSettingsActions(
                         runASRTest: { await appState.runVoiceASRTest() },
                         runTTSTest: { await appState.runVoiceTTSTest() }
                     ),
-                    voiceEnabled: appState.isVoiceEnabled,
+                    // The saved switch: while Conduit reconnects, voice isn't
+                    // usable yet, but it wasn't turned off.
+                    voiceEnabled: appState.activeProfileVoiceSwitch,
                     transcriptionMode: appState.voiceTranscriptionMode,
                     transcriptionModeChosen: voicePreferences.transcriptionMode != nil,
                     speechOutput: voicePreferences.speechOutput,
@@ -676,16 +830,43 @@ struct SettingsView: View {
                         saveCalls: appState.voiceCallSavingEnabled,
                         setSaveCalls: { appState.setVoiceCallSavingEnabled($0) },
                         speakerBargeIn: appState.liveVoiceSpeakerBargeInEnabled,
-                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) }
+                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) },
+                        keptStatus: appState.keptLiveVoiceStatus(.geminiLive),
+                        keepStatus: appState.liveVoiceStatusKeeper(.geminiLive)
+                    ),
+                    qwenLive: GeminiLiveSettingsModel(
+                        enabled: appState.isQwenLiveEnabled,
+                        setEnabled: { appState.setQwenLiveEnabled($0) },
+                        checkAvailability: {
+                            do {
+                                let status = try await appState.qwenLiveTokenClient.availability()
+                                await MainActor.run { appState.noteWatchCallVoice(.qwenLive, ready: status.isAvailable) }
+                                return .success(status)
+                            } catch {
+                                return .failure(error)
+                            }
+                        },
+                        search: appState.qwenLiveSearchMode,
+                        setSearch: { appState.setQwenLiveSearchMode($0) },
+                        voice: appState.qwenLiveVoice,
+                        setVoice: { appState.setQwenLiveVoice($0) },
+                        memory: appState.qwenLiveMemoryEnabled,
+                        setMemory: { appState.setQwenLiveMemoryEnabled($0) },
+                        personality: appState.qwenLivePersonalityEnabled,
+                        setPersonality: { appState.setQwenLivePersonalityEnabled($0) },
+                        saveCalls: appState.voiceCallSavingEnabled,
+                        setSaveCalls: { appState.setVoiceCallSavingEnabled($0) },
+                        speakerBargeIn: appState.liveVoiceSpeakerBargeInEnabled,
+                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) },
+                        provider: .qwenLive,
+                        keptStatus: appState.keptLiveVoiceStatus(.qwenLive),
+                        keepStatus: appState.liveVoiceStatusKeeper(.qwenLive)
                     ),
                     gptLive: GPTLiveSettingsModel(
                         enabled: appState.isGPTLiveEnabled,
                         setEnabled: { appState.setGPTLiveEnabled($0) },
-                        checkAvailability: {
+                        checkAvailability: { billing in
                             do {
-                                // The path the picker shows, even while a call Hermes placed
-                                // would start on the subscription.
-                                let billing = await MainActor.run { appState.gptLiveBilling }
                                 let status = try await appState.gptLiveClient.availability(billing: billing)
                                 // The Watch's GPT-Live is always the subscription's: an API-key
                                 // check says nothing about it.
@@ -714,7 +895,9 @@ struct SettingsView: View {
                         apiMaxMinutes: appState.gptLiveAPIMaxMinutes,
                         setAPIMaxMinutes: { appState.setGPTLiveAPIMaxMinutes($0) },
                         apiHermesCalls: appState.gptLiveAPIHermesCalls,
-                        setAPIHermesCalls: { appState.setGPTLiveAPIHermesCalls($0) }
+                        setAPIHermesCalls: { appState.setGPTLiveAPIHermesCalls($0) },
+                        keptStatus: appState.keptLiveVoiceStatus(.gptLive),
+                        keepStatus: appState.gptLiveStatusKeeper()
                     ),
                     grokLive: GrokLiveSettingsModel(
                         enabled: appState.isGrokLiveEnabled,
@@ -735,13 +918,22 @@ struct SettingsView: View {
                         saveCalls: appState.voiceCallSavingEnabled,
                         setSaveCalls: { appState.setVoiceCallSavingEnabled($0) },
                         speakerBargeIn: appState.liveVoiceSpeakerBargeInEnabled,
-                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) }
+                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) },
+                        keptStatus: appState.keptLiveVoiceStatus(.grokLive),
+                        keepStatus: appState.liveVoiceStatusKeeper(.grokLive)
                     ),
                     localLive: LocalLiveSettingsModel(
                         enabled: appState.isLocalLiveEnabled,
-                        setEnabled: { appState.setLocalLiveEnabled($0) }
+                        setEnabled: { appState.setLocalLiveEnabled($0) },
+                        agent: appState.isLocalLiveAgent,
+                        setAgent: { appState.setLocalLiveAgent($0) },
+                        personality: appState.localLivePersonalityEnabled,
+                        setPersonality: { appState.setLocalLivePersonalityEnabled($0) }
                     ),
-                    liveStyle: appState.isGeminiLiveEnabled || appState.isGPTLiveEnabled || appState.isGrokLiveEnabled
+                    // Local Live's agent mode reads the style too; its
+                    // hands-free option (Hermes answers each turn) doesn't.
+                    liveStyle: appState.isQwenLiveEnabled || appState.isGeminiLiveEnabled || appState.isGPTLiveEnabled || appState.isGrokLiveEnabled
+                        || (appState.isLocalLiveEnabled && appState.isLocalLiveAgent)
                         ? LiveVoiceStyleSettingsModel(
                             profile: appState.activeProfile,
                             style: appState.liveVoiceStyle,
@@ -757,21 +949,37 @@ struct SettingsView: View {
                         provider: voicePreferences.voiceJobProvider,
                         model: voicePreferences.voiceJobModel,
                         reasoningEffort: voicePreferences.voiceJobReasoningEffort,
-                        loadProviders: { await appState.loadVoiceJobModelProviders() },
+                        keptProviders: { appState.keptModelProviders() },
+                        loadProviders: { await appState.loadModelProviders() },
                         save: { provider, model, reasoning in
                             appState.setVoiceJobModel(provider: provider, model: model, reasoningEffort: reasoning)
                         }
                     ),
                     voiceReplies: VoiceReplyModelSettingsModel(
-                        load: { await appState.loadVoiceReplyModel() },
-                        loadProviders: { await appState.loadVoiceJobModelProviders() },
-                        save: { await appState.setVoiceReplyModel($0) }
+                        kept: { appState.keptVoiceReplyModel() },
+                        keptProviders: { appState.keptModelProviders() },
+                        load: { try await appState.loadVoiceReplyModel() },
+                        loadProviders: { await appState.loadModelProviders() },
+                        save: { await appState.setVoiceReplyModel($0, confirmed: $1) }
                     ),
                     wake: wakeSettings(profile: snapshot.profile),
                     lockedListening: VoiceLockedListeningSettingsModel(
                         enabled: appState.keepVoiceListeningWhenLocked,
                         setEnabled: { appState.setKeepVoiceListeningWhenLocked($0) }
                     ),
+                    pushToTalk: VoicePushToTalkSettingsModel(
+                        enabled: appState.voicePushToTalkEnabled,
+                        setEnabled: { appState.setVoicePushToTalk($0) }
+                    ),
+                    // Only V2 has the big button beside a chat.
+                    chatVoiceButton: V2ShellPreference.isOn ? ChatVoiceButtonSettingsModel(
+                        choice: ChatVoiceButtonAction.offeredChoice(appState.chatVoiceButtonOverride),
+                        appChoice: ChatVoiceButtonAction.resolved(
+                            profile: nil,
+                            app: UserDefaults.standard.string(forKey: ChatVoiceButtonAction.key)
+                        ),
+                        setChoice: { appState.setChatVoiceButtonOverride($0) }
+                    ) : nil,
                     speakerTalkOver: VoiceSpeakerTalkOverSettingsModel(
                         enabled: appState.liveVoiceSpeakerBargeInEnabled,
                         setEnabled: { appState.setLiveVoiceSpeakerBargeInEnabled($0) }
@@ -780,6 +988,7 @@ struct SettingsView: View {
                         pendingCount: appState.pendingVoiceCallSaves,
                         blocked: appState.voiceCallSavesBlocked,
                         isSaving: appState.isSavingQueuedVoiceCalls,
+                        lastResult: appState.voiceCallSaveNowResult,
                         isWaitingOnCall: appState.isLiveVoiceCallActive,
                         saveNow: { await appState.saveQueuedVoiceCallsNow() }
                     ),
@@ -794,7 +1003,7 @@ struct SettingsView: View {
                 SettingsDetailContainer {
                     ConduitSettingsSection(title: AppLocalization.string("Voice"), symbol: "mic.slash", tint: .orange) {
                         Text("Connect to Hermes to configure voice for this profile.")
-                            .font(.footnote)
+                            .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -805,18 +1014,27 @@ struct SettingsView: View {
                 subtitle: AppLocalization.string("Working defaults and safeguards for this profile."),
                 fields: [],
                 load: loadProfileSettings,
+                keptValues: { appState.keptProfileSettings(keys: $0) },
                 save: persistProfileSetting,
                 sections: Self.workspaceSections,
-                loadSchema: { await appState.loadProfileConfigSchema() }
+                loadSchema: { await appState.loadProfileConfigSchema() },
+                keptSchema: { appState.keptProfileConfigSchema() }
             )
         case .memory:
             MemorySettingsDetail(
                 load: loadProfileSettings,
+                keptValues: { appState.keptProfileSettings(keys: $0) },
                 save: persistProfileSetting,
                 loadOptions: loadProfileConfigOptions,
+                keptOptions: { appState.keptProfileConfigOptions() },
                 loadModels: loadProfileModelDefaults,
+                keptModels: { appState.keptProfileModelDefaults() },
                 loadSchema: { await appState.loadProfileConfigSchema() },
-                sections: Self.memorySections
+                keptSchema: { appState.keptProfileConfigSchema() },
+                sections: Self.memorySections,
+                loadDelegationPaused: { await appState.loadDelegationPaused() },
+                keptDelegationPaused: { appState.keptDelegationPaused() },
+                setDelegationPaused: { await appState.setDelegationPaused($0) }
             )
         case .advanced:
             ProfileConfigSettingsPage(
@@ -824,14 +1042,21 @@ struct SettingsView: View {
                 subtitle: AppLocalization.string("Limits and runtime defaults for this profile. Most profiles never need to change these."),
                 fields: [],
                 load: loadProfileSettings,
+                keptValues: { appState.keptProfileSettings(keys: $0) },
                 save: persistProfileSetting,
                 sections: Self.advancedSections,
-                loadSchema: { await appState.loadProfileConfigSchema() }
+                loadSchema: { await appState.loadProfileConfigSchema() },
+                keptSchema: { appState.keptProfileConfigSchema() }
             )
+        case .usage:
+            UsageSettingsDetail()
         case .capabilities:
             CapabilitiesView()
+        case .pulse:
+            PulseSettingsPage()
         case .gateway:
-            GatewaySettingsDetail(snapshot: snapshot, reconnect: reconnect, disconnect: disconnect, close: { dismiss() }, saveCloudflareAccess: appState.saveCloudflareAccess, removeCloudflareAccess: appState.removeCloudflareAccess, customHeaders: appState.customHeaders(), saveCustomHeaders: appState.saveCustomHeaders)
+            // V2's Settings names this row Connection, so its page does too.
+            GatewaySettingsDetail(title: homeHeader != nil ? AppLocalization.string("Connection") : AppLocalization.string("Gateway"), snapshot: snapshot, reconnect: reconnect, disconnect: disconnect, close: { dismiss() }, saveCloudflareAccess: appState.saveCloudflareAccess, removeCloudflareAccess: appState.removeCloudflareAccess, customHeaders: appState.customHeaders(), saveCustomHeaders: appState.saveCustomHeaders)
         case .conduitPlugin:
             ConduitPluginSettingsDetail()
         case .savedDashboards:
@@ -840,10 +1065,13 @@ struct SettingsView: View {
             AppearanceSettingsDetail(theme: appState.themePreference, saveTheme: saveTheme)
         case .notifications:
             NotificationsSettingsDetail()
+        case .syncedPreferences:
+            SyncedPreferencesSettingsDetail(controller: appState.syncedPreferences)
         case .hermesCalls:
             HermesCallsSettingsPage(
                 model: HermesCallSettingsModel(
                     profile: appState.activeProfile,
+                    botName: appState.hermesCallContactName(appState.activeProfile),
                     status: appState.activeHermesCallsStatus,
                     load: {
                         await appState.refreshHermesCallsStatus()
@@ -872,6 +1100,8 @@ struct SettingsView: View {
             LocationSettingsPage(controller: LocationSharingController.shared, engine: LocationSharingController.shared.engine)
         case .phone:
             PhoneSettingsPage(engine: appState.phoneSync)
+        case .shortcutInbox:
+            ShortcutInboxSettingsPage()
         case .screenQuestion:
             SettingsDetailContainer {
                 ScreenQuestionSettingsSection()
@@ -937,6 +1167,12 @@ struct SettingsView: View {
     ]
     }
 
+    /// Choices the Model page's fields gain from its main model: Ultrafast,
+    /// when the model offers it.
+    nonisolated static func modelExtraOptions(_ defaults: ProfileModelDefaults?) -> [String: [String]] {
+        defaults?.mainModelOffersUltrafast == true ? ["agent.service_tier": ["ultrafast"]] : [:]
+    }
+
     static var modelFields: [ProfileSettingField] { [
         .init(key: "agent.service_tier", label: AppLocalization.string("Fast mode"), help: AppLocalization.string("When Hermes asks the provider for faster priority processing, on models that offer it."), control: .options([], defaultValue: ""), requiresSchema: true),
         .init(key: "model_context_length", label: AppLocalization.string("Context window"), help: AppLocalization.string("Overrides the main model's context window, in tokens. 0 uses the model's own size."), control: .number(defaultValue: 0), requiresSchema: true),
@@ -972,6 +1208,8 @@ struct SettingsView: View {
 
 private struct SettingsHome: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// Redraws when an inbox's key or waiting events change (showsShortcutInboxSettings).
+    @ObservedObject private var shortcutInbox = ShortcutInboxLocalState.shared
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let snapshot: SettingsSnapshot
     @Binding var path: [SettingsDestination]
@@ -988,6 +1226,10 @@ private struct SettingsHome: View {
     /// has dismissed (one presentation context at a time).
     @State private var pendingAppliedNotice = false
     @State private var appliedConnectionNotice = false
+    /// The saved dashboard an edited address already belongs to: the apply
+    /// was refused, and says so the same way once the wizard has gone.
+    @State private var pendingAddressOwner: String?
+    @State private var addressOwner: String?
 
     /// Per-presentation seed for the wizard, built once when the row is
     /// tapped so the Keychain reads stay off the render path.
@@ -1010,7 +1252,7 @@ private struct SettingsHome: View {
             }
             ScrollView {
                 VStack(spacing: v2Layout ? 24 : 14) {
-                    if appState.notifierPlugin.updateAvailable || appState.notifierPlugin.restartPending {
+                    if appState.notifierPlugin.needsAttention {
                         NotifierPluginUpdateNotice(status: appState.notifierPlugin, dashboardLabel: notifierDashboardLabel) {
                             Haptics.selection()
                             path.append(.conduitPlugin)
@@ -1023,7 +1265,8 @@ private struct SettingsHome: View {
                         settingsLink(.profile, icon: "person.crop.circle", title: profileDisplayName, detail: AppLocalization.string("Profile-specific preferences"))
                     }
                     homeSection("Hermes", tint: .conduitAura) {
-                        settingsLink(.model, icon: "cpu", title: AppLocalization.string("Model"), detail: AppLocalization.string("Default model and reasoning"))
+                        settingsLink(.model, icon: "cpu", title: AppLocalization.string("Models & providers"), detail: AppLocalization.string("Default model, reasoning, and providers"))
+                        settingsLink(.usage, icon: "chart.bar", title: AppLocalization.string("Usage"), detail: AppLocalization.string("Tokens, cost, and provider quota"), identifier: "settings.usage")
                         settingsLink(.chat, icon: "bubble.left.and.bubble.right", title: AppLocalization.string("Chat"), detail: AppLocalization.string("Response behavior, visibility, and timezone"))
                         settingsLink(.voice, icon: "mic.and.signal.meter", title: AppLocalization.string("Voice"), detail: AppLocalization.string("Speech providers, credentials, and device opt-in"))
                         if appState.supportsHermesCalls {
@@ -1033,11 +1276,16 @@ private struct SettingsHome: View {
                         settingsLink(.memory, icon: "brain.head.profile", title: AppLocalization.string("Memory & delegation"), detail: AppLocalization.string("Memory, compression, and child agents"))
                         settingsLink(.advanced, icon: "wrench.and.screwdriver", title: AppLocalization.string("Advanced"), detail: AppLocalization.string("Turn limits, terminal, and tool output"))
                         settingsLink(.capabilities, icon: "puzzlepiece.extension", title: AppLocalization.string("Capabilities"), detail: AppLocalization.string("Skills, tools, connectors, and plugins"))
+                        // Where the plugin serves Pulse (AppState+Pulse.swift).
+                        if appState.showsPulseSettings {
+                            settingsLink(.pulse, icon: "waveform.path.ecg", title: AppLocalization.string("Pulse (beta)"), detail: AppLocalization.string("What Hermes would bring up on its own"), identifier: "settings.pulse")
+                        }
                     }
                     homeSection(AppLocalization.string("Connection"), tint: .conduitAura) {
                         settingsLink(.savedDashboards, icon: "server.rack", title: AppLocalization.string("Saved Dashboards"), detail: savedDashboardsDetail, identifier: "settings.saved-dashboards")
                         settingsLink(.gateway, icon: "radio", title: AppLocalization.string("Gateway"), detail: snapshot.server ?? AppLocalization.string("Not connected"), identifier: "settings.gateway")
                         settingsLink(.conduitPlugin, icon: "puzzlepiece.extension", title: AppLocalization.string("Conduit plugin"), detail: NotifierPluginSummary.detail(appState.notifierPlugin, update: appState.activeNotifierPluginUpdate), identifier: "settings.conduit-plugin")
+                        settingsLink(.syncedPreferences, icon: "arrow.triangle.2.circlepath", title: AppLocalization.string("Sync across devices"), detail: syncedPreferencesDetail, identifier: "settings.sync")
                         settingsActionRow(
                             icon: "checkmark.circle",
                             title: AppLocalization.string("Connection Setup"),
@@ -1059,12 +1307,15 @@ private struct SettingsHome: View {
                         if appState.showsPhoneSettings {
                             settingsLink(.phone, icon: "calendar", title: AppLocalization.string("Calendar & phone"), detail: AppLocalization.string("Share your calendar, reminders, Focus and phone status with Hermes"), identifier: "settings.phone")
                         }
+                        if appState.showsShortcutInboxSettings {
+                            settingsLink(.shortcutInbox, icon: "tray.full", title: AppLocalization.string("Shortcuts inbox"), detail: AppLocalization.string("What your automations logged for Hermes"), identifier: "settings.shortcut-inbox")
+                        }
                         settingsLink(.screenQuestion, icon: "camera.viewfinder", title: AppLocalization.string("Ask Hermes About Screen"), detail: AppLocalization.string("Action Button shortcut for screenshots"), identifier: "settings.screen-question")
                         settingsLink(.about, icon: "shield", title: AppLocalization.string("About & privacy"), detail: AppLocalization.string("App information and data handling"))
                     }
                     }
-                    Text("Hermes settings follow the active profile. Appearance, notifications, and privacy controls stay on this device.")
-                        .font(.footnote)
+                    Text("Hermes settings follow the active profile. Appearance, notifications, and privacy controls stay on this device unless you turn on Sync across devices.")
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, v2Layout ? 16 : 10)
@@ -1087,6 +1338,11 @@ private struct SettingsHome: View {
                 .environmentObject(appState)
         }
         .sheet(item: $connectionSetupSeed, onDismiss: {
+            if let owner = pendingAddressOwner {
+                pendingAddressOwner = nil
+                addressOwner = owner
+                return
+            }
             guard pendingAppliedNotice else { return }
             pendingAppliedNotice = false
             appliedConnectionNotice = true
@@ -1102,26 +1358,46 @@ private struct SettingsHome: View {
                 // wizard re-verifies the origin itself before sending it and
                 // never displays, edits, or persists it.
                 initialCloudflareAccess: seed.cloudflareAccess,
-                initialCloudflareOriginURL: seed.url
-            ) { result in
-                // Reload the saved state at apply time: the plan must decide
-                // against what exists NOW, not what existed when the sheet
-                // was seeded.
-                let plan = ConnectionSetupApplication.plan(
-                    result: result,
-                    currentDashboardURL: seed.url,
-                    savedCredentials: appState.savedCredentialsForDashboard(at: seed.url),
-                    savedCloudflareAccess: appState.dashboardScopedCloudflareAccess(for: seed.url)
-                )
-                plan.perform(appState: appState)
-                pendingAppliedNotice = !plan.isEmpty
-            }
+                initialCloudflareOriginURL: seed.url,
+                onComplete: { result in
+                    // Reload the saved state at apply time: the plan must
+                    // decide against what exists NOW, not what existed when
+                    // the sheet was seeded.
+                    let plan = ConnectionSetupApplication.plan(
+                        result: result,
+                        currentDashboardURL: seed.url,
+                        savedCredentials: appState.savedCredentialsForDashboard(at: seed.url),
+                        savedCloudflareAccess: appState.dashboardScopedCloudflareAccess(for: seed.url)
+                    )
+                    switch plan.perform(appState: appState) {
+                    case .applied:
+                        pendingAppliedNotice = !plan.isEmpty
+                    case .addressBelongsToDashboard(let label):
+                        pendingAddressOwner = label
+                    }
+                },
+                // Sign In Again (a test that found browser sign-in for this
+                // dashboard) signs in and reconnects through the same
+                // explicit activation as Repair.
+                onRepair: appState.connectionRepairActivationHandler()
+            )
             .environmentObject(appState)
         }
         .alert("Settings applied", isPresented: $appliedConnectionNotice) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("Saved for your next reconnect. Your current session stays connected.")
+            // Only a connected session "stays connected".
+            Text(appState.isConnected
+                 ? AppLocalization.string("Saved for your next reconnect. Your current session stays connected.")
+                 : AppLocalization.string("Saved for your next reconnect."))
+        }
+        .alert("Settings not applied", isPresented: Binding(
+            get: { addressOwner != nil },
+            set: { if !$0 { addressOwner = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(AppLocalization.string("This address is your saved dashboard “\(addressOwner ?? "")”. Switch to it from your dashboards instead."))
         }
         // Asked again on every visit and dashboard switch: the connect-time
         // check can miss (the dashboard was still loading), and the plugin
@@ -1141,6 +1417,12 @@ private struct SettingsHome: View {
             password: seeded?.password ?? "",
             cloudflareAccess: appState.dashboardScopedCloudflareAccess(for: seedURL)
         )
+    }
+
+    private var syncedPreferencesDetail: String {
+        appState.syncedPreferences.isEnabled
+            ? AppLocalization.string("On: shared with your other devices")
+            : AppLocalization.string("Share preferences with your other devices")
     }
 
     /// V2's grouping: the selected profile (its connection, approvals and
@@ -1169,17 +1451,22 @@ private struct SettingsHome: View {
             }
         }
         v2Group(AppLocalization.string("Hermes"), symbol: "gearshape.2") {
-            v2Link(.model, icon: "cpu", title: AppLocalization.string("Model"), detail: AppLocalization.string("Default model and reasoning"), first: true)
+            v2Link(.model, icon: "cpu", title: AppLocalization.string("Models & providers"), detail: AppLocalization.string("Default model, reasoning, and providers"), first: true)
+            v2Link(.usage, icon: "chart.bar", title: AppLocalization.string("Usage"), detail: AppLocalization.string("Tokens, cost, and provider quota"), identifier: "settings.usage")
             v2Link(.chat, icon: "bubble.left.and.bubble.right", title: AppLocalization.string("Chat"), detail: AppLocalization.string("Response behavior, visibility, and timezone"))
             v2Link(.memory, icon: "brain.head.profile", title: AppLocalization.string("Memory & delegation"), detail: AppLocalization.string("Memory, compression, and child agents"))
             v2Link(.advanced, icon: "wrench.and.screwdriver", title: AppLocalization.string("Advanced"), detail: AppLocalization.string("Turn limits, terminal, and tool output"))
             v2Link(.capabilities, icon: "puzzlepiece.extension", title: AppLocalization.string("Capabilities"), detail: AppLocalization.string("Skills, tools, connectors, and plugins"))
+            // Where the plugin serves Pulse (AppState+Pulse.swift).
+            if appState.showsPulseSettings {
+                v2Link(.pulse, icon: "waveform.path.ecg", title: AppLocalization.string("Pulse (beta)"), detail: AppLocalization.string("What Hermes would bring up on its own"), identifier: "settings.pulse")
+            }
         }
         v2Group(AppLocalization.string("App"), symbol: "slider.horizontal.3") {
             v2Action(
                 icon: "person.2.crop.square.stack",
                 title: AppLocalization.string("Profiles"),
-                detail: AppLocalization.string("Add, reorder, or change profile photos"),
+                detail: AppLocalization.string("Rename, reorder, or change profile photos"),
                 identifier: "settings.profiles",
                 first: true
             ) {
@@ -1187,9 +1474,10 @@ private struct SettingsHome: View {
             }
             v2Link(.appearance, icon: "circle.lefthalf.filled", title: AppLocalization.string("Appearance"), detail: AppLocalization.string("Theme and interface preferences"))
             v2Link(.notifications, icon: "bell", title: AppLocalization.string("Notifications"), detail: AppLocalization.string("Delivery status and setup"))
+            v2Link(.syncedPreferences, icon: "arrow.triangle.2.circlepath", title: AppLocalization.string("Sync across devices"), detail: syncedPreferencesDetail, identifier: "settings.sync")
             v2Link(.screenQuestion, icon: "camera.viewfinder", title: AppLocalization.string("Ask Hermes About Screen"), detail: AppLocalization.string("Action Button shortcut for screenshots"), identifier: "settings.screen-question")
         }
-        if appState.showsHealthSettings || appState.showsLocationSettings || appState.showsPhoneSettings {
+        if appState.showsHealthSettings || appState.showsLocationSettings || appState.showsPhoneSettings || appState.showsShortcutInboxSettings {
             v2Group(AppLocalization.string("On this device"), symbol: "iphone") {
                 if appState.showsHealthSettings {
                     v2Link(.health, icon: "heart.text.square", title: AppLocalization.string("Health"), detail: AppLocalization.string("Share Apple Health data with Hermes"), identifier: "settings.health", first: true)
@@ -1199,6 +1487,9 @@ private struct SettingsHome: View {
                 }
                 if appState.showsPhoneSettings {
                     v2Link(.phone, icon: "calendar", title: AppLocalization.string("Calendar & phone"), detail: AppLocalization.string("Share your calendar, reminders, Focus and phone status with Hermes"), identifier: "settings.phone", first: !appState.showsHealthSettings && !appState.showsLocationSettings)
+                }
+                if appState.showsShortcutInboxSettings {
+                    v2Link(.shortcutInbox, icon: "tray.full", title: AppLocalization.string("Shortcuts inbox"), detail: AppLocalization.string("What your automations logged for Hermes"), identifier: "settings.shortcut-inbox", first: !appState.showsHealthSettings && !appState.showsLocationSettings && !appState.showsPhoneSettings)
                 }
             }
         }
@@ -1273,29 +1564,29 @@ private struct SettingsHome: View {
     private func v2RowLabel(icon: String, title: String, detail: String, statusDot: Color? = nil, first: Bool) -> some View {
         HStack(spacing: 14) {
             Image(systemName: icon)
-                .font(.body.weight(.medium))
+                .scaledFont(.body.weight(.medium))
                 .conduitFixedGlyph()
                 .foregroundStyle(Color.conduitAccent)
                 .frame(width: 26)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.callout.weight(.semibold))
+                    .scaledFont(.callout.weight(.semibold))
                     .foregroundStyle(.primary)
                 HStack(spacing: 5) {
                     if let statusDot {
                         Circle().fill(statusDot).frame(width: 7, height: 7).accessibilityHidden(true)
                     }
                     Text(detail)
-                        .font(.subheadline)
+                        .scaledFont(.subheadline)
                         .foregroundStyle(Color.primary.opacity(0.58))
                         .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                 }
             }
             Spacer(minLength: 8)
             Image(systemName: "chevron.right")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .scaledFont(.footnote.weight(.semibold))
+                .foregroundStyle(.conduitTertiary)
                 .accessibilityHidden(true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1344,7 +1635,7 @@ private struct SettingsHome: View {
     }
 
     private var profileDisplayName: String {
-        snapshot.profile == "default" ? appState.defaultProfileName : snapshot.profile.capitalized
+        appState.profileDisplayName(snapshot.profile)
     }
 
     private func homeSection<Content: View>(_ title: String, symbol: String = "gearshape.2", tint: Color, @ViewBuilder content: () -> Content) -> some View {
@@ -1377,18 +1668,18 @@ private struct SettingsHome: View {
 
     private func settingsRowLabel(icon: String, title: String, detail: String, statusDot: Color? = nil) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: icon).font(.subheadline.weight(.semibold)).conduitFixedGlyph().foregroundStyle(.conduitAccent).frame(width: 25)
+            Image(systemName: icon).scaledFont(.subheadline.weight(.semibold)).conduitFixedGlyph().foregroundStyle(.conduitAccent).frame(width: 25)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.subheadline.weight(.semibold))
+                Text(title).scaledFont(.subheadline.weight(.semibold))
                 HStack(spacing: 5) {
                     if let statusDot {
                         Circle().fill(statusDot).frame(width: 7, height: 7).accessibilityHidden(true)
                     }
-                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                    Text(detail).scaledFont(.caption).foregroundStyle(.secondary).lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                 }
             }
             Spacer(minLength: 8)
-            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            Image(systemName: "chevron.right").scaledFont(.caption.weight(.semibold)).foregroundStyle(.conduitTertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 5)
@@ -1400,16 +1691,19 @@ private struct ProfileSettingsDetail: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     let profile: String
     let displayName: String
-    let saveDefaultProfileName: (String) -> Void
     @EnvironmentObject private var appState: AppState
     @State private var name: String
+    /// The name the field last showed: Save writes nothing until it's edited.
+    @State private var seeded: String
     @State private var didSave = false
+    @State private var isSaving = false
+    @State private var saveError: String?
 
-    init(profile: String, displayName: String, saveDefaultProfileName: @escaping (String) -> Void) {
+    init(profile: String, displayName: String) {
         self.profile = profile
         self.displayName = displayName
-        self.saveDefaultProfileName = saveDefaultProfileName
         _name = State(initialValue: displayName)
+        _seeded = State(initialValue: displayName)
     }
 
     var body: some View {
@@ -1417,31 +1711,70 @@ private struct ProfileSettingsDetail: View {
             ConduitSettingsSection(title: AppLocalization.string("Active profile"), symbol: "person.crop.circle.fill", tint: .conduitAccent) {
                 SettingsMetricRow(label: AppLocalization.string("Profile"), value: currentDisplayName)
                 Text("Choose a different profile from the session drawer. Chat, model, workspace, and memory preferences on the other settings pages follow that profile.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
             }
-            if profile == "default" {
-                ConduitSettingsSection(title: AppLocalization.string("On this device"), symbol: "pencil", tint: .conduitAccent) {
-                    Text("Display name").font(.subheadline.weight(.semibold))
-                    TextField("Hermes", text: $name)
-                        .textInputAutocapitalization(.words)
-                        .padding(10)
-                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    Text("This only changes how the default profile is named in Conduit. Hermes itself still uses the default profile.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Button(didSave ? AppLocalization.string("Saved") : AppLocalization.string("Save display name")) {
-                        saveDefaultProfileName(name)
-                        name = appState.defaultProfileName
-                        didSave = true
-                    }
-                        .buttonStyle(.settingsPrimary)
+            ConduitSettingsSection(title: namedOnDevice ? AppLocalization.string("On this device") : AppLocalization.string("Name"), symbol: "pencil", tint: .conduitAccent) {
+                Text("Display name").scaledFont(.subheadline.weight(.semibold))
+                TextField("Hermes", text: $name)
+                    .textInputAutocapitalization(.words)
+                    // What's typed mid-save would be replaced by the saved name.
+                    .disabled(isSaving)
+                    .padding(10)
+                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                Text(BotManagement.isDefaultProfile(profile)
+                     ? AppLocalization.string("This only changes how the default profile is named in Conduit. Hermes itself still uses the default profile.")
+                     : namedOnDevice
+                        ? AppLocalization.string("This only changes how the profile is named in Conduit.")
+                        : AppLocalization.string("Chats and settings stay with the profile. Bots and Hermes Desktop show the new name too."))
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
+                if let saveError {
+                    Text(saveError).scaledFont(.footnote).foregroundStyle(.red)
                 }
+                Button(didSave ? AppLocalization.string("Saved") : AppLocalization.string("Save display name")) {
+                    save()
+                }
+                    .buttonStyle(.settingsPrimary)
+                    .disabled(isSaving)
             }
         }
         .navigationTitle("Profile")
+        // A rename elsewhere (Edit Bot, the Profiles sheet) shows here
+        // unless the field is being edited.
+        .onAppear(perform: followCurrentName)
+        .onChange(of: currentDisplayName) { _, _ in followCurrentName() }
+        .onChange(of: name) { _, _ in if name != seeded { didSave = false } }
+    }
+
+    private func followCurrentName() {
+        guard name == seeded else { return }
+        name = currentDisplayName
+        seeded = currentDisplayName
     }
 
     private var currentDisplayName: String {
-        profile == "default" ? appState.defaultProfileName : displayName
+        appState.profileDisplayName(profile)
+    }
+
+    /// The main profile's name is Conduit's own; any other profile's is its
+    /// bot title on Hermes, unless the gateway has no bot looks.
+    private var namedOnDevice: Bool {
+        BotManagement.isDefaultProfile(profile) || !appState.profilePhotosLiveOnHermes
+    }
+
+    private func save() {
+        guard name.trimmingCharacters(in: .whitespacesAndNewlines)
+                != seeded.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        isSaving = true
+        saveError = nil
+        Task { @MainActor in
+            saveError = await appState.renameProfile(profile, to: name)
+            isSaving = false
+            // A failed save keeps what was typed, to try again.
+            guard saveError == nil else { return }
+            name = appState.profileDisplayName(profile)
+            seeded = name
+            didSave = true
+        }
     }
 }
 
@@ -1454,10 +1787,13 @@ struct ChatSettingsDetail: View {
     let chatReturnSurface: ChatReturnSurface
     let persistChatReturnSurface: (ChatReturnSurface) -> Void
     let load: ([String]) async -> [String: ProfileSettingValue]
+    var keptValues: (([String]) -> [String: ProfileSettingValue]?)? = nil
     let save: (String, ProfileSettingValue) async -> Bool
     let loadOptions: () async -> ProfileConfigOptions
+    var keptOptions: () -> ProfileConfigOptions? = { nil }
     var loadSchema: (() async -> ProfileConfigSchema)? = nil
-    @State private var options = ProfileConfigOptions()
+    var keptSchema: (() -> ProfileConfigSchema?)? = nil
+    @State private var options: ProfileConfigOptions?
 
     var body: some View {
         ProfileConfigSettingsPage(
@@ -1465,9 +1801,10 @@ struct ChatSettingsDetail: View {
             subtitle: "",
             fields: Self.fields,
             load: load,
+            keptValues: keptValues,
             save: save,
             showsNavigationTitle: false,
-            optionOverrides: ["display.personality": ["", "helpful", "concise", "technical", "creative", "teacher", "kawaii", "catgirl", "pirate", "shakespeare", "surfer", "noir", "uwu", "philosopher", "hype"] + options.personalities],
+            optionOverrides: ["display.personality": ["", "helpful", "concise", "technical", "creative", "teacher", "kawaii", "catgirl", "pirate", "shakespeare", "surfer", "noir", "uwu", "philosopher", "hype"] + shownOptions.personalities],
             fieldsHeader: AppLocalization.string("Hermes"),
             leadingSection: AnyView(
                 VStack(spacing: 24) {
@@ -1483,22 +1820,30 @@ struct ChatSettingsDetail: View {
             trailingSection: AnyView(
                 VStack(spacing: 24) {
                     ChatTextSizeSettings()
+                    ChatFontStyleSettings()
+                    ReplyStartSettings()
                     ComposerReturnKeySettings()
                     AttachmentLimitSettings()
                     ChatTakeoverSettings()
+                    StepSummarySettings()
+                    PredictiveSettingsSection()
                     DeviceHapticsSettings()
                 }
             ),
-            loadSchema: loadSchema
+            loadSchema: loadSchema,
+            keptSchema: keptSchema
         )
         .navigationTitle("Chat")
         .task { options = await loadOptions() }
     }
 
+    /// Hermes' choices, else the ones it gave last time, kept on the phone.
+    private var shownOptions: ProfileConfigOptions { options ?? keptOptions() ?? ProfileConfigOptions() }
+
     static var fields: [ProfileSettingField] { [
         .init(key: "display.personality", label: AppLocalization.string("Personality"), help: AppLocalization.string("Default response style for new conversations."), control: .options([], defaultValue: "")),
-        .init(key: "timezone", label: AppLocalization.string("Timezone"), help: AppLocalization.string("Used for dates, reminders, and scheduled work."), control: .text(defaultValue: "")),
-        .init(key: "display.show_reasoning", label: AppLocalization.string("Show thinking"), help: AppLocalization.string("Show collapsible thinking blocks when provided."), control: .toggle(defaultValue: true)),
+        .init(key: ProfileTimeZone.configKey, label: AppLocalization.string("Timezone"), help: AppLocalization.string("Used for dates, reminders, and scheduled work."), control: .timeZone),
+        .init(key: ReasoningDisplayMode.settingKey, label: AppLocalization.string("Thinking"), help: AppLocalization.string("Show puts Hermes' thinking in every chat. On request hides it, with Show thinking in a run's menu and a reply's ⋯. Off hides it everywhere."), control: .labeledOptions([(value: ReasoningDisplayMode.show.rawValue, label: AppLocalization.string("Show in every chat")), (value: ReasoningDisplayMode.onRequest.rawValue, label: AppLocalization.string("On request")), (value: ReasoningDisplayMode.off.rawValue, label: AppLocalization.string("Off"))], defaultValue: ReasoningDisplayMode.show.rawValue)),
         .init(key: "display.tool_progress", label: AppLocalization.string("Tool cards"), help: AppLocalization.string("Show tool calls and expandable details in conversations."), control: .textToggle(onValue: "all", offValue: "off", defaultValue: true)),
         .init(key: "display.expand_tools", label: AppLocalization.string("Keep tool cards expanded"), help: AppLocalization.string("Keep completed tool details open by default."), control: .toggle(defaultValue: false)),
         .init(key: "display.memory_notifications", label: AppLocalization.string("Self-improvement updates"), help: AppLocalization.string("Choose whether Conduit follows Hermes, always shows, or never shows maintenance updates."), control: .labeledOptions([(value: "default", label: AppLocalization.string("Use Hermes default")), (value: "on", label: AppLocalization.string("Always show")), (value: "off", label: AppLocalization.string("Never show"))], defaultValue: "default")),
@@ -1509,10 +1854,10 @@ struct ChatSettingsDetail: View {
     }
 }
 
-/// Local, device-only chat text-size preference (issue #85). Stored in
-/// UserDefaults via @AppStorage with the same lifetime as
-/// ComposerReturnKey — never part of the Hermes profile configuration and
-/// never synchronized anywhere. A five-position stepped slider: the change
+/// Chat text-size preference (issue #85). Stored in UserDefaults via
+/// @AppStorage with the same lifetime as ComposerReturnKey — never part of
+/// the Hermes profile configuration, and shared only by Sync across
+/// devices. A five-position stepped slider: the change
 /// is live (the visible transcript re-renders as the slider moves), there
 /// is no Save button, and `Default` keeps today's appearance.
 private struct ChatTextSizeSettings: View {
@@ -1530,15 +1875,17 @@ private struct ChatTextSizeSettings: View {
             tint: .conduitAura
         ) {
             Text("Readable conversation content only — messages, lists, tables, and code. Buttons, timestamps, and the rest of the interface keep their size, and iOS Dynamic Type still applies on top.")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
+                    // Fixed size: the slider's small and large ends.
                     Text("A")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .accessibilityHidden(true)
                     Spacer()
+                    // Fixed size: the slider's small and large ends.
                     Text("A")
                         .font(.system(size: 22, weight: .medium))
                         .foregroundStyle(.secondary)
@@ -1557,10 +1904,49 @@ private struct ChatTextSizeSettings: View {
                 .accessibilityValue(selected.displayName)
                 .accessibilityHint("Five steps from smallest to largest. Applies to conversation text immediately.")
                 Text(selected.displayName)
-                    .font(.subheadline.weight(.medium))
+                    .scaledFont(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
             }
+        }
+    }
+}
+
+/// The typeface of conversation text: Apple's system designs, so Dynamic
+/// Type and every language keep working. Code stays monospaced and the
+/// interface stays in the system font.
+private struct ChatFontStyleSettings: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    @AppStorage(ChatTypography.fontStylePreferenceKey) private var styleRaw = ChatFontStyle.standard.rawValue
+
+    private var selected: ChatFontStyle {
+        ChatTypography.resolveStyle(rawValue: styleRaw)
+    }
+
+    var body: some View {
+        ConduitSettingsSection(
+            title: AppLocalization.string("Chat text style"),
+            symbol: "textformat",
+            tint: .conduitAura
+        ) {
+            Text("The typeface of messages in a chat. Code stays monospaced, and the rest of the interface keeps the system font.")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Picker("Chat text style", selection: Binding(get: { selected }, set: {
+                Haptics.selection()
+                styleRaw = $0.rawValue
+            })) {
+                ForEach(ChatFontStyle.allCases, id: \.self) { style in
+                    Text(verbatim: style.displayName).tag(style)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text("Hermes replies like this.")
+                .scaledFont(.body)
+                .fontDesign(selected.fontDesign)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .conduitGlassSurface(cornerRadius: 14, tint: .clear)
         }
     }
 }
@@ -1569,7 +1955,10 @@ private struct ChatTextSizeSettings: View {
 /// @AppStorage; never part of the Hermes profile configuration.
 private struct ComposerReturnKeySettings: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
-    @AppStorage(ComposerReturnKey.preferenceKey) private var returnKeySends = false
+    @AppStorage(ComposerReturnKey.preferenceKey) private var returnKeySends = ComposerReturnKey.sendsByDefault
+    /// A Mac has no on-screen keyboard to mention, and starts with the
+    /// preference on.
+    private let onMac = ProcessInfo.processInfo.isiOSAppOnMac
 
     var body: some View {
         ConduitSettingsSection(
@@ -1577,15 +1966,45 @@ private struct ComposerReturnKeySettings: View {
             symbol: "keyboard",
             tint: .conduitAura
         ) {
-            Text("Press Return to send. Use Shift-Return for a new line.")
-                .font(.footnote)
+            Text("When on, Return sends and Shift-Return starts a new line.")
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
-            Text("Hardware keyboards only. The on-screen keyboard's Return key keeps inserting a new line.")
-                .font(.footnote)
+            Text(ComposerReturnKey.defaultFootnote(onMac: onMac))
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
+            if !onMac {
+                Text("Hardware keyboards only. The on-screen keyboard's Return key keeps inserting a new line.")
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Toggle("Return key sends", isOn: $returnKeySends)
                 .tint(.conduitAccent)
-                .accessibilityHint("Applies to hardware keyboards only. The on-screen keyboard's Return key is unchanged.")
+                .accessibilityHint(onMac ? Text(verbatim: "") : Text("Applies to hardware keyboards only. The on-screen keyboard's Return key is unchanged."))
+        }
+    }
+}
+
+/// A reply longer than the screen stops at its start (#365), and an
+/// unread chat opens there (ChatReplyStartPreference, TranscriptScroller).
+private struct ReplyStartSettings: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    @AppStorage(ChatReplyStartPreference.key) private var stopsAtStart = ChatReplyStartPreference.defaultOn
+
+    var body: some View {
+        ConduitSettingsSection(
+            title: AppLocalization.string("Long replies"),
+            symbol: "arrow.up.to.line",
+            tint: .conduitAura
+        ) {
+            Text("In a chat, your message moves to the top of the screen when you send, and the reply appears under it. A reply longer than the screen stops at its start, so you can read it from the top. The arrow button goes to its end.")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Text("A chat with an unread reply also opens at the start of that reply.")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Toggle("Stop at the start of long replies", isOn: $stopsAtStart)
+                .tint(.conduitAccent)
+                .accessibilityHint("When off, the chat follows each reply to its end as it arrives.")
         }
     }
 }
@@ -1603,7 +2022,7 @@ private struct AttachmentLimitSettings: View {
             tint: .conduitAura
         ) {
             Text("Photos, videos and files larger than this are not attached.")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             ConduitMenuPicker(
                 value: megabytes,
@@ -1619,7 +2038,7 @@ private struct AttachmentLimitSettings: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                 }
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             }
         }
@@ -1627,10 +2046,11 @@ private struct AttachmentLimitSettings: View {
 }
 
 /// Device-only: take a chat over from Hermes Desktop or a terminal as soon
-/// as a send is refused, instead of offering a button (#304).
+/// as a send is refused (#304), on until turned off (#1061). Off, the
+/// composer offers a button instead; calls take over either way.
 private struct ChatTakeoverSettings: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
-    @AppStorage(ChatTakeoverPreference.automaticKey) private var automatic = false
+    @AppStorage(ChatTakeoverPreference.automaticKey) private var automatic = ChatTakeoverPreference.automaticDefault
 
     var body: some View {
         ConduitSettingsSection(
@@ -1638,15 +2058,50 @@ private struct ChatTakeoverSettings: View {
             symbol: "desktopcomputer",
             tint: .conduitAura
         ) {
-            Text("Hermes lets one app use a chat at a time. When a chat is open in Hermes Desktop or a terminal, Conduit offers to take it over when you send.")
-                .font(.footnote)
+            Text("Hermes lets one app use a chat at a time. When a chat is open in Hermes Desktop or a terminal, Conduit takes it over when you send. Calls always take it over; turn this off to be asked first when you type.")
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             Text("A reply running there always finishes first. If you go back to that app, reopen the chat there to see what you sent from Conduit.")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             Toggle("Take over automatically", isOn: $automatic)
                 .tint(.conduitAccent)
                 .accessibilityHint("Sending in a chat open in Hermes Desktop or a terminal takes it over without asking. Needs the Conduit notifier plugin on your Hermes host.")
+        }
+    }
+}
+
+/// Device-only and off by default: a few lines on a finished run of
+/// steps, asked of Hermes with a hidden /btw (ChatStepSummaries). A run's
+/// menu asks for one whatever the switch says.
+private struct StepSummarySettings: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    @AppStorage(ChatStepSummaries.preferenceKey) private var enabled = ChatStepSummaries.defaultEnabled
+    @AppStorage(ChatStepSummaries.maxStepsKey) private var maxSteps = ChatStepSummaries.defaultMaxSteps
+
+    var body: some View {
+        ConduitSettingsSection(
+            title: AppLocalization.string("Step summaries"),
+            symbol: "text.line.first.and.arrowtriangle.forward",
+            tint: .conduitAura
+        ) {
+            Text("When a reply took several steps, Hermes looks back on them in a short paragraph: what it set out to do and why each step came next, shown under the folded steps.")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Text("Each summary is one more short request to your model. It reuses the chat's prompt cache and never changes the chat.")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Text("On or off, you can touch and hold any folded steps and choose Explain these steps, or a single finished step and choose Explain this step.")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Toggle("Describe finished steps", isOn: $enabled)
+                .tint(.conduitAccent)
+                .accessibilityHint("Summaries are kept on this device.")
+            Stepper(value: $maxSteps, in: ChatStepSummaries.maxStepsRange, step: 5) {
+                // The limit the check uses, should a stored value be out of range.
+                Text(AppLocalization.string("Skip runs over \(String(ChatStepSummaries.clampedMaxSteps(maxSteps))) steps"))
+            }
+            .disabled(!enabled)
         }
     }
 }
@@ -1663,12 +2118,15 @@ private struct NotifierPluginUpdateNotice: View {
 
     var body: some View {
         ConduitSettingsSection(
-            title: AppLocalization.string("Update the Conduit plugin"),
+            // Missing, or on the host but not running: there's nothing to update.
+            title: status.offersInstall || status.isNotServed
+                ? AppLocalization.string("Conduit plugin")
+                : AppLocalization.string("Update the Conduit plugin"),
             symbol: "arrow.down.circle",
             tint: .orange
         ) {
             Text(detail)
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             Button(action: open) {
                 Label(AppLocalization.string("Open Conduit plugin"), systemImage: "puzzlepiece.extension")
@@ -1682,7 +2140,13 @@ private struct NotifierPluginUpdateNotice: View {
     }
 
     private var detail: String {
-        switch (dashboardLabel, status.restartPending && !status.updateAvailable) {
+        if status.isNotServed {
+            return AppLocalization.string("Installed on this dashboard's host, but the dashboard doesn't run it. Turn it on in Hermes, then restart the gateway and the dashboard.")
+        }
+        if status.offersInstall {
+            return AppLocalization.string("Missing or out of date on this dashboard's host, so features like taking chats over from Hermes Desktop won't work.")
+        }
+        switch (dashboardLabel, status.restartPending && !status.updateRecommended) {
         case (let label?, true):
             return AppLocalization.string("The Conduit plugin on \(label) was updated, and Hermes needs a restart to use it.")
         case (.none, true):
@@ -1706,7 +2170,7 @@ private struct DeviceHapticsSettings: View {
             tint: .conduitAura
         ) {
             Text("Conduit-generated vibration feedback for actions and response progress. iOS system controls can still provide their own feedback.")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             Toggle("Haptic feedback", isOn: $enabled)
                 .labelsHidden()
@@ -1724,7 +2188,8 @@ private struct ChatReturnBehaviorSettings: View {
     let persistSurface: (ChatReturnSurface) -> Void
     @State private var behavior: ChatResumeBehavior
     @State private var surface: ChatReturnSurface
-    /// V2 always opens on the Chats list, so it has no "Open to" choice.
+    /// V2 opens on Chats, or on the chat iOS closed it on (#1559), so it
+    /// has no "Open to" choice.
     @AppStorage(V2ShellPreference.key) private var usesV2 = V2ShellPreference.defaultValue
 
     init(
@@ -1745,13 +2210,19 @@ private struct ChatReturnBehaviorSettings: View {
             symbol: "arrow.uturn.backward.circle",
             tint: .conduitAccent
         ) {
-            Text("Stored only on this device, not in your Hermes profile. Choose which surface Conduit opens to and whether it preserves your exact reading position or follows the newest conversation.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            Group {
+                if usesV2 {
+                    Text("Stored only on this device, not in your Hermes profile. If iOS closes Conduit while you're away, it reopens a chat when you come back. If you swipe Conduit away, it opens on Chats. Choose whether that chat is the one you left, at your exact reading position, or the newest conversation.")
+                } else {
+                    Text("Stored only on this device, not in your Hermes profile. Choose which surface Conduit opens to and whether it preserves your exact reading position or follows the newest conversation.")
+                }
+            }
+            .scaledFont(.footnote)
+            .foregroundStyle(.secondary)
             if !usesV2 {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Open to")
-                        .font(.subheadline.weight(.semibold))
+                        .scaledFont(.subheadline.weight(.semibold))
                     Picker("Open to", selection: Binding(get: { surface }, set: chooseSurface)) {
                         ForEach(ChatReturnSurface.allCases, id: \.self) { choice in
                             Text(choice.title).tag(choice)
@@ -1765,14 +2236,14 @@ private struct ChatReturnBehaviorSettings: View {
                     )
                     if surface == .sessions {
                         Text("Used if you dismiss the session list without choosing another conversation.")
-                            .font(.footnote)
+                            .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                     }
                 }
             }
             VStack(alignment: .leading, spacing: 8) {
                 Text("Conversation")
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                 Picker("Conversation", selection: Binding(get: { behavior }, set: chooseBehavior)) {
                     Text("Continue").tag(ChatResumeBehavior.continueWhereLeftOff)
                     Text("Latest").tag(ChatResumeBehavior.latestActivity)
@@ -1811,15 +2282,16 @@ private struct ResponseBehaviorSettings: View {
 
     var body: some View {
         ConduitSettingsSection(title: AppLocalization.string("During a response"), symbol: BusyInputMode.steer.symbol, tint: .conduitAccent) {
-            Text("Steer adds guidance to the active turn. Interrupt stops it before handling the new message.")
-                .font(.footnote).foregroundStyle(.secondary)
+            Text("Steer adds guidance to the active turn. Queue sends the message once it finishes. Interrupt stops it before handling the new message.")
+                .scaledFont(.footnote).foregroundStyle(.secondary)
             Picker("Messages during a response", selection: Binding(get: { mode }, set: choose)) {
                 Text("Steer").tag(BusyInputMode.steer)
+                Text("Queue").tag(BusyInputMode.queue)
                 Text("Interrupt").tag(BusyInputMode.interrupt)
             }
             .pickerStyle(.segmented)
             .disabled(saving)
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            if let error { Text(error).scaledFont(.caption).foregroundStyle(.red) }
         }
     }
 
@@ -1840,6 +2312,14 @@ private struct ResponseBehaviorSettings: View {
     }
 }
 
+/// A titled run of a menu picker's choices, shown as a submenu that opens
+/// in place, so a long list (every provider's models) reads as its groups.
+/// An untitled group's choices sit in the menu itself.
+struct ConduitMenuGroup<ID: Hashable> {
+    var title: String?
+    var choices: [(id: ID, title: String)]
+}
+
 /// A custom menu picker matching the Chat settings selector style,
 /// used by Model and Delegate model settings for visual consistency.
 /// The settings picker row: the setting's name on the left and its current
@@ -1850,18 +2330,43 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let label: Label
     let value: ID
-    let choices: [(id: ID, title: String)]
+    let groups: [ConduitMenuGroup<ID>]
     let onSelect: (ID) -> Void
 
     init(value: ID, choices: [(id: ID, title: String)], onSelect: @escaping (ID) -> Void, @ViewBuilder label: () -> Label) {
+        self.init(value: value, groups: [ConduitMenuGroup(title: nil, choices: choices)], onSelect: onSelect, label: label)
+    }
+
+    init(value: ID, groups: [ConduitMenuGroup<ID>], onSelect: @escaping (ID) -> Void, @ViewBuilder label: () -> Label) {
         self.value = value
-        self.choices = choices
+        self.groups = groups
         self.onSelect = onSelect
         self.label = label()
     }
 
+    /// The pick's name in the row: a grouped choice names its group too
+    /// ("gpt-5 · openrouter"), as the row stands without the menu.
     private var displayedTitle: String {
-        choices.first(where: { $0.id == value })?.title ?? (value as? String) ?? String(describing: value)
+        for group in groups {
+            if let choice = group.choices.first(where: { $0.id == value }) {
+                guard let groupTitle = group.title else { return choice.title }
+                return "\(choice.title) · \(groupTitle)"
+            }
+        }
+        return (value as? String) ?? String(describing: value)
+    }
+
+    private func choiceButton(_ choice: (id: ID, title: String)) -> some View {
+        Button {
+            onSelect(choice.id)
+        } label: {
+            if choice.id == value {
+                SwiftUI.Label(choice.title, systemImage: "checkmark")
+            } else {
+                Text(verbatim: choice.title)
+            }
+        }
+        .accessibilityAddTraits(choice.id == value ? .isSelected : [])
     }
 
     private var valueText: Text {
@@ -1874,18 +2379,26 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
 
     var body: some View {
         Menu {
-            ForEach(choices.indices, id: \.self) { index in
-                let choice = choices[index]
-                Button {
-                    onSelect(choice.id)
-                } label: {
-                    if choice.id == value {
-                        SwiftUI.Label(choice.title, systemImage: "checkmark")
-                    } else {
-                        Text(verbatim: choice.title)
+            ForEach(groups.indices, id: \.self) { groupIndex in
+                let group = groups[groupIndex]
+                if let title = group.title {
+                    Menu {
+                        ForEach(group.choices.indices, id: \.self) { index in
+                            choiceButton(group.choices[index])
+                        }
+                    } label: {
+                        // The group holding the pick says so while closed.
+                        if group.choices.contains(where: { $0.id == value }) {
+                            SwiftUI.Label(title, systemImage: "checkmark")
+                        } else {
+                            Text(verbatim: title)
+                        }
+                    }
+                } else {
+                    ForEach(group.choices.indices, id: \.self) { index in
+                        choiceButton(group.choices[index])
                     }
                 }
-                .accessibilityAddTraits(choice.id == value ? .isSelected : [])
             }
         } label: {
             Group {
@@ -1901,15 +2414,30 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
                         }
                     }
                 } else {
-                    HStack {
-                        label
-                        Spacer(minLength: 8)
-                        valueText.multilineTextAlignment(.trailing).accessibilityHidden(true)
-                        chevron
+                    // The value never wraps beside the name: when both
+                    // don't fit on one line ("Right away, with a
+                    // notification"), it goes under the name, on one line.
+                    ViewThatFits(in: .horizontal) {
+                        HStack {
+                            // One line here, so a long name can't fit this
+                            // candidate by wrapping beside the value.
+                            label.lineLimit(1)
+                            Spacer(minLength: 8)
+                            valueText.fixedSize().accessibilityHidden(true)
+                            chevron
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            label
+                            HStack {
+                                valueText.lineLimit(1).accessibilityHidden(true)
+                                Spacer(minLength: 8)
+                                chevron
+                            }
+                        }
                     }
                 }
             }
-            .font(.subheadline.weight(.medium))
+            .scaledFont(.subheadline.weight(.medium))
             .padding(.horizontal, 12)
             .padding(.vertical, 6).frame(minHeight: 42)
             .contentShape(Rectangle())
@@ -1920,16 +2448,77 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
     }
 }
 
+/// A models list's state when it isn't drawn as models: the Model page
+/// editors' stand-in for their pickers until the catalog has rows, and the
+/// failed row with Try Again under the voice and Pulse pickers' models.
+struct ModelCatalogPlaceholder: View {
+    let state: ModelCatalogState
+    let retry: () -> Void
+
+    var body: some View {
+        switch state {
+        case .loading:
+            ProgressView("Loading available models…")
+        case .ready:
+            // Callers show their pickers instead; never a spinner that
+            // can't end.
+            EmptyView()
+        case .failed:
+            Text(AppLocalization.string("Could not load models."))
+                .scaledFont(.footnote).foregroundStyle(.secondary)
+            Button(AppLocalization.string("Try Again"), action: retry)
+                .buttonStyle(.settings)
+        case .empty:
+            Text("No models are available from this gateway.")
+                .scaledFont(.footnote).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// When a page that opens on a kept answer (#1533) can save: a single
+/// setting saves at once, but a save that writes several values or a
+/// whole list waits for Hermes' answer, since the kept one may be stale,
+/// and for a save already on its way. `ready`: what it writes is complete.
+enum KeptAnswerGate {
+    static func canSave(answered: Bool, saving: Bool, ready: Bool = true) -> Bool {
+        answered && !saving && ready
+    }
+}
+
 private struct ProfileModelSettingsDetail: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// The catalog and defaults Hermes gave last time, kept on the phone:
+    /// the page opens on them while it asks again (#1533).
+    let kept: () -> ProfileModelDefaults?
     let load: () async -> ProfileModelDefaults?
     let save: (String, String, String) async -> Bool
+    /// Raised when a provider or the default changed elsewhere on the page:
+    /// Hermes is asked again, and picks changed here stay.
+    var refresh = 0
     @State private var defaults: ProfileModelDefaults?
     @State private var provider = ""
     @State private var model = ""
     @State private var reasoning = "medium"
     @State private var saving = false
     @State private var error: String?
+    @State private var loadFailed = false
+    /// Hermes has answered. Until then the page shows what it kept, and
+    /// Save waits: it writes all three, and a kept one may be stale.
+    @State private var answered = false
+    /// Counts the catalog reads, so a read again a later read overtook
+    /// never lands.
+    @State private var catalogRead = 0
+    /// Counts the whole-page reads, so an older one never lands over a
+    /// newer one.
+    @State private var pageRead = 0
+    /// The newest catalog read whose models are shown.
+    @State private var catalogLanded = 0
+    /// Counts the saves Hermes took, so a read asked before one never puts
+    /// back what the save replaced.
+    @State private var savesLanded = 0
+    /// A pick was changed here: Hermes' answer then updates the catalog
+    /// under the picks, not the picks.
+    @State private var edited = false
 
     private var models: [ModelInfo] { defaults?.providers.first(where: { $0.name == provider })?.models ?? [] }
     /// Keeps a saved model the catalog no longer lists visible instead of
@@ -1953,8 +2542,9 @@ private struct ProfileModelSettingsDetail: View {
         VStack(alignment: .leading, spacing: 24) {
             ConduitSettingsSection(title: AppLocalization.string("Default model"), symbol: "cpu", tint: .conduitAccent) {
                 Text("Select a provider first, then one of its available models. These defaults apply to new sessions in this profile.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                if let defaults, !defaults.providers.isEmpty {
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
+                let catalog = ModelCatalogState.of(providers: defaults?.providers, failed: loadFailed)
+                if catalog == .ready, let defaults {
                     ConduitMenuPicker(
                         value: provider,
                         choices: providerChoices(defaults.providers),
@@ -1965,41 +2555,102 @@ private struct ProfileModelSettingsDetail: View {
                     ConduitMenuPicker(
                         value: model,
                         choices: modelChoices,
-                        onSelect: { model = $0 }
+                        onSelect: { next in
+                            guard next != model else { return }
+                            model = next
+                            edited = true
+                        }
                     ) {
                         Text("Model").foregroundStyle(.secondary)
                     }
                     .disabled(modelChoices.isEmpty)
+                    if loadFailed && !answered {
+                        // The kept catalog stays up; Save waits for Hermes.
+                        ModelCatalogPlaceholder(state: .failed) { Task { await reload() } }
+                    }
                 } else {
-                    ProgressView("Loading available models…")
+                    ModelCatalogPlaceholder(state: catalog) { Task { await reload() } }
                 }
             }
             ConduitSettingsSection(title: AppLocalization.string("Reasoning"), symbol: "brain.head.profile", tint: .conduitAura) {
                 ConduitMenuPicker(
                     value: reasoning,
                     choices: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map { (id: $0, title: $0.capitalized) },
-                    onSelect: { reasoning = $0 }
+                    onSelect: { next in
+                        guard next != reasoning else { return }
+                        reasoning = next
+                        edited = true
+                    }
                 ) {
                     Text("Default reasoning").foregroundStyle(.secondary)
                 }
             }
             Button { persist() } label: { Label(saving ? AppLocalization.string("Saving…") : AppLocalization.string("Save model defaults"), systemImage: "checkmark").frame(maxWidth: .infinity).padding(.vertical, 6).frame(minHeight: 46) }
-                .disabled(saving || provider.isEmpty || model.isEmpty).conduitGlassControl(cornerRadius: 17, tint: .conduitAccent.opacity(0.18))
-            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red) }
+                .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving, ready: !provider.isEmpty && !model.isEmpty))
+                .conduitGlassControl(cornerRadius: 17, tint: .conduitAccent.opacity(0.18))
+            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").scaledFont(.footnote).foregroundStyle(.red) }
         }
-        .task { await reload() }
+        // What it showed last time, before the first frame; Hermes'
+        // answer follows.
+        .onAppear {
+            guard defaults == nil, let keptDefaults = kept() else { return }
+            show(keptDefaults)
+        }
+        .task {
+            await reload()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await settleCatalog() }
+        }
+        .onChange(of: refresh) { _, _ in Task { await reload() } }
     }
 
     private func reload() async {
-        guard let loaded = await load() else { return }
+        catalogRead += 1
+        pageRead += 1
+        let read = (catalog: catalogRead, page: pageRead, saves: savesLanded)
+        loadFailed = false
+        let loaded = await load()
+        // A whole-page read asked since has the newer answer.
+        guard read.page == pageRead else { return }
+        guard let loaded else {
+            loadFailed = true
+            return
+        }
+        // A read again that landed since keeps its newer models; a save
+        // that landed meanwhile keeps its picks.
+        let newerModels = catalogLanded > read.catalog ? defaults?.providers : nil
+        show(loaded, picks: read.saves == savesLanded)
+        if let newerModels { defaults?.providers = newerModels } else { catalogLanded = read.catalog }
+        answered = true
+    }
+
+    /// The read again (issue 1807) takes only Hermes' models, so a save
+    /// that lands while it's asked keeps its picks; one that fails leaves
+    /// the page as it is.
+    private func settleCatalog() async {
+        // After a first read that failed, the whole page reads again.
+        guard answered else { return await reload() }
+        catalogRead += 1
+        let asked = catalogRead
+        guard let loaded = await load(), asked == catalogRead, defaults != nil else { return }
+        defaults?.providers = loaded.providers
+        catalogLanded = asked
+    }
+
+    /// The catalog, and the picks unless they were changed here.
+    private func show(_ loaded: ProfileModelDefaults, picks: Bool = true) {
         defaults = loaded
+        guard picks, !edited else { return }
         (provider, model) = loaded.selection
         reasoning = loaded.reasoning
     }
+
     /// Menus fire on the current item too; re-picking it must not swap out
     /// a saved model.
     private func chooseProvider(_ next: String) {
         guard next != provider else { return }
+        edited = true
         provider = next
         // The unlisted saved entry has no model list, so keep the model.
         // Otherwise keep a model the new provider also lists (e.g. one saved
@@ -2011,9 +2662,14 @@ private struct ProfileModelSettingsDetail: View {
     }
     private func persist() {
         Task {
+            guard defaults != nil else { return }
             saving = true
             error = nil
-            if !(await save(provider, model, reasoning)) {
+            if await save(provider, model, reasoning) {
+                // Hermes holds the picks now; its next answer shows them.
+                edited = false
+                savesLanded += 1
+            } else {
                 error = AppLocalization.string("Could not save model defaults.")
             }
             saving = false
@@ -2023,6 +2679,10 @@ private struct ProfileModelSettingsDetail: View {
 
 private struct DelegationModelSettings: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// The catalog and settings Hermes gave last time, kept on the phone:
+    /// the card opens on them while it asks again (#1533).
+    let keptModels: () -> ProfileModelDefaults?
+    let keptSettings: ([String]) -> [String: ProfileSettingValue]?
     let loadModels: () async -> ProfileModelDefaults?
     let loadSettings: ([String]) async -> [String: ProfileSettingValue]
     let save: (String, ProfileSettingValue) async -> Bool
@@ -2032,6 +2692,25 @@ private struct DelegationModelSettings: View {
     @State private var reasoning = "medium"
     @State private var saving = false
     @State private var error: String?
+    @State private var loadFailed = false
+    /// Hermes' catalog is in. Until then Save waits: it writes all three,
+    /// and a kept one may be stale.
+    @State private var answered = false
+    /// Counts the catalog reads, so a read again a later read overtook
+    /// never lands.
+    @State private var catalogRead = 0
+    /// Counts the whole-page reads, so an older one never lands over a
+    /// newer one.
+    @State private var pageRead = 0
+    /// The newest catalog read whose models are shown.
+    @State private var catalogLanded = 0
+    /// Counts the saves Hermes took, so a read asked before one never puts
+    /// back what the save replaced.
+    @State private var savesLanded = 0
+    /// A pick was changed here: Hermes' answer leaves the picks alone.
+    @State private var edited = false
+
+    private static let settingKeys = ["delegation.provider", "delegation.model", "delegation.reasoning_effort"]
     /// An inherited provider offers the chat row's models, since that is the
     /// provider the delegate will run on.
     private var models: [ModelInfo] {
@@ -2056,8 +2735,9 @@ private struct DelegationModelSettings: View {
     var body: some View {
         ConduitSettingsSection(title: AppLocalization.string("Delegate model"), symbol: "point.3.connected.trianglepath.dotted", tint: .conduitAccent) {
             Text("Leave both selections empty to inherit the chat model. Set a provider and model to route delegate agents separately.")
-                .font(.footnote).foregroundStyle(.secondary)
-            if let defaults, !defaults.providers.isEmpty {
+                .scaledFont(.footnote).foregroundStyle(.secondary)
+            let catalog = ModelCatalogState.of(providers: defaults?.providers, failed: loadFailed)
+            if catalog == .ready {
                 ConduitMenuPicker(
                     value: provider,
                     choices: providerChoices,
@@ -2069,7 +2749,11 @@ private struct DelegationModelSettings: View {
                     ConduitMenuPicker(
                         value: model,
                         choices: modelChoices,
-                        onSelect: { model = $0 }
+                        onSelect: { next in
+                            guard next != model else { return }
+                            model = next
+                            edited = true
+                        }
                     ) {
                         Text("Delegate model").foregroundStyle(.secondary)
                     }
@@ -2077,33 +2761,98 @@ private struct DelegationModelSettings: View {
                 ConduitMenuPicker(
                     value: reasoning,
                     choices: [(id: "", title: AppLocalization.string("Inherit chat reasoning"))] + ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map { (id: $0, title: $0.capitalized) },
-                    onSelect: { reasoning = $0 }
+                    onSelect: { next in
+                        guard next != reasoning else { return }
+                        reasoning = next
+                        edited = true
+                    }
                 ) {
                     Text("Delegate reasoning").foregroundStyle(.secondary)
                 }
-            } else { ProgressView("Loading available models…") }
+                if loadFailed && !answered {
+                    // The kept catalog stays up; Save waits for Hermes.
+                    ModelCatalogPlaceholder(state: .failed) { Task { await reload() } }
+                }
+            } else {
+                ModelCatalogPlaceholder(state: catalog) { Task { await reload() } }
+            }
             Button { persist() } label: { Label(saving ? AppLocalization.string("Saving…") : AppLocalization.string("Save delegate defaults"), systemImage: "checkmark").frame(maxWidth: .infinity).padding(.vertical, 6).frame(minHeight: 42) }
-                .disabled(saving).conduitGlassControl(cornerRadius: 15, tint: .conduitAccent.opacity(0.18))
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+                .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving, ready: defaults != nil))
+                .conduitGlassControl(cornerRadius: 15, tint: .conduitAccent.opacity(0.18))
+            if let error { Text(error).scaledFont(.caption).foregroundStyle(.red) }
         }
-        .task { await reload() }
+        // What it showed last time, before the first frame; Hermes'
+        // answer follows.
+        .onAppear {
+            guard defaults == nil, let models = keptModels(), let settings = keptSettings(Self.settingKeys) else { return }
+            show(models, settings: settings)
+        }
+        .task {
+            await reload()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await settleCatalog() }
+        }
     }
 
     private func reload() async {
+        catalogRead += 1
+        pageRead += 1
+        let read = (catalog: catalogRead, page: pageRead, saves: savesLanded)
+        loadFailed = false
         async let modelRequest = loadModels()
-        async let settingRequest = loadSettings(["delegation.provider", "delegation.model", "delegation.reasoning_effort"])
+        async let settingRequest = loadSettings(Self.settingKeys)
         let (loaded, settings) = await (modelRequest, settingRequest)
-        defaults = loaded
+        // A whole-page read asked since has the newer answer.
+        guard read.page == pageRead else { return }
+        // A catalog that didn't load says so, with Try Again, instead of
+        // loading forever; a re-load that fails keeps the one it had.
+        if loaded == nil { loadFailed = true }
+        // A read again that landed since keeps its newer models; a save
+        // that landed meanwhile keeps its picks.
+        let newerModels = catalogLanded > read.catalog ? defaults?.providers : nil
+        show(loaded, settings: settings, picks: read.saves == savesLanded)
+        if let newerModels { defaults?.providers = newerModels } else if loaded != nil { catalogLanded = read.catalog }
+        if loaded != nil { answered = true }
+    }
+
+    /// The read again (issue 1807) takes only Hermes' models, so a save
+    /// that lands while it's asked keeps its picks; one that fails leaves
+    /// the page as it is.
+    private func settleCatalog() async {
+        // After a first read that failed, the whole page reads again.
+        guard answered else { return await reload() }
+        catalogRead += 1
+        let asked = catalogRead
+        guard let loaded = await loadModels(), asked == catalogRead, defaults != nil else { return }
+        defaults?.providers = loaded.providers
+        catalogLanded = asked
+    }
+
+    /// The catalog when there is one, and the picks unless they were
+    /// changed here.
+    private func show(_ loaded: ProfileModelDefaults?, settings: [String: ProfileSettingValue], picks: Bool = true) {
+        if let loaded { defaults = loaded }
+        guard picks, !edited else { return }
         let configuredProvider = settings["delegation.provider"]?.textValue ?? ""
         let configuredModel = settings["delegation.model"]?.textValue ?? ""
-        (provider, model) = loaded?.delegateSelection(provider: configuredProvider, model: configuredModel)
+        (provider, model) = defaults?.delegateSelection(provider: configuredProvider, model: configuredModel)
             ?? (configuredProvider, configuredModel)
         reasoning = settings["delegation.reasoning_effort"]?.textValue ?? ""
     }
+
     private func chooseProvider(_ next: String) {
         guard next != provider else { return }
+        edited = true
         provider = next
-        model = next.isEmpty ? "" : defaults?.providers.first(where: { $0.name == next })?.models.first?.id ?? ""
+        guard !next.isEmpty else {
+            model = ""
+            return
+        }
+        guard let models = defaults?.providers.first(where: { $0.name == next })?.models else { return }
+        if !models.contains(where: { $0.id == model }) {
+            model = models.first?.id ?? ""
+        }
     }
     private func persist() {
         Task {
@@ -2112,7 +2861,89 @@ private struct DelegationModelSettings: View {
             let providerSaved = await save("delegation.provider", .text(provider))
             let modelSaved = providerSaved ? await save("delegation.model", .text(model)) : false
             let reasoningSaved = modelSaved ? await save("delegation.reasoning_effort", .text(reasoning)) : false
-            if !reasoningSaved { error = AppLocalization.string("Could not save delegate defaults.") }
+            if reasoningSaved {
+                edited = false
+                savesLanded += 1
+            } else {
+                error = AppLocalization.string("Could not save delegate defaults.")
+            }
+            saving = false
+        }
+    }
+}
+
+/// Holds new delegate agents on the whole Hermes (`delegation.pause`,
+/// #820). Agents already working carry on.
+private struct DelegationPauseSettings: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// What Hermes said last time, kept on the phone: the card opens on it
+    /// while it asks again (#1533).
+    let kept: () -> Bool?
+    let load: () async -> Bool?
+    let save: (Bool) async -> Bool?
+    @State private var paused: Bool?
+    @State private var loaded = false
+    @State private var saving = false
+    @State private var error: String?
+    /// Changed here since Hermes was asked: its answer, read before the
+    /// change, leaves the toggle as it is.
+    @State private var changed = false
+
+    var body: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Pause delegation"), symbol: "pause.circle", tint: .orange) {
+            if let paused {
+                Toggle(isOn: Binding(get: { paused }, set: { change(to: $0) })) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Pause new delegate agents").scaledFont(.subheadline.weight(.medium))
+                        Text("Hermes starts no new delegate agents while this is on. Agents already working carry on. This applies to every profile on this Hermes.")
+                            .scaledFont(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .tint(.conduitAccent)
+                .disabled(saving)
+                .padding(.vertical, 2)
+                .accessibilityIdentifier("settings.delegationPause")
+            } else if loaded {
+                Text("This Hermes can't pause delegation, or Conduit isn't connected.")
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
+                Button { Task { await reload() } } label: {
+                    Label("Try again", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.settings)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            if let error { Text(error).scaledFont(.caption).foregroundStyle(.red) }
+        }
+        .onAppear {
+            guard paused == nil, !loaded, let keptState = kept() else { return }
+            paused = keptState
+        }
+        .task { await reload() }
+    }
+
+    private func reload() async {
+        changed = false
+        // Try again shows it's asking; a toggle on screen stays up.
+        if paused == nil { loaded = false }
+        let state = await load()
+        // A change made meanwhile keeps its choice, and a read that fails
+        // keeps a state already shown (kept, or read before).
+        if !changed, let state { paused = state }
+        loaded = true
+    }
+
+    private func change(to next: Bool) {
+        guard !saving else { return }
+        saving = true
+        changed = true
+        Task {
+            error = nil
+            if let state = await save(next) {
+                paused = state
+            } else {
+                error = AppLocalization.string("Could not change the delegation pause.")
+            }
             saving = false
         }
     }
@@ -2122,13 +2953,35 @@ private struct DelegationModelSettings: View {
 /// order, when the default model fails.
 private struct FallbackModelsSettings: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    /// The catalog and list Hermes gave last time, kept on the phone: the
+    /// editor opens on them while it asks again (#1533).
+    let keptModels: () -> ProfileModelDefaults?
+    let kept: () -> [ProfileFallbackModel]?
     let loadModels: () async -> ProfileModelDefaults?
     let load: () async -> [ProfileFallbackModel]?
     let save: ([ProfileFallbackModel]) async -> Bool
+    /// Raised when a provider was added or removed: the catalog is read
+    /// again, the rows being edited stay.
+    var refresh = 0
     @State private var defaults: ProfileModelDefaults?
     @State private var entries: [ProfileFallbackModel] = []
     @State private var saved: [ProfileFallbackModel] = []
     @State private var loaded = false
+    /// Hermes' list is in. Until then the kept list can't be edited or
+    /// saved: a save replaces the whole list, and the kept one may be
+    /// stale and has no credentials (an entry's `api_key`) to write back.
+    @State private var answered = false
+    /// Counts the catalog reads, so a read again a later read overtook
+    /// never lands.
+    @State private var catalogRead = 0
+    /// Counts the whole-page reads, so an older one never lands over a
+    /// newer one.
+    @State private var pageRead = 0
+    /// The newest catalog read whose models are shown.
+    @State private var catalogLanded = 0
+    /// Counts the saves Hermes took, so a read asked before one never puts
+    /// back what the save replaced.
+    @State private var savesLanded = 0
     @State private var saving = false
     @State private var error: String?
 
@@ -2137,42 +2990,79 @@ private struct FallbackModelsSettings: View {
     var body: some View {
         ConduitSettingsSection(title: AppLocalization.string("Fallback models"), symbol: "arrow.triangle.branch", tint: .conduitAura) {
             Text("If the default model fails, Hermes tries these in order.")
-                .font(.footnote).foregroundStyle(.secondary)
+                .scaledFont(.footnote).foregroundStyle(.secondary)
             if !loaded {
                 // A list that didn't load is never edited: saving it would
                 // replace the real one.
-                if error == nil { ProgressView("Loading available models…") }
+                if error == nil {
+                    ProgressView("Loading available models…")
+                } else {
+                    Button(AppLocalization.string("Try Again")) { Task { await reload() } }
+                        .buttonStyle(.settings)
+                }
             } else {
                 if entries.isEmpty {
                     Text("No fallback models yet.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .scaledFont(.footnote).foregroundStyle(.secondary)
                 }
                 ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
                     entryRow(index: index, entry: entry)
+                        .disabled(!answered)
                 }
                 AdaptiveStack(spacing: 8) {
                     Button { addEntry() } label: { Label(AppLocalization.string("Add fallback"), systemImage: "plus") }
                         .buttonStyle(.settings)
-                        .disabled(saving || providers.isEmpty)
+                        .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving, ready: !providers.isEmpty))
                     Button(saving ? AppLocalization.string("Saving…") : AppLocalization.string("Save fallbacks")) { persist() }
                         .buttonStyle(.settingsPrimary)
-                        .disabled(saving || entries == saved || entries.contains { !$0.isComplete })
+                        .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving,
+                                                          ready: entries != saved && entries.allSatisfy(\.isComplete)))
                 }
                 if entries.contains(where: { !$0.isComplete }) {
                     Text("Pick a provider and model for every fallback to save.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .scaledFont(.caption).foregroundStyle(.secondary)
+                }
+                if !answered && error != nil {
+                    // The kept list stays up; editing waits for Hermes.
+                    Button(AppLocalization.string("Try Again")) { Task { await reload() } }
+                        .buttonStyle(.settings)
                 }
             }
-            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            if let error { Text(error).scaledFont(.caption).foregroundStyle(.red) }
         }
-        .task { await reload() }
+        // What it showed last time, before the first frame; Hermes'
+        // answer follows.
+        .onAppear {
+            guard !loaded, let models = keptModels(), let keptEntries = kept() else { return }
+            defaults = models
+            entries = keptEntries
+            saved = keptEntries
+            loaded = true
+        }
+        .task {
+            await reload()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await settleCatalog() }
+        }
+        .onChange(of: refresh) { _, _ in
+            Task {
+                catalogRead += 1
+                let asked = catalogRead
+                // A read asked since has the newer models.
+                if let models = await loadModels(), asked == catalogRead {
+                    defaults = models
+                    catalogLanded = asked
+                }
+            }
+        }
     }
 
     private func entryRow(index: Int, entry: ProfileFallbackModel) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(AppLocalization.string("Fallback \(String(index + 1))"))
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                 Spacer()
                 Menu {
                     if index > 0 {
@@ -2184,7 +3074,7 @@ private struct FallbackModelsSettings: View {
                     Button(role: .destructive) { entries.removeAll { $0.id == entry.id } } label: { Label(AppLocalization.string("Delete"), systemImage: "trash") }
                 } label: {
                     Image(systemName: "ellipsis")
-                        .font(.footnote.weight(.semibold))
+                        .scaledFont(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .frame(minWidth: 44, minHeight: 44)
                         .contentShape(Rectangle())
@@ -2247,17 +3137,57 @@ private struct FallbackModelsSettings: View {
     }
 
     private func reload() async {
+        catalogRead += 1
+        pageRead += 1
+        let read = (catalog: catalogRead, page: pageRead, saves: savesLanded)
+        error = nil
         async let modelRequest = loadModels()
         async let entryRequest = load()
         let (models, loadedEntries) = await (modelRequest, entryRequest)
-        defaults = models
-        guard let loadedEntries else {
+        // A whole-page read asked since has the newer answer.
+        guard read.page == pageRead else { return }
+        // Without the model catalog no fallback can be added or changed, so
+        // a half-loaded list fails with Try Again instead of a silently
+        // disabled Add. A re-load (the editor re-appearing) that fails keeps
+        // the catalog and rows it already had: only the error is new.
+        guard let loadedEntries, let models else {
             error = AppLocalization.string("Could not load fallback models.")
             return
         }
-        entries = loadedEntries
+        // A read again that landed since has the newer models.
+        if catalogLanded < read.catalog || defaults == nil {
+            defaults = models
+            catalogLanded = max(catalogLanded, read.catalog)
+        }
+        // A save that landed meanwhile holds the newer list.
+        guard read.saves == savesLanded else {
+            loaded = true
+            answered = true
+            return
+        }
+        // A re-load keeps fallbacks the user is still editing, but what
+        // they compare against is what the host holds now: an edit changed
+        // back to the old list still differs from another client's save.
+        // Rows the answer didn't change stay as drawn.
+        if !loaded || (entries == saved && entries != loadedEntries) {
+            entries = loadedEntries
+        }
         saved = loadedEntries
         loaded = true
+        answered = true
+    }
+
+    /// The read again (issue 1807) takes only Hermes' models, so a save
+    /// that lands while it's asked keeps its picks; one that fails leaves
+    /// the page as it is.
+    private func settleCatalog() async {
+        // After a first read that failed, the whole page reads again.
+        guard answered else { return await reload() }
+        catalogRead += 1
+        let asked = catalogRead
+        guard let models = await loadModels(), asked == catalogRead, defaults != nil else { return }
+        defaults?.providers = models.providers
+        catalogLanded = asked
     }
 
     private func persist() {
@@ -2267,6 +3197,7 @@ private struct FallbackModelsSettings: View {
             let next = entries
             if await save(next) {
                 saved = next
+                savesLanded += 1
             } else {
                 error = AppLocalization.string("Could not save fallback models.")
             }
@@ -2278,24 +3209,45 @@ private struct FallbackModelsSettings: View {
 private struct MemorySettingsDetail: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     let load: ([String]) async -> [String: ProfileSettingValue]
+    let keptValues: ([String]) -> [String: ProfileSettingValue]?
     let save: (String, ProfileSettingValue) async -> Bool
     let loadOptions: () async -> ProfileConfigOptions
+    let keptOptions: () -> ProfileConfigOptions?
     let loadModels: () async -> ProfileModelDefaults?
+    let keptModels: () -> ProfileModelDefaults?
     let loadSchema: () async -> ProfileConfigSchema
+    let keptSchema: () -> ProfileConfigSchema?
     let sections: [ProfileSettingSection]
-    @State private var options = ProfileConfigOptions()
+    let loadDelegationPaused: () async -> Bool?
+    let keptDelegationPaused: () -> Bool?
+    let setDelegationPaused: (Bool) async -> Bool?
+    @State private var options: ProfileConfigOptions?
 
     var body: some View {
+        let shownOptions = options ?? keptOptions() ?? ProfileConfigOptions()
         ProfileConfigSettingsPage(
             title: AppLocalization.string("Memory & delegation"),
             subtitle: AppLocalization.string("Long-term context and delegate-agent defaults."),
             fields: [],
             load: load,
+            keptValues: keptValues,
             save: save,
-            optionOverrides: ["memory.provider": options.memoryProviders, "context.engine": options.contextEngines],
-            trailingSection: AnyView(DelegationModelSettings(loadModels: loadModels, loadSettings: load, save: save)),
+            optionOverrides: ["memory.provider": shownOptions.memoryProviders, "context.engine": shownOptions.contextEngines],
+            trailingSection: AnyView(
+                VStack(spacing: 24) {
+                    DelegationModelSettings(
+                        keptModels: keptModels,
+                        keptSettings: keptValues,
+                        loadModels: loadModels,
+                        loadSettings: load,
+                        save: save
+                    )
+                    DelegationPauseSettings(kept: keptDelegationPaused, load: loadDelegationPaused, save: setDelegationPaused)
+                }
+            ),
             sections: sections,
-            loadSchema: loadSchema
+            loadSchema: loadSchema,
+            keptSchema: keptSchema
         )
         .task { options = await loadOptions() }
     }
@@ -2308,7 +3260,7 @@ enum ProfileConfigValueDisplay {
         "approvals.mode": ["manual": "Manual", "smart": "Smart", "off": "YOLO mode"],
         "code_execution.mode": ["project": "Project", "strict": "Strict"],
         "agent.image_input_mode": ["auto": "Automatic", "native": "Native images", "text": "Text only"],
-        "agent.service_tier": ["normal": "Off", "fast": "Always", "auto": "Start of each turn", "cold": "First turn only"],
+        "agent.service_tier": ["normal": "Off", "fast": "Always", "auto": "Start of each turn", "cold": "First turn only", "ultrafast": "Ultrafast"],
         "updates.non_interactive_local_changes": ["stash": "Keep them", "discard": "Throw them away"],
         "display.personality": [
             "": "Default", "helpful": "Helpful", "concise": "Concise", "technical": "Technical",
@@ -2332,6 +3284,9 @@ struct ProfileConfigSettingsPage: View {
     let subtitle: String
     let fields: [ProfileSettingField]
     let load: ([String]) async -> [String: ProfileSettingValue]
+    /// The values Hermes gave last time, kept on the phone: the page opens
+    /// on them while it asks again (#1533). Nil when none are kept.
+    var keptValues: (([String]) -> [String: ProfileSettingValue]?)? = nil
     let save: (String, ProfileSettingValue) async -> Bool
     var showsNavigationTitle = true
     var optionOverrides: [String: [String]] = [:]
@@ -2344,19 +3299,40 @@ struct ProfileConfigSettingsPage: View {
     /// The gateway's config schema, which hides settings this Hermes lacks
     /// and fills in runtime choices.
     var loadSchema: (() async -> ProfileConfigSchema)? = nil
+    /// The schema last read, kept on the phone; a page with a schema opens
+    /// on its kept values only with it, so no row comes or goes when
+    /// Hermes answers.
+    var keptSchema: (() -> ProfileConfigSchema?)? = nil
+    /// Choices a field gains beyond its schema's, loaded with the page.
+    var loadExtraOptions: (() async -> [String: [String]])? = nil
+    var keptExtraOptions: (() -> [String: [String]]?)? = nil
+    /// Changing it reloads the extra choices.
+    var extraOptionsRefresh = 0
 
+    @State private var extraOptions: [String: [String]] = [:]
     @State private var values: [String: ProfileSettingValue] = [:]
     @State private var drafts: [String: String] = [:]
     @State private var schema = ProfileConfigSchema()
     @State private var loading = true
     @State private var savingKey: String?
-    @State private var error: String?
+    /// Each field's last save problem, shown in its own card.
+    @State private var fieldErrors: [String: String] = [:]
+    /// The field whose save just landed, for a brief "Saved".
+    @State private var savedKey: String?
+    @State private var savedToken = UUID()
+    /// Fields changed here since Hermes was last asked (saved, or typed
+    /// in): its answer, read before the change, leaves them as they are.
+    @State private var changedKeys: Set<String> = []
+    @FocusState private var focusedKey: String?
+
+    /// How long "Saved" stays up after a save lands.
+    private static let savedConfirmationDuration: Duration = .seconds(2)
 
     var body: some View {
         SettingsDetailContainer {
             if let leadingSection { leadingSection }
             if !subtitle.isEmpty {
-                Text(subtitle).font(.footnote).foregroundStyle(.secondary).padding(.horizontal, 16)
+                Text(subtitle).scaledFont(.footnote).foregroundStyle(.secondary).padding(.horizontal, 16)
             }
             if loading {
                 ProgressView("Loading profile settings…").frame(maxWidth: .infinity, minHeight: 180)
@@ -2366,10 +3342,19 @@ struct ProfileConfigSettingsPage: View {
                 }
             }
             if let trailingSection { trailingSection }
-            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red) }
         }
         .navigationTitle(showsNavigationTitle ? title : "")
+        // What it showed last time, before the first frame; Hermes'
+        // answer follows.
+        .onAppear(perform: showKept)
         .task { await reload() }
+        // Also the first load. A newer refresh cancels an older one, so a
+        // slow read for the previous model can't land last.
+        .task(id: extraOptionsRefresh) {
+            let options = await loadExtras()
+            guard !Task.isCancelled else { return }
+            extraOptions = options
+        }
     }
 
     private struct FieldsCard: Identifiable {
@@ -2433,7 +3418,8 @@ struct ProfileConfigSettingsPage: View {
             case .options(let options, let defaultValue):
                 fieldLabel(field)
                 // A runtime list that came back empty falls back to the schema's.
-                let choices = optionOverrides[field.key].flatMap { $0.isEmpty ? nil : $0 } ?? options
+                let baseChoices = optionOverrides[field.key].flatMap { $0.isEmpty ? nil : $0 } ?? options
+                let choices = baseChoices + (extraOptions[field.key] ?? []).filter { !baseChoices.contains($0) }
                 let selectedValue = textValue(field.key, defaultValue: defaultValue)
                 let displayedValue = selectedValue
                 Menu {
@@ -2442,23 +3428,23 @@ struct ProfileConfigSettingsPage: View {
                     }
                 } label: {
                     HStack { Text(ProfileConfigValueDisplay.label(forFieldKey: field.key, displayedValue)); Spacer(); Image(systemName: "chevron.up.chevron.down").foregroundStyle(.secondary) }
-                        .font(.subheadline.weight(.medium)).padding(.horizontal, 12).padding(.vertical, 6).frame(minHeight: 42)
+                        .scaledFont(.subheadline.weight(.medium)).padding(.horizontal, 12).padding(.vertical, 6).frame(minHeight: 42)
                 }
                 .disabled(savingKey != nil || choices.isEmpty).conduitGlassControl(cornerRadius: 14)
                 .accessibilityLabel(Text(field.label))
                 .accessibilityValue(Text(ProfileConfigValueDisplay.label(forFieldKey: field.key, displayedValue)))
-                if choices.isEmpty { Text("No configured choices are available.").font(.caption).foregroundStyle(.secondary) }
+                if choices.isEmpty { Text("No configured choices are available.").scaledFont(.caption).foregroundStyle(.secondary) }
             case .labeledOptions(let options, let defaultValue):
                 fieldLabel(field)
                 let selectedValue = textValue(field.key, defaultValue: defaultValue)
-                let displayedValue = options.first(where: { $0.value == selectedValue })?.label ?? options.first?.label ?? ""
+                let displayedValue = options.first(where: { $0.value == selectedValue })?.label ?? selectedValue
                 Menu {
                     ForEach(options, id: \.value) { option in
                         Button(option.label) { save(field, value: .text(option.value)) }
                     }
                 } label: {
                     HStack { Text(displayedValue); Spacer(); Image(systemName: "chevron.up.chevron.down").foregroundStyle(.secondary) }
-                        .font(.subheadline.weight(.medium)).padding(.horizontal, 12).padding(.vertical, 6).frame(minHeight: 42)
+                        .scaledFont(.subheadline.weight(.medium)).padding(.horizontal, 12).padding(.vertical, 6).frame(minHeight: 42)
                 }
                 .disabled(savingKey != nil || options.isEmpty).conduitGlassControl(cornerRadius: 14)
                 .accessibilityLabel(Text(field.label))
@@ -2472,8 +3458,12 @@ struct ProfileConfigSettingsPage: View {
             case .stringList:
                 fieldLabel(field)
                 listEditor(field)
+            case .timeZone:
+                fieldLabel(field)
+                textEditor(field, defaultValue: "", keyboard: .asciiCapable, placeholder: AppLocalization.string("Server's local time"))
+                timeZoneShortcuts(field)
             }
-            if savingKey == field.key { HStack { ProgressView().controlSize(.small); Text("Saving…").font(.caption).foregroundStyle(.secondary) } }
+            saveStatus(field)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2482,37 +3472,67 @@ struct ProfileConfigSettingsPage: View {
     private func fieldLabel(_ field: ProfileSettingField) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(field.label)
-                .font(.subheadline.weight(.semibold))
+                .scaledFont(.subheadline.weight(.semibold))
                 .foregroundStyle(.primary)
             Text(field.help)
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private func textEditor(_ field: ProfileSettingField, defaultValue: String, keyboard: UIKeyboardType) -> some View {
+    /// Saving…, a brief Saved, or what went wrong, under the field it is about.
+    @ViewBuilder
+    private func saveStatus(_ field: ProfileSettingField) -> some View {
+        if savingKey == field.key {
+            HStack { ProgressView().controlSize(.small); Text("Saving…").scaledFont(.caption).foregroundStyle(.secondary) }
+        } else if let message = fieldErrors[field.key] {
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .scaledFont(.footnote)
+                .foregroundStyle(.red)
+        } else if savedKey == field.key {
+            Label(AppLocalization.string("Saved"), systemImage: "checkmark.circle.fill")
+                .scaledFont(.caption.weight(.semibold))
+                .foregroundStyle(.green)
+                .transition(.opacity)
+        }
+    }
+
+    private func textEditor(_ field: ProfileSettingField, defaultValue: String, keyboard: UIKeyboardType, placeholder: String? = nil) -> some View {
         AdaptiveStack(spacing: 8) {
-            TextField(field.label, text: Binding(get: { drafts[field.key] ?? textValue(field.key, defaultValue: defaultValue) }, set: { drafts[field.key] = $0 }))
+            TextField(placeholder ?? field.label, text: Binding(
+                get: { drafts[field.key] ?? textValue(field.key, defaultValue: defaultValue) },
+                set: {
+                    drafts[field.key] = $0
+                    changedKeys.insert(field.key)
+                    fieldErrors[field.key] = nil
+                }
+            ))
                 .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(keyboard)
+                .focused($focusedKey, equals: field.key)
+                .submitLabel(.done)
+                .onSubmit { saveDraft(field, defaultValue: defaultValue) }
                 .padding(.horizontal, 12).padding(.vertical, 6).frame(minHeight: 42).conduitGlassSurface(cornerRadius: 14)
-            Button("Save") {
-                let raw = drafts[field.key] ?? textValue(field.key, defaultValue: defaultValue)
-                if case .number = field.control, let number = Double(raw) { save(field, value: .number(number)) }
-                else if case .number = field.control { error = AppLocalization.string("Enter a valid number for \(field.label).") }
-                else { save(field, value: .text(raw)) }
-            }
-            .buttonStyle(.settingsPrimary).disabled(savingKey != nil)
-            .accessibilityLabel(Text(AppLocalization.string("Save \(field.label)")))
+                // VoiceOver names the field, not its placeholder.
+                .accessibilityLabel(Text(field.label))
+            Button("Save") { saveDraft(field, defaultValue: defaultValue) }
+                .buttonStyle(.settingsPrimary).disabled(savingKey != nil)
+                .accessibilityLabel(Text(AppLocalization.string("Save \(field.label)")))
         }
     }
 
     /// One entry per line; blank lines are dropped on save.
     private func listEditor(_ field: ProfileSettingField) -> some View {
         VStack(alignment: .trailing, spacing: 8) {
-            TextField(field.label, text: Binding(get: { drafts[field.key] ?? textValue(field.key, defaultValue: "") }, set: { drafts[field.key] = $0 }), axis: .vertical)
+            TextField(field.label, text: Binding(
+                get: { drafts[field.key] ?? textValue(field.key, defaultValue: "") },
+                set: {
+                    drafts[field.key] = $0
+                    changedKeys.insert(field.key)
+                }
+            ), axis: .vertical)
                 .lineLimit(3...8)
-                .font(.subheadline.monospaced())
+                .scaledFont(.subheadline.monospaced())
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                 .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 42).conduitGlassSurface(cornerRadius: 14)
             Button("Save") {
@@ -2530,29 +3550,147 @@ struct ProfileConfigSettingsPage: View {
             .filter { !$0.isEmpty }
     }
 
-    private func reload() async {
-        loading = true
-        let fields = allFields
-        async let valuesRequest = load(fields.map(\.key))
-        schema = await loadSchema?() ?? ProfileConfigSchema()
-        values = await valuesRequest
-        for field in fields { drafts[field.key] = values[field.key]?.textValue }
+    /// One tap to this iPhone's zone, or back to the server's own time.
+    @ViewBuilder
+    private func timeZoneShortcuts(_ field: ProfileSettingField) -> some View {
+        let saved = textValue(field.key, defaultValue: "")
+        let device = TimeZone.current.identifier
+        VStack(alignment: .leading, spacing: 6) {
+            if !ProfileTimeZone.matches(saved, device), case .identifier(let id) = ProfileTimeZone.resolve(device) {
+                Button {
+                    drafts[field.key] = id
+                    commitText(field, value: id)
+                } label: {
+                    Label(AppLocalization.string("Use this iPhone's time zone (\(id))"), systemImage: "location")
+                        .scaledFont(.subheadline.weight(.medium))
+                }
+                .disabled(savingKey != nil)
+            }
+            if !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Button {
+                    drafts[field.key] = ""
+                    commitText(field, value: "")
+                } label: {
+                    Label(AppLocalization.string("Use the server's local time"), systemImage: "server.rack")
+                        .scaledFont(.subheadline.weight(.medium))
+                }
+                .disabled(savingKey != nil)
+            }
+        }
+        .buttonStyle(.borderless)
+        .tint(.conduitAccent)
+    }
+
+    private func saveDraft(_ field: ProfileSettingField, defaultValue: String) {
+        // Return in a field while a save is on its way: the buttons are
+        // disabled, and this waits the same way.
+        guard savingKey == nil else { return }
+        let raw = drafts[field.key] ?? textValue(field.key, defaultValue: defaultValue)
+        switch field.control {
+        case .number:
+            guard let number = ProfileSettingValue.parseNumber(raw) else {
+                fieldErrors[field.key] = AppLocalization.string("Enter a valid number for \(field.label).")
+                return
+            }
+            focusedKey = nil
+            save(field, value: .number(number))
+        case .timeZone:
+            guard let value = ProfileTimeZone.resolve(raw).storedValue else {
+                fieldErrors[field.key] = AppLocalization.string("That isn't a time zone name. Use one like America/Toronto or Europe/Paris, or leave it blank for the server's local time.")
+                return
+            }
+            drafts[field.key] = value
+            commitText(field, value: value)
+        default:
+            commitText(field, value: raw)
+        }
+    }
+
+    private func commitText(_ field: ProfileSettingField, value: String) {
+        focusedKey = nil
+        save(field, value: .text(value))
+    }
+
+    /// Once: a page that comes back keeps what it shows while it asks again.
+    private func showKept() {
+        guard loading, let kept = keptValues?(allFields.map(\.key)) else { return }
+        if loadSchema != nil {
+            guard let schemaKept = keptSchema?() else { return }
+            schema = schemaKept
+        }
+        if let options = keptExtraOptions?() { extraOptions = options }
+        values = kept
+        for field in allFields { drafts[field.key] = kept[field.key]?.textValue }
         loading = false
     }
 
+    private func reload() async {
+        // A save still in flight keeps its field: the answer may be read
+        // before it lands.
+        changedKeys = savingKey.map { [$0] } ?? []
+        let fields = allFields
+        async let valuesRequest = load(fields.map(\.key))
+        let answeredSchema = await loadSchema?() ?? ProfileConfigSchema()
+        let answered = await valuesRequest
+        schema = answeredSchema
+        let changes = Self.answerChanges(
+            answered, keys: fields.map(\.key), changedHere: changedKeys, typingIn: focusedKey,
+            values: values, drafts: drafts
+        )
+        for (key, value) in changes.values { values[key] = value }
+        for (key, draft) in changes.drafts { drafts[key] = draft }
+        loading = false
+    }
+
+    /// What Hermes' answer changes on the page (#1533): only the fields it
+    /// changed redraw, a field changed here since it was asked keeps its
+    /// choice, and the one being typed in keeps its text.
+    nonisolated static func answerChanges(
+        _ answered: [String: ProfileSettingValue],
+        keys: [String],
+        changedHere: Set<String>,
+        typingIn focusedKey: String?,
+        values: [String: ProfileSettingValue],
+        drafts: [String: String]
+    ) -> (values: [String: ProfileSettingValue?], drafts: [String: String?]) {
+        var changes: (values: [String: ProfileSettingValue?], drafts: [String: String?]) = ([:], [:])
+        for key in keys where !changedHere.contains(key) {
+            if values[key] != answered[key] { changes.values[key] = .some(answered[key]) }
+            if focusedKey != key, drafts[key] != answered[key]?.textValue {
+                changes.drafts[key] = .some(answered[key]?.textValue)
+            }
+        }
+        return changes
+    }
+
+    private func loadExtras() async -> [String: [String]] {
+        await loadExtraOptions?() ?? [:]
+    }
+
     private func save(_ field: ProfileSettingField, value: ProfileSettingValue) {
+        // One save at a time: an older one failing after a newer one landed
+        // would put back the value from before both.
+        guard savingKey == nil else { return }
         let previous = values[field.key]
         values[field.key] = value
-        error = nil
+        changedKeys.insert(field.key)
+        fieldErrors[field.key] = nil
+        if savedKey == field.key { savedKey = nil }
+        savingKey = field.key
         Task {
-            savingKey = field.key
             guard await save(field.key, value) else {
                 values[field.key] = previous
-                error = AppLocalization.string("Could not save \(field.label).")
+                fieldErrors[field.key] = AppLocalization.string("Could not save \(field.label).")
                 savingKey = nil
                 return
             }
             savingKey = nil
+            let token = UUID()
+            savedToken = token
+            withAnimation { savedKey = field.key }
+            try? await Task.sleep(for: Self.savedConfirmationDuration)
+            guard savedToken == token else { return }
+            withAnimation { savedKey = nil }
         }
     }
 
@@ -2563,6 +3701,7 @@ struct ProfileConfigSettingsPage: View {
 private struct GatewaySettingsDetail: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
+    let title: String
     let snapshot: SettingsSnapshot
     let reconnect: () async -> Bool
     let disconnect: () -> Void
@@ -2576,11 +3715,12 @@ private struct GatewaySettingsDetail: View {
     @State private var reconnecting = false
     @State private var cloudflareEnabled: Bool
     @State private var clientID: String
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var clientSecret = ""
     @State private var confirmingRestart = false
 
-    init(snapshot: SettingsSnapshot, reconnect: @escaping () async -> Bool, disconnect: @escaping () -> Void, close: @escaping () -> Void, saveCloudflareAccess: @escaping (String, String) -> Void, removeCloudflareAccess: @escaping () -> Void, customHeaders: [CustomHeader], saveCustomHeaders: @escaping ([CustomHeader]) -> Void) {
-        self.snapshot = snapshot; self.reconnect = reconnect; self.disconnect = disconnect; self.close = close
+    init(title: String, snapshot: SettingsSnapshot, reconnect: @escaping () async -> Bool, disconnect: @escaping () -> Void, close: @escaping () -> Void, saveCloudflareAccess: @escaping (String, String) -> Void, removeCloudflareAccess: @escaping () -> Void, customHeaders: [CustomHeader], saveCustomHeaders: @escaping ([CustomHeader]) -> Void) {
+        self.title = title; self.snapshot = snapshot; self.reconnect = reconnect; self.disconnect = disconnect; self.close = close
         self.saveCloudflareAccess = saveCloudflareAccess; self.removeCloudflareAccess = removeCloudflareAccess
         self.saveCustomHeaders = saveCustomHeaders
         _customHeaders = State(initialValue: customHeaders)
@@ -2601,23 +3741,24 @@ private struct GatewaySettingsDetail: View {
                     .accessibilityIdentifier("settings.gateway.restart")
                 GatewayRestartStatusView()
                 Text("Reconnect only reconnects Conduit. Restart Gateway restarts Hermes' gateway on your host.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
                 // The gateway's state, connectors, last connection and logs,
                 // which the chat header used to open.
+                // Open while disconnected too: that's when its logs, traces
+                // and device reports are needed most.
                 NavigationLink {
-                    GatewayDiagnosticsSheet(embedded: true)
+                    GatewayDiagnosticsSheet(placement: .settings)
                         .v2TabBarClearance()
                 } label: {
                     Label(AppLocalization.string("Diagnostics & logs"), systemImage: "doc.text.magnifyingglass")
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .frame(minHeight: 44)
                 }
-                .disabled(snapshot.server == nil)
                 .accessibilityIdentifier("settings.gateway.diagnostics")
             }
             ConduitSettingsSection(title: "Cloudflare Access", symbol: "shield.lefthalf.filled", tint: .conduitAccent) {
                 Toggle("Use service token", isOn: Binding(get: { cloudflareEnabled }, set: { enabled in
-                    cloudflareEnabled = enabled
+                    withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) { cloudflareEnabled = enabled }
                     if !enabled { clientSecret = ""; removeCloudflareAccess() }
                 }))
                 if cloudflareEnabled {
@@ -2627,12 +3768,12 @@ private struct GatewaySettingsDetail: View {
                     Button("Save token") { saveCloudflareAccess(clientID, clientSecret); clientSecret = "" }
                         .buttonStyle(.settingsPrimary)
                     Text("The secret is stored only in Keychain. Reconnect after changing it.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .scaledFont(.footnote).foregroundStyle(.secondary)
                 }
             }
             ConduitSettingsSection(title: AppLocalization.string("Extra headers"), symbol: "list.bullet.rectangle", tint: .conduitAccent) {
                 Text(AppLocalization.string("For reverse proxies such as Pangolin, Traefik, or nginx that check a header. Sent only to this server, over HTTPS."))
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
                 let configured = CustomHeaderPolicy.sendable(customHeaders)
                 ForEach(configured) { header in
                     SettingsMetricRow(label: header.name, value: "••••••", lineLimit: 1)
@@ -2641,12 +3782,12 @@ private struct GatewaySettingsDetail: View {
                     .disabled(snapshot.server == nil)
                     .accessibilityIdentifier("gateway.extra-headers")
                 Text(AppLocalization.string("Reconnect after changing them."))
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
             }
             Button(role: .destructive) { disconnect(); close() } label: { Label(AppLocalization.string("Sign Out of This Dashboard"), systemImage: "rectangle.portrait.and.arrow.right").frame(maxWidth: .infinity).padding(.vertical, 6).frame(minHeight: 48) }
                 .conduitGlassControl(cornerRadius: 18, tint: .red.opacity(0.18))
         }
-        .navigationTitle("Gateway")
+        .navigationTitle(title)
         .gatewayRestartConfirmation(isPresented: $confirmingRestart)
         .sheet(isPresented: $showCustomHeaders) {
             CustomHeadersEditorSheet(serverURL: snapshot.server ?? "", headers: customHeaders) { headers in
@@ -2665,7 +3806,10 @@ private struct AppearanceSettingsDetail: View {
     @AppStorage("conduit.ipadPersistentSidebar") private var iPadPersistentSidebar = false
     @AppStorage(V2ShellPreference.key) private var usesV2 = V2ShellPreference.defaultValue
     @AppStorage(V2MainButtonPreference.key) private var mainButtonNewChat = V2MainButtonPreference.defaultValue
-    @AppStorage(ConduitAccentChoice.storageKey) private var accentChoice = ConduitAccentChoice.defaultChoice
+    @AppStorage(V2ChatListPreference.key) private var chatListBeside = V2ChatListPreference.defaultValue
+    @AppStorage(ChatVoiceButtonAction.key) private var chatVoiceButton = ChatVoiceButtonAction.defaultValue.rawValue
+    @AppStorage(ProjectChatsInChats.key) private var projectChats = ProjectChatsInChats.defaultValue
+    @AppStorage(ConduitAccent.storageKey) private var accentChoice = ConduitAccent.defaultValue
     @State private var selected: ThemePreference
     @State private var isChangingIcon = false
     init(theme: ThemePreference, saveTheme: @escaping (ThemePreference) -> Void) { self.theme = theme; self.saveTheme = saveTheme; _selected = State(initialValue: theme) }
@@ -2673,7 +3817,7 @@ private struct AppearanceSettingsDetail: View {
     var body: some View {
         SettingsDetailContainer {
             ConduitSettingsSection(title: AppLocalization.string("Theme"), symbol: "circle.lefthalf.filled", tint: .conduitAccent) {
-                Text("Choose how Conduit appears across this device.").font(.footnote).foregroundStyle(.secondary)
+                Text("Choose how Conduit appears across this device.").scaledFont(.footnote).foregroundStyle(.secondary)
                 Picker("Theme", selection: Binding(get: { selected }, set: {
                     selected = $0
                     Haptics.selection()
@@ -2684,13 +3828,13 @@ private struct AppearanceSettingsDetail: View {
             }
             ConduitSettingsSection(title: AppLocalization.string("Accent color"), symbol: "paintpalette", tint: .conduitAccent) {
                 Text("Choose the color of your own messages and Conduit’s highlights.")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                 AccentColorPicker(selection: $accentChoice)
             }
             ConduitSettingsSection(title: AppLocalization.string("App language"), symbol: "globe", tint: .conduitAccent) {
                 Text("Choose the language Conduit’s interface uses. Speech, transcription, and provider language settings are unaffected.")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                 // System Default plus two languages fit a segmented control;
                 // more languages get the settings menu row.
@@ -2719,7 +3863,7 @@ private struct AppearanceSettingsDetail: View {
             }
             ConduitSettingsSection(title: AppLocalization.string("App icon"), symbol: "app.badge", tint: .conduitAura) {
                 Text("Choose the icon shown on your Home Screen.")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 12) {
                     ForEach(AppIconChoice.allCases) { choice in
@@ -2743,7 +3887,7 @@ private struct AppearanceSettingsDetail: View {
                                         Image(systemName: "checkmark.circle.fill")
                                     }
                                 }
-                                .font(.caption.weight(.semibold))
+                                .scaledFont(.caption.weight(.semibold))
                             }
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
@@ -2769,7 +3913,7 @@ private struct AppearanceSettingsDetail: View {
             if usesV2 {
                 ConduitSettingsSection(title: AppLocalization.string("Main button"), symbol: "circle.circle.fill", tint: .conduitAccent) {
                     Text("Choose what the round button beside the tabs does. The other one moves to the top bar, and a chat keeps its voice button.")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                     Picker("Main button", selection: Binding(get: { mainButtonNewChat }, set: {
                         Haptics.selection()
@@ -2780,59 +3924,230 @@ private struct AppearanceSettingsDetail: View {
                     }
                     .pickerStyle(.segmented)
                 }
+
+                // The big button beside a chat's composer. A profile can
+                // choose its own in Settings > Voice.
+                ConduitSettingsSection(title: AppLocalization.string("Chat voice button"), symbol: "mic.circle", tint: .conduitAccent) {
+                    Text("Choose what the round button beside a chat's message box does. A live call stays in the chat's top bar and in the button's touch-and-hold menu. Each profile can choose its own in Voice settings.")
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                    Picker("Chat voice button", selection: Binding(
+                        get: { ChatVoiceButtonAction.resolved(profile: nil, app: chatVoiceButton) },
+                        set: {
+                            Haptics.selection()
+                            chatVoiceButton = $0.rawValue
+                        }
+                    )) {
+                        ForEach(ChatVoiceButtonAction.offered, id: \.self) { action in
+                            Text(action.title).tag(action)
+                        }
+                    }
+                    // Three choices whose names run long in some languages.
+                    .pickerStyle(.menu)
+                }
+
+                // A project's chats otherwise show only on its page.
+                ConduitSettingsSection(title: AppLocalization.string("Project chats"), symbol: "folder", tint: .conduitAccent) {
+                    Text("Choose whether chats inside a project also appear in Chats, with the project’s name under the title. Recent shows the ones active today or yesterday. To leave some projects out, untick them in Filter > Projects.")
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                    Picker("Project chats", selection: Binding(get: { projectChats }, set: {
+                        Haptics.selection()
+                        projectChats = $0
+                    })) {
+                        Text("Off").tag(ProjectChatsInChats.hidden)
+                        Text("Recent").tag(ProjectChatsInChats.recent)
+                        Text("All").tag(ProjectChatsInChats.all)
+                    }
+                    .pickerStyle(.segmented)
+                }
             }
 
-            if isPad {
+            // V2's wide windows: the list beside the open chat, or the
+            // chat on its own (#1164). The chat's top bar switches it too.
+            if isPad, usesV2 {
+                ConduitSettingsSection(title: AppLocalization.string("Layout"), symbol: "sidebar.left", tint: .conduitAura) {
+                    Text("Choose whether Chats and Bots keep their list beside the open chat when the window is wide enough. The sidebar button at the top of a chat switches it too.")
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                    Picker("Chat list", selection: Binding(get: { chatListBeside }, set: {
+                        Haptics.selection()
+                        chatListBeside = $0
+                    })) {
+                        Text("Beside chat").tag(true)
+                        Text("Hidden").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    // #1487: the list's width follows the user's drag.
+                    if chatListBeside {
+                        Text("Drag the line beside the list to make it wider or narrower.")
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else if isPad {
                 ConduitSettingsSection(title: AppLocalization.string("Layout"), symbol: "sidebar.left", tint: .conduitAura) {
                     Toggle("Persistent session sidebar", isOn: $iPadPersistentSidebar)
                         .tint(.conduitAccent)
                     Text("Keep Sessions, Cron, and Kanban visible beside the current conversation when the window is wide enough.")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
+                    if iPadPersistentSidebar {
+                        Text("Drag the line beside the list to make it wider or narrower.")
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }.navigationTitle("Appearance")
     }
 }
 
-/// One swatch per preset accent (#697); the pick redraws the app in place.
+/// One swatch per preset accent (#697), then a colour of the user's own;
+/// the pick redraws the app in place.
 private struct AccentColorPicker: View {
-    @Binding var selection: ConduitAccentChoice
+    @Binding var selection: ConduitAccent
     @Environment(\.colorScheme) private var colorScheme
+    /// The last colour of the user's own, kept while a preset is picked so
+    /// the custom swatch reopens on it.
+    @AppStorage(CustomAccentColor.lastPickKey) private var lastCustomHex = CustomAccentColor.firstPick.hex
+
+    private var isCustom: Bool {
+        if case .custom = selection { return true }
+        return false
+    }
 
     var body: some View {
-        HStack(spacing: 0) {
-            ForEach(ConduitAccentChoice.allCases) { choice in
-                let isSelected = choice == selection
-                Button {
-                    guard !isSelected else { return }
-                    Haptics.selection()
-                    selection = choice
-                } label: {
-                    Circle()
-                        .fill(Color(uiColor: choice.color(dark: colorScheme == .dark)))
-                        .frame(width: 32, height: 32)
-                        .overlay {
-                            if isSelected {
-                                Image(systemName: "checkmark")
-                                    .font(.footnote.weight(.bold))
-                                    .foregroundStyle(Color(uiColor: choice.selectionColorOnBubble(dark: colorScheme == .dark)))
-                            }
-                        }
-                        .padding(4)
-                        .overlay {
-                            Circle()
-                                .strokeBorder(isSelected ? Color.primary.opacity(0.55) : .clear, lineWidth: 2)
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .contentShape(Rectangle())
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 0) {
+                ForEach(ConduitAccentChoice.allCases) { choice in
+                    presetSwatch(choice)
                 }
-                .buttonStyle(PressableButtonStyle())
-                .accessibilityLabel(choice.title)
-                .accessibilityAddTraits(isSelected ? .isSelected : [])
+                customSwatch
+            }
+            .conduitFixedGlyph()
+            if isCustom {
+                Text("Your color is adjusted where needed so text stays readable in light and dark mode.")
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.secondary)
+                AccentPreview()
             }
         }
-        .conduitFixedGlyph()
+        // A custom colour that arrives from another device is the one the
+        // custom swatch reopens on too.
+        .onChange(of: selection) { _, newSelection in
+            if case .custom(let custom) = newSelection { lastCustomHex = custom.hex }
+        }
+    }
+
+    private func presetSwatch(_ choice: ConduitAccentChoice) -> some View {
+        let isSelected = selection == .preset(choice)
+        let fill = choice.color(dark: colorScheme == .dark)
+        return Button {
+            guard !isSelected else { return }
+            Haptics.selection()
+            selection = .preset(choice)
+        } label: {
+            Circle()
+                .fill(Color(uiColor: fill))
+                .frame(width: 32, height: 32)
+                .overlay {
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .scaledFont(.footnote.weight(.bold))
+                            .foregroundStyle(Color(uiColor: ConduitAccentChoice.markColor(on: fill)))
+                    }
+                }
+                .modifier(AccentSwatchFrame(isSelected: isSelected))
+        }
+        .buttonStyle(PressableButtonStyle())
+        .accessibilityLabel(choice.title)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    /// The system colour picker, its well in the swatch row. Picking in it
+    /// selects the custom accent; tapping the well again reopens the pick.
+    private var customSwatch: some View {
+        ColorPicker(selection: customColor, supportsOpacity: false) {
+            Text("Custom color")
+        }
+        .labelsHidden()
+        .frame(width: 32, height: 32)
+        .modifier(AccentSwatchFrame(isSelected: isCustom))
+        .accessibilityAddTraits(isCustom ? .isSelected : [])
+    }
+
+    private var customColor: Binding<Color> {
+        Binding(
+            get: {
+                let pick: CustomAccentColor
+                if case .custom(let custom) = selection {
+                    pick = custom
+                } else {
+                    pick = CustomAccentColor(hex: lastCustomHex) ?? CustomAccentColor.firstPick
+                }
+                return Color(uiColor: UIColor(pick.picked))
+            },
+            set: { color in
+                var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+                guard UIColor(color).getRed(&red, green: &green, blue: &blue, alpha: &alpha) else { return }
+                // The picker can hand back Display P3; stored components are sRGB.
+                let srgb = CGColorSpace(name: CGColorSpace.sRGB).flatMap {
+                    UIColor(color).cgColor.converted(to: $0, intent: .defaultIntent, options: nil)
+                }
+                if let components = srgb?.components, components.count >= 3 {
+                    (red, green, blue) = (components[0], components[1], components[2])
+                }
+                let pick = CustomAccentColor(red: red, green: green, blue: blue)
+                guard selection != .custom(pick) else { return }
+                if !isCustom { Haptics.selection() }
+                lastCustomHex = pick.hex
+                selection = .custom(pick)
+            }
+        )
+    }
+}
+
+/// A swatch's ring when picked, and its full-width 44 pt hit region.
+private struct AccentSwatchFrame: ViewModifier {
+    let isSelected: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .padding(4)
+            .overlay {
+                Circle()
+                    .strokeBorder(isSelected ? Color.primary.opacity(0.55) : .clear, lineWidth: 2)
+            }
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
+    }
+}
+
+/// A sent message and accent text, drawn as the app will draw them, so a
+/// colour of the user's own shows its adjusted shades.
+private struct AccentPreview: View {
+    var body: some View {
+        HStack(spacing: 12) {
+            Label("Highlights", systemImage: "sparkles")
+                .scaledFont(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.conduitAccent)
+            Spacer(minLength: 8)
+            Text("Your messages")
+                .scaledFont(.subheadline)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(
+                    LinearGradient(
+                        colors: [.conduitUserBubble, .conduitUserBubbleShade],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+                )
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -2847,6 +4162,10 @@ private struct NotificationsSettingsDetail: View {
     @State private var relayDraftInvalid = false
     @State private var pairing = false
     @State private var pairingError: String?
+    /// The profile the last Pair tap was for: what it did stays on screen
+    /// (a haptic alone left people unsure anything happened), for that
+    /// profile only.
+    @State private var pairTapProfile: String?
     @AppStorage(LiveTurnActivities.enabledDefaultsKey) private var liveActivitiesEnabled = true
 
     private func trimmed(_ value: String) -> String {
@@ -2921,32 +4240,35 @@ private struct NotificationsSettingsDetail: View {
                 )
                 if let error = notifications.lastError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.red)
                 }
             }
 
             // #605: a running turn on the Lock Screen and in the Dynamic
             // Island. Updated by Conduit while it runs; in the background
-            // only through the relay, so it needs notifications on.
-            ConduitSettingsSection(title: AppLocalization.string("Lock Screen"), symbol: "lock.iphone", tint: .conduitAccent) {
-                Toggle(isOn: Binding(
-                    get: { liveActivitiesEnabled },
-                    set: { value in
-                        Haptics.selection()
-                        liveActivitiesEnabled = value
-                        if !value { LiveTurnActivities.shared.endAll() }
+            // only through the relay, so it needs notifications on. A Mac
+            // has neither (issue 1877).
+            if LiveTurnActivities.isAvailable {
+                ConduitSettingsSection(title: AppLocalization.string("Lock Screen"), symbol: "lock.iphone", tint: .conduitAccent) {
+                    Toggle(isOn: Binding(
+                        get: { liveActivitiesEnabled },
+                        set: { value in
+                            Haptics.selection()
+                            liveActivitiesEnabled = value
+                            if !value { LiveTurnActivities.shared?.endAll() }
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(AppLocalization.string("Show progress on the Lock Screen"))
+                            Text(AppLocalization.string("While Hermes works on a message you sent: what it's doing, how long it has run, its tools and context. Keeps updating in the background when notifications are on."))
+                                .scaledFont(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(AppLocalization.string("Show progress on the Lock Screen"))
-                        Text(AppLocalization.string("While Hermes works on a message you sent: what it's doing, how long it has run, its tools and context. Keeps updating in the background when notifications are on."))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    .tint(.conduitAccent)
+                    .accessibilityIdentifier("notifications.live-activities")
                 }
-                .tint(.conduitAccent)
-                .accessibilityIdentifier("notifications.live-activities")
             }
 
             if notifications.isEnabled {
@@ -2954,7 +4276,7 @@ private struct NotificationsSettingsDetail: View {
                     // The relay keeps one set of preferences per iPhone.
                     if appState.savedDashboardRegistry.dashboards.count > 1 {
                         Text(AppLocalization.string("These apply to every dashboard paired with this iPhone."))
-                            .font(.footnote)
+                            .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     notificationToggle(AppLocalization.string("Approval needed"), detail: AppLocalization.string("A tool is waiting for approval"), keyPath: \.approvalNeeded)
@@ -2964,7 +4286,7 @@ private struct NotificationsSettingsDetail: View {
                     notificationToggle(AppLocalization.string("Background task finished"), detail: AppLocalization.string("A delegated agent completes"), keyPath: \.backgroundTaskFinished)
                     notificationToggle(AppLocalization.string("Approval & input sound"), detail: AppLocalization.string("Play a sound when Hermes is waiting on you"), keyPath: \.attentionSound)
                     notificationToggle(AppLocalization.string("Completion sound"), detail: AppLocalization.string("Play a sound when a turn or task finishes"), keyPath: \.completionSound)
-                    notificationToggle(AppLocalization.string("Show previews"), detail: AppLocalization.string("Include response text in notifications"), keyPath: \.showPreviews)
+                    notificationDetailPicker
                     notificationToggle(AppLocalization.string("Approval cards in pushes"), detail: AppLocalization.string("Include approval details so cards work from notifications. Disable for maximum privacy."), keyPath: \.decisionCards)
                 }
 
@@ -2980,17 +4302,20 @@ private struct NotificationsSettingsDetail: View {
                 ConduitSettingsSection(title: AppLocalization.string("Compatibility"), symbol: "checkmark.seal", tint: .conduitAura) {
                     if appState.savedDashboardRegistry.dashboards.count > 1, let label = appState.savedDashboardRegistry.activeDashboardLabel {
                         Text("Showing \(label). Switch dashboards to check another one.")
-                            .font(.footnote)
+                            .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     // The plugin itself has its own page; here only a way there
                     // when it needs attention.
-                    if appState.notifierPlugin.updateAvailable || appState.notifierPlugin.restartPending {
-                        pluginPageLink(AppLocalization.string("Update the Conduit plugin"))
+                    if appState.notifierPlugin.needsAttention {
+                        // Missing, or on the host but not running: nothing to update.
+                        pluginPageLink(appState.notifierPlugin.offersInstall || appState.notifierPlugin.isNotServed
+                            ? AppLocalization.string("Open Conduit plugin")
+                            : AppLocalization.string("Update the Conduit plugin"))
                     }
                     if notifications.isFetchingMeta {
                         Text("Checking compatibility…")
-                            .font(.footnote)
+                            .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                     } else if let meta = notifications.relayMeta {
                         compatibilityRow(
@@ -3004,7 +4329,8 @@ private struct NotificationsSettingsDetail: View {
                         let pairings = NotificationDashboardPairings(
                             gateways: meta.gateways,
                             activeDashboardID: appState.activeDashboardID,
-                            savedDashboardIDs: appState.savedDashboardRegistry.dashboards.map(\.id)
+                            savedDashboardIDs: appState.savedDashboardRegistry.dashboards.map(\.id),
+                            activeDashboardGatewayIDs: appState.activeDashboardRelayGatewayIDs
                         )
                         // Without a selected dashboard there is nothing to
                         // pair yet (and `pairings` is empty); the pairing
@@ -3022,11 +4348,26 @@ private struct NotificationsSettingsDetail: View {
                         ForEach(pairings.thisDashboard) { gateway in
                             gatewayRow(gateway)
                         }
+                        if notifications.canRotateEncryptionKeys(gatewayIDs: pairings.thisDashboard.map(\.id)) {
+                            Button {
+                                notifications.requestEncryptionKeyRotation()
+                                Task { await appState.provisionNotificationEncryptionNow() }
+                            } label: {
+                                Label(AppLocalization.string("Rotate encryption keys"), systemImage: "arrow.triangle.2.circlepath")
+                            }
+                            .scaledFont(.footnote)
+                            // A tap while keys are being set up would only
+                            // wait for the next connect.
+                            .disabled(notifications.isProvisioningEncryption)
+                            Text("Conduit gives this dashboard's hosts new keys by itself every 7 days. The old keys still open notifications already on their way for 7 days.")
+                                .scaledFont(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                         // One host, one set of commands, however many of its
                         // pairings are behind. The host row above already
                         // offers them when the plugin itself reports it is
                         // behind.
-                        if !(appState.notifierPlugin.updateAvailable || appState.notifierPlugin.restartPending),
+                        if !appState.notifierPlugin.needsAttention,
                            pairings.thisDashboard.contains(where: Self.isOutdated) {
                             pluginPageLink(AppLocalization.string("Update the Conduit plugin"))
                         }
@@ -3040,17 +4381,21 @@ private struct NotificationsSettingsDetail: View {
                         }
                         if pairings.otherDashboardsCount > 0 {
                             Text("\(pairings.otherDashboardsCount) more pairings belong to your other dashboards.")
-                                .font(.footnote)
+                                .scaledFont(.footnote)
                                 .foregroundStyle(.secondary)
                         }
                         if pairings.unrecognizedCount > 0 {
                             Text("\(pairings.unrecognizedCount) more pairings don't match any dashboard saved on this iPhone.")
-                                .font(.footnote)
+                                .scaledFont(.footnote)
                                 .foregroundStyle(.secondary)
                         }
+                    } else if notifications.relayMetaFetchFailed {
+                        Text("Couldn't reach the push relay to check compatibility.")
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.secondary)
                     } else {
                         Text("Compatibility unknown. Your relay predates version reporting; decision cards may not be available until it updates.")
-                            .font(.footnote)
+                            .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -3070,10 +4415,18 @@ private struct NotificationsSettingsDetail: View {
                     if appState.notifierPlugin.reports("pairing") {
                         oneTapPairing
                     } else {
-                        Text("Install the Conduit plugin on each dashboard's host, then create a short-lived pairing code here for each Hermes dashboard you want to reach.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                        pluginPageLink(AppLocalization.string("Install or update the Conduit plugin"))
+                        // Installed but not running: installing again can't help.
+                        if appState.notifierPlugin.isNotServed {
+                            Text("Installed on this dashboard's host, but the dashboard doesn't run it. Turn it on in Hermes, then restart the gateway and the dashboard.")
+                                .scaledFont(.footnote)
+                                .foregroundStyle(.secondary)
+                            pluginPageLink(AppLocalization.string("Open Conduit plugin"))
+                        } else {
+                            Text("Install the Conduit plugin on each dashboard's host, then create a short-lived pairing code here for each Hermes dashboard you want to reach.")
+                                .scaledFont(.footnote)
+                                .foregroundStyle(.secondary)
+                            pluginPageLink(AppLocalization.string("Install or update the Conduit plugin"))
+                        }
                         Button {
                             Task {
                                 // Pairings are bound to the active dashboard
@@ -3095,7 +4448,7 @@ private struct NotificationsSettingsDetail: View {
                         .conduitGlassControl(cornerRadius: 16, tint: .conduitAccent.opacity(0.16))
                         if appState.activeDashboardID == nil {
                             Text("Connect to a dashboard before creating a pairing code.")
-                                .font(.footnote)
+                                .scaledFont(.footnote)
                                 .foregroundStyle(.secondary)
                         }
 
@@ -3103,7 +4456,7 @@ private struct NotificationsSettingsDetail: View {
                             NotificationSetupCommand(step: 3, title: AppLocalization.string("Pair the active dashboard"), command: "hermes conduit-push pair \(code)")
                             if let expiry = notifications.pairingExpiry {
                                 Text("This code expires \(expiry).")
-                                    .font(.caption)
+                                    .scaledFont(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -3111,14 +4464,14 @@ private struct NotificationsSettingsDetail: View {
                 }
                 ConduitSettingsSection(title: AppLocalization.string("Verify pairing"), symbol: "checkmark.seal", tint: .conduitAccent) {
                     Text("After pairing, run these on the same Hermes profile. First confirm the local relay credential, then send a test. You should receive the test notification on this iPhone within a few seconds.")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                     NotificationSetupCommand(step: 4, title: AppLocalization.string("Check pairing status"), command: "hermes conduit-push status")
                     NotificationSetupCommand(step: 5, title: AppLocalization.string("Send a test notification"), command: "hermes conduit-push test")
                 }
                 ConduitSettingsSection(title: AppLocalization.string("How it works"), symbol: "hand.raised", tint: .conduitAura) {
                     Text("The notifier receives a revocable credential for this phone. Your gateway never needs the phone’s push token, and you can turn notifications off here at any time.")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -3129,9 +4482,9 @@ private struct NotificationsSettingsDetail: View {
             ConduitSettingsSection(title: AppLocalization.string("Push relay"), symbol: "server.rack", tint: .conduitAura) {
                 // Edits stay a draft until saved, so a half-typed URL never
                 // becomes the relay; saving moves an active registration.
-                TextField("https://push.milim.dev", text: $relayDraft)
+                TextField(PushNotificationService.defaultRelayURL.absoluteString, text: $relayDraft)
                     .textFieldStyle(.plain)
-                    .font(.body.monospaced())
+                    .scaledFont(.body.monospaced())
                     .padding(.vertical, 4)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
@@ -3143,15 +4496,15 @@ private struct NotificationsSettingsDetail: View {
                     .onChange(of: relayDraft) { _, _ in relayDraftInvalid = false }
                 if relayDraftInvalid {
                     Label(AppLocalization.string("Enter a full HTTPS relay URL, like https://push.example.com."), systemImage: "exclamationmark.triangle.fill")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.red)
                 }
                 Text("Leave blank to use the default relay. A relay you run yourself only works with a Conduit build signed with your own Apple developer account, because Apple only delivers this app's notifications through its developer's key.")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                 if notifications.isEnabled && relayDraftIsUnsaved {
                     Text("Saving moves this iPhone to the new relay. You'll need to pair each Hermes profile again.")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                 }
                 // A failed move leaves the phone on the old relay with the
@@ -3185,7 +4538,7 @@ private struct NotificationsSettingsDetail: View {
                 }
                 if let notice = notifications.relayNotice {
                     Label(notice, systemImage: "info.circle.fill")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -3205,10 +4558,10 @@ private struct NotificationsSettingsDetail: View {
                     .foregroundStyle(.orange)
                     .accessibilityHidden(true)
                 Text(verbatim: title)
-                    .font(.subheadline.weight(.medium))
+                    .scaledFont(.subheadline.weight(.medium))
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Image(systemName: "chevron.right")
-                    .font(.footnote.weight(.semibold))
+                    .scaledFont(.footnote.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
             }
@@ -3225,12 +4578,13 @@ private struct NotificationsSettingsDetail: View {
     private var oneTapPairing: some View {
         let profile = appState.activeProfile
         Text("Conduit pairs this dashboard's profile by itself. If it says another iPhone is paired, pairing here moves its notifications to this one.")
-            .font(.footnote)
+            .scaledFont(.footnote)
             .foregroundStyle(.secondary)
         Button {
             Task {
                 pairing = true
                 pairingError = nil
+                pairTapProfile = profile
                 do {
                     try await appState.pairProfileWithThisDevice(profile)
                     Haptics.success()
@@ -3242,7 +4596,9 @@ private struct NotificationsSettingsDetail: View {
             }
         } label: {
             Label(
-                pairing ? AppLocalization.string("Pairing…") : AppLocalization.string("Pair \(profile) with this iPhone"),
+                // The automatic pairing runs on the same flag and holds the
+                // button too, so it says so rather than looking stuck.
+                pairing || notifications.isPairing ? AppLocalization.string("Pairing…") : AppLocalization.string("Pair \(profile) with this iPhone"),
                 systemImage: "link"
             )
             .frame(maxWidth: .infinity)
@@ -3254,13 +4610,20 @@ private struct NotificationsSettingsDetail: View {
         .accessibilityIdentifier("notifications.pair")
         if !notifications.isEnabled {
             Text("Turn on notifications above to pair this profile.")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
         }
-        if let pairingError {
+        if pairTapProfile != profile || pairing {
+            EmptyView()
+        } else if let pairingError {
             Label(pairingError, systemImage: "exclamationmark.triangle.fill")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.red)
+        } else {
+            Label(AppLocalization.string("Paired. Notifications and calls from \(appState.profileDisplayName(profile)) now come to this iPhone."), systemImage: "checkmark.circle.fill")
+                .scaledFont(.footnote)
+                .foregroundStyle(.green)
+                .accessibilityIdentifier("notifications.paired")
         }
     }
 
@@ -3293,15 +4656,48 @@ private struct NotificationsSettingsDetail: View {
         // #431: whether this pairing's notifications are sealed so the relay
         // can't read them. Keys are set up automatically over the dashboard
         // connection once the host's notifier supports it.
-        if notifications.encryptedGatewayIDs.contains(gateway.id) {
-            Label(AppLocalization.string("End-to-end encrypted"), systemImage: "lock.fill")
-                .font(.footnote)
+        // The padlock is closed only when the host confirmed it seals with
+        // the key this iPhone holds, and that key isn't long overdue.
+        let assurance = notifications.encryptionAssurance(gatewayID: gateway.id)
+        if notifications.unsavedRotationGatewayIDs.contains(gateway.id) {
+            // A rotation the host took whose new key the Keychain refused:
+            // said as it is, not as a generic mismatch.
+            Label(AppLocalization.string("This host has a new encryption key that Conduit couldn't save on this iPhone, so its notifications show only generic text. Conduit asks for it again the next time it connects to this dashboard."), systemImage: "exclamationmark.triangle.fill")
+                .scaledFont(.footnote)
+                .foregroundStyle(.orange)
+        } else if case .ensured(let createdAt, let rotates, let quantumSafe) = assurance {
+            let date = createdAt.formatted(date: .abbreviated, time: .omitted)
+            // The shield replaces the padlock once the key came from an
+            // ML-KEM rotation: quantum-safe end to end.
+            Label(
+                quantumSafe
+                    ? AppLocalization.string("End-to-end encrypted and quantum-safe, with a key from \(date). Only this iPhone can read these notifications; the relay sees when they arrive, not what they say. The key changes every 7 days.")
+                    : !rotates
+                        ? AppLocalization.string("End-to-end encrypted. Only this iPhone can read these notifications; the relay sees when they arrive, not what they say. Update this host's notifier so the key changes every 7 days.")
+                        : NotificationKeyRotation.supportsPQ
+                            ? AppLocalization.string("End-to-end encrypted with a key from \(date). Only this iPhone can read these notifications; the relay sees when they arrive, not what they say. The key changes every 7 days.")
+                            : AppLocalization.string("End-to-end encrypted with a key from \(date). Only this iPhone can read these notifications; the relay sees when they arrive, not what they say. The key changes every 7 days; update to iOS 26 to make it quantum-safe."),
+                systemImage: quantumSafe ? "lock.shield.fill" : "lock.fill"
+            )
+            .scaledFont(.footnote)
+            .foregroundStyle(.secondary)
+        } else if case .overdue = assurance {
+            Label(AppLocalization.string("End-to-end encrypted, but the key is overdue for rotation. Open this host's dashboard in Conduit so it can hand over a new one."), systemImage: "lock.open")
+                .scaledFont(.footnote)
+                .foregroundStyle(.orange)
+        } else if case .mismatched = assurance {
+            Label(AppLocalization.string("This host's encryption key doesn't match this iPhone's, so its notifications show only generic text. Conduit sets up a new key the next time it connects to this dashboard."), systemImage: "lock.open")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+        } else if case .unconfirmed = assurance {
+            Label(AppLocalization.string("End-to-end encryption is set up on this iPhone. Conduit checks it with the host the next time it connects to this dashboard."), systemImage: "lock.open")
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
         } else if NotificationSharedSettings.keysProvisioned, notifications.encryptedGatewayIDs.isEmpty {
             // Keys were stored but none can be read (locked, or lost and
             // being set up again): every plaintext push shows generic text.
             Label(AppLocalization.string("Setting up encryption again, so notifications from this host show only generic text for now."), systemImage: "lock.open")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
         } else if NotificationSharedSettings.keysProvisioned,
                   !NotificationSharedSettings.knownGatewayIDs.contains(gateway.id) {
@@ -3311,11 +4707,11 @@ private struct NotificationsSettingsDetail: View {
             // because every change to them also changes encryptedGatewayIDs
             // or relayMeta.
             Label(AppLocalization.string("Not end-to-end encrypted, so notifications from this host show only generic text and don't open the chat. Update this host's notifier to turn encryption on."), systemImage: "lock.open")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
         } else {
             Label(AppLocalization.string("Not end-to-end encrypted yet, so the relay can read these notifications. Conduit turns encryption on by itself once notifications are on and this host's notifier supports it."), systemImage: "lock.open")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
         }
     }
@@ -3357,15 +4753,15 @@ private struct NotificationsSettingsDetail: View {
             }
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(title).font(.subheadline.weight(.medium))
+                    Text(title).scaledFont(.subheadline.weight(.medium))
                     if let version {
                         Text("v\(version)")
-                            .font(.caption.monospaced())
+                            .scaledFont(.caption.monospaced())
                             .foregroundStyle(.secondary)
                     }
                 }
                 Text(detail)
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             }
         }
@@ -3374,6 +4770,33 @@ private struct NotificationsSettingsDetail: View {
     }
 
     @ViewBuilder
+    /// How much a notification says (#1415).
+    private var notificationDetailPicker: some View {
+        let detail = notifications.preferences.detail
+        return VStack(alignment: .leading, spacing: 4) {
+            ConduitMenuPicker(
+                value: detail,
+                choices: NotificationDetail.allCases.map { (id: $0, title: $0.title) },
+                onSelect: { choice in
+                    guard choice != detail else { return }
+                    Haptics.selection()
+                    Task { await notifications.setDetail(choice) }
+                }
+            ) {
+                Text(AppLocalization.string("Show in notifications"))
+            }
+            .accessibilityIdentifier("notifications.detail")
+            Text(detail.caption)
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+            if detail != .generic {
+                Text(AppLocalization.string("To keep them off the Lock Screen, set Show Previews to When Unlocked in iOS Settings > Notifications > Conduit."))
+                    .scaledFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private func notificationToggle(
         _ title: String,
         detail: String,
@@ -3388,7 +4811,7 @@ private struct NotificationsSettingsDetail: View {
         )) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).scaledFont(.caption).foregroundStyle(.secondary)
             }
         }
         .tint(.conduitAccent)
@@ -3405,12 +4828,14 @@ struct NotificationSetupCommand: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Text("\(step)")
-                    .font(.caption.weight(.bold))
+                    .scaledFont(.caption.weight(.bold))
                     .conduitFixedGlyph()
                     .foregroundStyle(.white)
                     .frame(width: 22, height: 22)
-                    .background(Color.conduitAccent, in: Circle())
-                Text(title).font(.subheadline.weight(.semibold))
+                    // The sent-bubble fill: the dark-mode accent is too
+                    // light under white text.
+                    .background(Color.conduitUserBubble, in: Circle())
+                Text(title).scaledFont(.subheadline.weight(.semibold))
             }
             Button {
                 UIPasteboard.general.string = command
@@ -3419,11 +4844,11 @@ struct NotificationSetupCommand: View {
             } label: {
                 HStack(spacing: 10) {
                     Text(command)
-                        .font(.system(.caption, design: .monospaced))
+                        .scaledFont(.caption.monospaced())
                         .multilineTextAlignment(.leading)
                     Spacer(minLength: 8)
                     Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                        .font(.caption.weight(.semibold))
+                        .scaledFont(.caption.weight(.semibold))
                 }
                 .padding(12)
                 // Copying is the card's whole purpose: the card is the tap
@@ -3454,17 +4879,17 @@ private struct AboutSettingsDetail: View {
                         size: 48
                     )
                     Text("A touch-first native client for your Hermes gateway.")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                SettingsMetricRow(label: AppLocalization.string("Active profile"), value: profile.capitalized)
+                SettingsMetricRow(label: AppLocalization.string("Active profile"), value: appState.profileDisplayName(profile))
                 SettingsMetricRow(label: AppLocalization.string("Version"), value: ConduitAppVersion.display)
             }
             ConduitSettingsSection(title: AppLocalization.string("Data handling"), symbol: "hand.raised", tint: .conduitAura) {
                 Text("Conduit connects to the dashboard and gateway you configure. Conversations and attachments are handled by that Hermes installation.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                Text("Conduit keeps your Chats lists and recent conversations on this device, so it opens straight to them while it connects. Each dashboard keeps its own until you sign out of it or remove it.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
+                Text("Conduit keeps your Chats lists, recent conversations and what each screen last showed on this device, so it opens straight to them while it connects. Each dashboard keeps its own until you sign out of it or remove it.")
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
                 deleteSavedChatsButton
             }
             ConduitSettingsSection(title: AppLocalization.string("Links"), symbol: "link", tint: .conduitAccent) {
@@ -3473,7 +4898,7 @@ private struct AboutSettingsDetail: View {
                         Image(systemName: "lock.shield")
                         Text("Privacy policy")
                         Spacer()
-                        Image(systemName: "arrow.up.right.square").font(.caption).foregroundStyle(.tertiary)
+                        Image(systemName: "arrow.up.right.square").scaledFont(.caption).foregroundStyle(.conduitTertiary)
                     }
                 }
                 Link(destination: URL(string: "https://kaishi00.github.io/hermes-conduit-notifier/support/")!) {
@@ -3481,7 +4906,7 @@ private struct AboutSettingsDetail: View {
                         Image(systemName: "lifepreserver")
                         Text("Support")
                         Spacer()
-                        Image(systemName: "arrow.up.right.square").font(.caption).foregroundStyle(.tertiary)
+                        Image(systemName: "arrow.up.right.square").scaledFont(.caption).foregroundStyle(.conduitTertiary)
                     }
                 }
                 Link(destination: URL(string: "https://github.com/kaishi00/hermes-conduit-notifier")!) {
@@ -3489,13 +4914,13 @@ private struct AboutSettingsDetail: View {
                         Image(systemName: "chevron.left.forwardslash.chevron.right")
                         Text("GitHub")
                         Spacer()
-                        Image(systemName: "arrow.up.right.square").font(.caption).foregroundStyle(.tertiary)
+                        Image(systemName: "arrow.up.right.square").scaledFont(.caption).foregroundStyle(.conduitTertiary)
                     }
                 }
             }
             ConduitSettingsSection(title: AppLocalization.string("Disclaimer"), symbol: "info.circle", tint: .conduitAura) {
                 Text("Hermes Conduit is an independent client and is not affiliated with or endorsed by Nous Research. © 2026 Milim.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
             }
         }.navigationTitle("About & privacy")
     }
@@ -3521,7 +4946,7 @@ private struct AboutSettingsDetail: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This deletes the saved Chats lists, conversation copies and pictures for every dashboard. Nothing changes on Hermes, and Conduit saves them again as you use it.")
+            Text("This deletes the saved Chats lists, conversation copies, pictures and what each screen last showed, for every dashboard. Nothing changes on Hermes, and Conduit saves them again as you use it.")
         }
     }
 }
@@ -3585,6 +5010,79 @@ struct ConduitSettingsSection<Content: View>: View {
     }
 }
 
+/// A Settings card with no name over it, for a group whose first row
+/// names it (Edit Bot's Advanced).
+struct SettingsCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .settingsCard()
+    }
+}
+
+/// A row in a Settings card that opens a page: its name, what it's set
+/// to in grey, and a chevron, as Settings > Pulse's What Pulse remembers.
+/// The caller's NavigationLink takes `.buttonStyle(.plain)`, so the row
+/// reads like the rows beside it rather than in the accent.
+struct SettingsLinkRow: View {
+    let title: String
+    var value: String?
+
+    var body: some View {
+        HStack {
+            Text(verbatim: title)
+                .foregroundStyle(.primary)
+            Spacer(minLength: 8)
+            if let value {
+                Text(verbatim: value)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            SettingsChevron()
+        }
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+    }
+}
+
+extension View {
+    /// A caption inside a Settings card, under the control it explains.
+    func settingsCaption() -> some View {
+        scaledFont(.footnote)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// A multi-line editor's field inside a Settings card, beside the
+    /// rounded-border text fields.
+    func settingsEditorBox() -> some View {
+        scrollContentBackground(.hidden)
+            .padding(6)
+            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// Names a Settings card shows the same in every language.
+enum SettingsNames {
+    static let mcp = "MCP"
+    static let json = "JSON"
+}
+
+/// The chevron at the end of a Settings row that opens a page.
+struct SettingsChevron: View {
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .scaledFont(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+    }
+}
+
 /// A settings page's still backdrop, its glow in `settingsGlowTint`: the
 /// active profile's color in V2's Settings tab, as on its home page, so
 /// pushing a page keeps it. An environment value rather than AppState, so a
@@ -3594,6 +5092,42 @@ struct SettingsBackdrop: View {
 
     var body: some View {
         ConduitBackdrop(glowTint: glowTint)
+    }
+}
+
+/// A sheet's list you reorder or swipe, in Settings' look: the Settings
+/// backdrop behind it and quiet card rows over it, rather than the system's
+/// plain grey. Every other sheet is built from Settings' own pieces
+/// (SettingsDetailContainer, ConduitSettingsSection, SettingsCard), as
+/// the Settings tab is (Eric 2026-11-05); only a List keeps move and swipe.
+struct ConduitList<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        List {
+            content.listRowBackground(ConduitFormRowFill())
+        }
+        .conduitFormBackdrop()
+    }
+}
+
+/// The fill of a `ConduitList` row: `settingsCard`'s faint fill, a little
+/// stronger in dark mode, where 0.05 left rows hard to tell from the glow.
+struct ConduitFormRowFill: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.05)
+    }
+}
+
+extension View {
+    /// The Settings backdrop behind a grouped Form or List, for a list whose
+    /// rows take `ConduitFormRowFill` themselves.
+    func conduitFormBackdrop() -> some View {
+        scrollContentBackground(.hidden)
+            .background { SettingsBackdrop().ignoresSafeArea() }
+            .tint(.conduitAccent)
     }
 }
 
@@ -3619,12 +5153,12 @@ struct SettingsSectionHeader: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: symbol)
-                .font(.caption.weight(.semibold))
+                .scaledFont(.caption.weight(.semibold))
                 .conduitFixedGlyph()
                 .foregroundStyle(tint)
                 .accessibilityHidden(true)
             Text(title)
-                .font(.footnote.weight(.semibold))
+                .scaledFont(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 16)
@@ -3651,15 +5185,19 @@ extension View {
 /// that commits what was typed (Save, Add key, Apply).
 struct SettingsButtonStyle: ButtonStyle {
     var isPrimary = false
+    /// `.settings` in red, for an action that stops something (a
+    /// workstream's Stop).
+    var isDestructive = false
 
     func makeBody(configuration: Configuration) -> some View {
-        SettingsButtonLabel(configuration: configuration, isPrimary: isPrimary)
+        SettingsButtonLabel(configuration: configuration, isPrimary: isPrimary, isDestructive: isDestructive)
     }
 }
 
 extension ButtonStyle where Self == SettingsButtonStyle {
     static var settings: SettingsButtonStyle { SettingsButtonStyle() }
     static var settingsPrimary: SettingsButtonStyle { SettingsButtonStyle(isPrimary: true) }
+    static var settingsDestructive: SettingsButtonStyle { SettingsButtonStyle(isDestructive: true) }
 }
 
 private struct SettingsButtonLabel: View {
@@ -3668,6 +5206,9 @@ private struct SettingsButtonLabel: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let configuration: ButtonStyleConfiguration
     let isPrimary: Bool
+    var isDestructive = false
+
+    private var tint: Color { isDestructive ? .red : .conduitAccent }
 
     /// Dark text on the bright dark-mode gold; white on the light-mode
     /// brown, where dark text read poorly.
@@ -3677,14 +5218,14 @@ private struct SettingsButtonLabel: View {
 
     var body: some View {
         configuration.label
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(isPrimary ? primaryText : Color.conduitAccent)
+            .scaledFont(.subheadline.weight(.semibold))
+            .foregroundStyle(isPrimary ? primaryText : tint)
             .padding(.horizontal, isPrimary ? 16 : 14)
             .frame(minHeight: isPrimary ? 38 : 36)
-            .background(isPrimary ? Color.conduitAccent : Color.conduitAccent.opacity(0.15), in: Capsule())
+            .background(isPrimary ? tint : tint.opacity(isDestructive ? 0.12 : 0.15), in: Capsule())
             .overlay {
                 if !isPrimary {
-                    Capsule().strokeBorder(Color.conduitAccent.opacity(0.4), lineWidth: 0.5)
+                    Capsule().strokeBorder(tint.opacity(0.4), lineWidth: 0.5)
                 }
             }
             // A 44 pt touch target around the smaller capsule.
@@ -3718,7 +5259,7 @@ struct SettingsRowMenu: View {
             }
         } label: {
             Image(systemName: "ellipsis")
-                .font(.footnote.weight(.semibold))
+                .scaledFont(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())
@@ -3746,13 +5287,13 @@ struct SettingsMetricRow: View {
                 HStack(spacing: 8) {
                     statusIndicator
                     Text(value)
-                        .font(.subheadline.weight(.medium))
+                        .scaledFont(.subheadline.weight(.medium))
                         .foregroundStyle(valueColor)
                         .lineLimit(lineLimit.map { $0 + 1 })
                         .truncationMode(.middle)
                 }
             }
-            .font(.subheadline)
+            .scaledFont(.subheadline)
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             HStack(spacing: 10) {
@@ -3761,12 +5302,12 @@ struct SettingsMetricRow: View {
                 Spacer(minLength: 16)
                 statusIndicator
                 Text(value)
-                    .font(.subheadline.weight(.medium))
+                    .scaledFont(.subheadline.weight(.medium))
                     .foregroundStyle(valueColor)
                     .lineLimit(lineLimit)
                     .multilineTextAlignment(.trailing)
             }
-            .font(.subheadline)
+            .scaledFont(.subheadline)
         }
     }
 

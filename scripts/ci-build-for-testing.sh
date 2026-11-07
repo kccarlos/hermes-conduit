@@ -21,7 +21,10 @@ SCHEME="Conduit"
 # GitHub-hosted runners for the same repository, which is what makes the
 # absolute paths inside the .xctestrun portable without rewriting anything.
 DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$PWD/ci-derived-data}"
-BUILD_TIMEOUT_SECS="${BUILD_TIMEOUT_SECS:-1200}"
+# Read as base 10 with a 1200 fallback: the value goes straight into
+# run_with_deadline's $(( )), where a non-numeric or leading-zero override
+# would abort the build job.
+BUILD_TIMEOUT_SECS=$(decimal_seconds "${BUILD_TIMEOUT_SECS:-}" 1200)
 LOG_DIR="ci-lane/build"
 mkdir -p "$LOG_DIR"
 
@@ -70,7 +73,8 @@ destination_s=$(( $(date +%s) - prep_start ))
 # echoed after the build and posted as a notice on the job.
 #
 # Incremental builds from a restored cache (2026-10-15): ci.yml restores the
-# newest main build's DerivedData, so only what changed since recompiles.
+# DerivedData of the newest build it can reach (main's, or its own branch's),
+# so only what changed since recompiles.
 # Xcode reuses a result only when its inputs' file info matches exactly, and a
 # fresh runner gives every file a new inode and the checkout time. So the
 # sources get content-derived timestamps (ci-normalize-mtimes.py), and XCBuild
@@ -243,7 +247,24 @@ printf '{"schema_version": 1, "status": "%s", "duration_s": %d, "started_at": "%
   "$build_status_token" "$duration" "$started_at" "$finished_at" "$xctestrun" \
   > "$LOG_DIR/build-result.json"
 
+# The first source errors go on the job as annotations, which the API
+# serves when the job log can't be read (it comes from storage some
+# networks can't reach). A step keeps 10 error annotations: 8 errors and
+# the failure line below.
+annotate_source_errors() {
+  grep -E ':[0-9]+:[0-9]+: error: ' "$LOG_DIR/build.log" | grep -F "$PWD/" | awk '!seen[$0]++' | head -n 8 \
+    | while IFS= read -r line; do
+        file="${line%%:*}"; rest="${line#*:}"
+        row="${rest%%:*}"; rest="${rest#*:}"
+        col="${rest%%:*}"; rest="${rest#*: error: }"
+        # A workflow command's message escapes % and a carriage return.
+        message="${rest//%/%25}"; message="${message//$'\r'/%0D}"
+        echo "::error file=${file#"$PWD/"},line=$row,col=$col::$message"
+      done
+}
+
 if [ "$status" -ne 0 ]; then
+  annotate_source_errors
   echo "::error::build-for-testing failed (exit $status); full log: $LOG_DIR/build.log"
   tail -n 100 "$LOG_DIR/build.log" || true
   exit 1

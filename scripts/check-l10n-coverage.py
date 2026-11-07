@@ -148,6 +148,7 @@ STRING_DISPLAY_PARAMETERS = {
     "ConduitSettingsSection": ("title",),
     "ConduitSheetHeader": ("title",),
     "SettingsMetricRow": ("label", "value"),
+    "SessionListPlaceholderView": ("emptyTitle", "emptyDescription"),
     "NotificationSetupCommand": ("title",),
     "ModelPickerSection": ("title",),
     "BotModeNoticeRow": ("message",),
@@ -198,6 +199,11 @@ DISPLAY_BRAND_NAMES = frozenset({
     "Cloudflare Access", "Hermes Conduit", "Gemini Live", "Grok Live",
     "GPT-Live", "LaTeX", "Mermaid", "Discord", "Telegram", "API",
     "Tailscale", "Apple",
+    # Hermes' gateway platforms, as the Chats filter names them (#1561).
+    "Slack", "WhatsApp", "Signal", "iMessage", "Matrix", "Mattermost",
+    "Microsoft Teams", "Google Chat", "SMS", "IRC", "LINE", "SimpleX",
+    "WeChat", "WeCom", "Feishu", "DingTalk", "QQ", "Yuanbao", "Buzz", "Raft",
+    "ntfy", "A2A",
 })
 
 # Dynamic sites the extractor cannot see: variable-key lookups where the
@@ -1122,6 +1128,10 @@ def required_key_problems(catalog: dict, required_keys) -> dict:
 SOURCE_CATALOG = "Localizable.xcstrings"
 SECONDARY_CATALOGS = ("AppShortcuts.xcstrings", "InfoPlist.xcstrings")
 INFO_PLIST = os.path.join("Conduit", "Info.plist")
+# The share extension's sources, which resolve through the app's catalog.
+SHARE_EXTENSION_DIRECTORY = "ConduitShareExtension"
+# The Notification Service Extension's sources, which do too.
+NOTIFICATION_SERVICE_DIRECTORY = "ConduitNotificationService"
 # The Apple Watch app's sources and its own Localizable catalog.
 WATCH_DIRECTORY = "ConduitWatch"
 # Each Info.plist with the InfoPlist catalog iOS reads its permission
@@ -1136,7 +1146,9 @@ INFO_PLIST_CATALOGS = (
 WATCH_SHARED_SOURCES = (
     "Shared/GeminiLive",
     "Shared/GrokLive",
+    "Shared/LocalLive",
     "Shared/WatchVoice",
+    "Shared/Approvals",
     "Conduit/Voice/GPTLive/GPTLiveProtocol.swift",
 )
 
@@ -1363,6 +1375,13 @@ def check(repo_root: str):
     checked = scan_sites(conduit, catalog_keys, repo_root, missing, key_problems)
     # The iPhone app compiles Shared/ too (project.yml).
     checked += scan_sites(os.path.join(repo_root, "Shared"), catalog_keys, repo_root, missing, key_problems)
+    # The share extension carries the app's catalog (project.yml).
+    share_extension = os.path.join(repo_root, SHARE_EXTENSION_DIRECTORY)
+    if os.path.exists(share_extension):
+        checked += scan_sites(share_extension, catalog_keys, repo_root, missing, key_problems)
+    notification_service = os.path.join(repo_root, NOTIFICATION_SERVICE_DIRECTORY)
+    if os.path.exists(notification_service):
+        checked += scan_sites(notification_service, catalog_keys, repo_root, missing, key_problems)
 
     # The Apple Watch app has its own catalog, in the same languages.
     watch = os.path.join(repo_root, WATCH_DIRECTORY)

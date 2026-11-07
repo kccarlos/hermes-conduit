@@ -38,13 +38,7 @@ final class ClarifyBatchStateTests: XCTestCase {
     }
 
     private func makeAppState() -> (appState: AppState, cache: SessionPresentationCache) {
-        let suite = "ClarifyBatchStateTests.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suite) else {
-            fatalError("Failed to create test UserDefaults suite")
-        }
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suite)
-        }
+        let defaults = makeScratchDefaults("ClarifyBatchStateTests")
         let cache = SessionPresentationCache(defaults: defaults)
         let appState = AppState(
             defaults: defaults,
@@ -409,6 +403,21 @@ final class ClarifyBatchStateTests: XCTestCase {
                            timestamp: "1", inputPrompt: prompt)
     }
 
+    func testInputPromptFromAnotherProfileNeverSends() async throws {
+        let (appState, _) = makeAppState()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: ClarifyFakeTransport())
+        var message = try inputPromptMessage(status: .pending)
+        message.inputPrompt?.profile = appState.activeProfile + "-before-switch"
+        appState.messages = [message]
+        let sentBefore = socket.sentTexts.count
+
+        await appState.respondToInputPrompt(messageId: message.id, value: "hunter2")
+
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .expired)
+        XCTAssertEqual(socket.sentTexts.count, sentBefore, "A card shown before a profile switch never sends its answer")
+    }
+
     func testPendingInputPromptCountsAsAPendingDecision() throws {
         XCTAssertTrue(AppState.hasPendingDecision(in: [try inputPromptMessage(status: .pending)]),
                       "An answerable sudo card keeps an omitted `running` reading as active")
@@ -445,6 +454,162 @@ final class ClarifyBatchStateTests: XCTestCase {
                            "A withdrawn request never reads as Sent (or as a retryable error) — sendFails=\(sendFails)")
             XCTAssertEqual(settled.error, AppLocalization.string("This request is no longer active — Hermes stopped waiting and continued."))
         }
+    }
+
+    private func openInputPromptSnapshot() -> SessionRuntimeSnapshot {
+        SessionRuntimeSnapshot(object: [
+            "open_requests": .array([.object([
+                "id": .string("srq-sudo00000001"),
+                "method": .string("sudo"),
+                "params": .object(["session_id": .string("stored-a"), "command": .string("sudo ls")])
+            ])])
+        ])
+    }
+
+    /// Starts an answer, parks its send, connects a replacement client so
+    /// the completion fails the ownership fence, then releases the send.
+    /// Returns the replacement's socket.
+    @discardableResult
+    private func fenceOffInputPromptAnswer(_ appState: AppState) async throws -> ClarifyFakeSocket {
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: ClarifyFakeTransport())
+        socket.holdSendCompletion = true
+        let message = try inputPromptMessage(status: .pending)
+        appState.messages = [message]
+
+        let answer = Task { @MainActor in
+            await appState.respondToInputPrompt(messageId: message.id, value: "hunter2")
+        }
+        for _ in 0..<500 where socket.heldSendCount == 0 { await Task.yield() }
+        XCTAssertEqual(socket.heldSendCount, 1, "The reply frame must be in flight")
+
+        let replacement = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: replacement, transport: ClarifyFakeTransport())
+        socket.releaseSends(error: nil)
+        await answer.value
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .submitting,
+                       "A fenced-off completion leaves the card for the replacement client")
+        return replacement
+    }
+
+    func testAuthoritativeReplayReArmsInputPromptWhoseAnswerWasFencedOff() async throws {
+        let (appState, _) = makeAppState()
+        let replacement = try await fenceOffInputPromptAnswer(appState)
+
+        appState.handleStreamEvent(.sessionInfo(sessionId: "stored-a", snapshot: openInputPromptSnapshot()))
+
+        let card = try XCTUnwrap(appState.messages.first?.inputPrompt)
+        XCTAssertEqual(appState.messages.count, 1)
+        XCTAssertEqual(card.status, .pending,
+                       "The gateway still waits on this request and no send owns the card: it must be answerable again")
+        XCTAssertTrue(card.isAnswerable)
+
+        await appState.respondToInputPrompt(messageId: "input-prompt-srq-sudo00000001", value: "hunter2")
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .submitted,
+                       "The re-armed card answers through the client that owns it now")
+        XCTAssertTrue(replacement.sentTexts.contains { $0.contains("srq-sudo00000001") })
+    }
+
+    /// A request withdrawn while this device's answer was in flight, whose
+    /// completion then fails the ownership fence: no open-request replay
+    /// will ever re-arm it, so the card settles as withdrawn instead of
+    /// staying `.submitting`.
+    func testInputPromptWithdrawnMidSendSettlesEvenWhenItsCompletionIsFencedOff() async throws {
+        let (appState, _) = makeAppState()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: ClarifyFakeTransport())
+        socket.holdSendCompletion = true
+        let message = try inputPromptMessage(status: .pending)
+        appState.messages = [message]
+
+        let answer = Task { @MainActor in
+            await appState.respondToInputPrompt(messageId: message.id, value: "hunter2")
+        }
+        for _ in 0..<500 where socket.heldSendCount == 0 { await Task.yield() }
+        XCTAssertEqual(socket.heldSendCount, 1, "The reply frame must be in flight")
+        appState.handleStreamEvent(.inputPromptExpire(sessionId: "stored-a", requestId: "srq-sudo00000001", reason: "timeout"))
+
+        _ = try await installConnectedClient(appState, socket: ClarifyFakeSocket(), transport: ClarifyFakeTransport())
+        socket.releaseSends(error: nil)
+        await answer.value
+
+        let settled = try XCTUnwrap(appState.messages.first?.inputPrompt)
+        XCTAssertEqual(settled.status, .expired, "A withdrawn request must not stay `.submitting` with no send to settle it")
+        XCTAssertEqual(settled.error, AppLocalization.string("This request is no longer active — Hermes stopped waiting and continued."))
+        XCTAssertFalse(AppState.hasPendingDecision(in: appState.messages))
+    }
+
+    /// A withdrawal that arrives after a fenced-off completion settles the
+    /// card at once: no send is left to report it.
+    func testInputPromptWithdrawnAfterItsAnswerWasFencedOffSettles() async throws {
+        let (appState, _) = makeAppState()
+        try await fenceOffInputPromptAnswer(appState)
+
+        appState.handleStreamEvent(.inputPromptExpire(sessionId: "stored-a", requestId: "srq-sudo00000001", reason: "resolved"))
+
+        let settled = try XCTUnwrap(appState.messages.first?.inputPrompt)
+        XCTAssertEqual(settled.status, .expired)
+        XCTAssertEqual(settled.error, AppLocalization.string("This request was answered elsewhere."))
+    }
+
+    func testStreamRedeliveryLeavesFencedOffInputPromptAlone() async throws {
+        let (appState, _) = makeAppState()
+        try await fenceOffInputPromptAnswer(appState)
+        let replay = try XCTUnwrap(try inputPromptMessage(status: .pending).inputPrompt)
+
+        appState.handleStreamEvent(.inputPrompt(sessionId: "stored-a", activity: replay))
+
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .submitting,
+                       "A one-shot re-delivery is not the gateway's current truth")
+    }
+
+    func testAuthoritativeReplayLeavesALiveInputPromptAnswerAlone() async throws {
+        let (appState, _) = makeAppState()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: ClarifyFakeTransport())
+        socket.holdSendCompletion = true
+        let message = try inputPromptMessage(status: .pending)
+        appState.messages = [message]
+
+        let answer = Task { @MainActor in
+            await appState.respondToInputPrompt(messageId: message.id, value: "hunter2")
+        }
+        for _ in 0..<500 where socket.heldSendCount == 0 { await Task.yield() }
+        XCTAssertEqual(socket.heldSendCount, 1, "The reply frame must be in flight")
+
+        appState.handleStreamEvent(.sessionInfo(sessionId: "stored-a", snapshot: openInputPromptSnapshot()))
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .submitting,
+                       "The in-flight send owns the card until it completes")
+
+        socket.releaseSends(error: nil)
+        await answer.value
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .submitted)
+    }
+
+    func testRebuiltInputPromptStaysSubmittingWhileItsAnswerIsInFlight() async throws {
+        let (appState, _) = makeAppState()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: ClarifyFakeTransport())
+        socket.holdSendCompletion = true
+        let message = try inputPromptMessage(status: .pending)
+        appState.messages = [message]
+
+        let answer = Task { @MainActor in
+            await appState.respondToInputPrompt(messageId: message.id, value: "hunter2")
+        }
+        for _ in 0..<500 where socket.heldSendCount == 0 { await Task.yield() }
+        XCTAssertEqual(socket.heldSendCount, 1, "The reply frame must be in flight")
+
+        // A resume rebuild drops live-only input cards, then re-adds the
+        // gateway's open requests.
+        appState.messages = []
+        appState.handleStreamEvent(.sessionInfo(sessionId: "stored-a", snapshot: openInputPromptSnapshot()))
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .submitting,
+                       "A request whose answer is in flight must not be answerable twice")
+
+        socket.releaseSends(error: nil)
+        await answer.value
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .submitted)
     }
 
     func testMixedExpiredPendingClarifyStillAwaitsUserInputForHaptics() throws {
@@ -498,12 +663,13 @@ final class ClarifyBatchStateTests: XCTestCase {
         appState.handleStreamEvent(.inputPromptExpire(sessionId: "stored-a", requestId: "srq-sudo00000001", reason: "resolved"))
         XCTAssertEqual(appState.messages.first?.inputPrompt?.error, AppLocalization.string("This request was answered elsewhere."))
 
+        // A `.submitting` card with no send of this device behind it (its
+        // send was fenced off) has nothing left to settle it: the
+        // withdrawal does. An answer actually in flight still owns the
+        // card (testInputPromptWithdrawnMidSendSettlesAsWithdrawnNotSent).
         appState.messages = [try inputPromptMessage(status: .submitting)]
         appState.handleStreamEvent(.inputPromptExpire(sessionId: "stored-a", requestId: "srq-sudo00000001"))
-        XCTAssertEqual(
-            appState.messages.first?.inputPrompt?.status, .submitting,
-            "An answer this device has in flight owns the card's outcome"
-        )
+        XCTAssertEqual(appState.messages.first?.inputPrompt?.status, .expired)
     }
 
     // MARK: - Duplicate / replay identity
@@ -1359,6 +1525,214 @@ final class ClarifyBatchStateTests: XCTestCase {
         XCTAssertEqual(settled.questions[2].status, .pending, "Still listed in remaining ⇒ stays answerable")
     }
 
+    // MARK: - Forms
+
+    func testOnlySeveralQuestionsWithATypedOneMakeAForm() {
+        XCTAssertTrue(makeBatchActivity().isForm, "Several questions, one of them typed")
+        var choicesOnly = makeBatchActivity()
+        choicesOnly.questions.removeLast()
+        XCTAssertFalse(choicesOnly.isForm, "Choices only keep the card that answers each one")
+        let single = ClarifyActivity(requestId: "req-solo", question: "Leaving from?", choices: [])
+        XCTAssertFalse(single.isForm, "A question on its own keeps its card")
+    }
+
+    func testFormFieldAnswersComeFromWhatWasFilledIn() {
+        let form = makeBatchActivity()
+        let environment = form.questions[0], tests = form.questions[1], notes = form.questions[2]
+        XCTAssertEqual(environment.formAnswer(picked: ["prod"], typed: ""), "prod")
+        XCTAssertEqual(environment.formAnswer(picked: [], typed: " eu-west "), "eu-west", "Something else: the user's own words")
+        XCTAssertEqual(environment.formAnswer(picked: [], typed: ""), "", "Left blank")
+        XCTAssertEqual(
+            tests.formAnswer(picked: ["ui", "unit"], typed: ""),
+            ClarifyQuestion.multiSelectAnswer(["unit", "ui"]),
+            "A multi-select's picks go in choice order"
+        )
+        XCTAssertEqual(
+            tests.formAnswer(picked: ["ui"], typed: "smoke"),
+            ClarifyQuestion.multiSelectAnswer(["ui", "smoke"]),
+            "Its own words go after the picks"
+        )
+        XCTAssertEqual(tests.formAnswer(picked: [], typed: "  "), "", "Nothing picked or typed is blank, not an empty list")
+        XCTAssertEqual(notes.formAnswer(picked: [], typed: "Window seat\n"), "Window seat")
+    }
+
+    func testFormSendsEveryFieldInOrderWithBlanksEmpty() async throws {
+        let (appState, _) = makeAppState()
+        appState.messages = [
+            ChatMessage(id: "clarify-req-batch", role: .clarify, content: "batch", timestamp: "1", clarify: makeBatchActivity())
+        ]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        try await installConnectedClient(appState, socket: socket, transport: transport)
+        // The gateway takes each answer as it comes, the last one closing
+        // the request.
+        var open = ["environment", "tests", "notes"]
+        socket.onSend = { [unowned socket] in
+            guard let request = (try? JSONSerialization.jsonObject(with: Data((socket.sentTexts.last ?? "").utf8))) as? [String: Any],
+                  request["method"] as? String == "clarify.respond",
+                  let id = request["id"] as? Int,
+                  let questionID = (request["params"] as? [String: Any])?["question_id"] as? String else { return }
+            open.removeAll { $0 == questionID }
+            let response: [String: Any] = ["jsonrpc": "2.0", "id": id, "result": ["status": "ok", "remaining": open]]
+            socket.deliver(String(decoding: try! JSONSerialization.data(withJSONObject: response), as: UTF8.self))
+        }
+
+        await appState.respondToClarifyForm(requestId: "req-batch", answers: ["environment": "staging", "notes": "  "])
+
+        let sent = socket.sentTexts
+            .compactMap { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any] }
+            .filter { $0["method"] as? String == "clarify.respond" }
+            .compactMap { $0["params"] as? [String: Any] }
+        XCTAssertEqual(sent.compactMap { $0["question_id"] as? String }, ["environment", "tests", "notes"], "One at a time, in order")
+        XCTAssertEqual(sent.compactMap { $0["answer"] as? String }, ["staging", "", ""], "A blank goes as empty, even a multi-select's")
+        let settled = try XCTUnwrap(clarifyCard(in: appState, requestId: "req-batch"))
+        XCTAssertEqual(settled.status, .answered)
+        XCTAssertEqual(settled.questions[0].answer, "staging")
+        XCTAssertTrue(settled.questions[1].isSkipped)
+        XCTAssertTrue(settled.questions[2].isSkipped)
+        XCTAssertFalse(settled.questions[0].isSkipped)
+    }
+
+    func testFormRetrySendsOnlyTheFieldThatFailed() async throws {
+        let (appState, _) = makeAppState()
+        appState.messages = [
+            ChatMessage(id: "clarify-relay", role: .clarify, content: "relay", timestamp: "1", clarify: makeRelayBatchCard())
+        ]
+        var sent: [String] = []
+        var failsTests = true
+        appState.relayQuestionResponder = { _, questionID, answer in
+            sent.append("\(questionID)=\(answer)")
+            if questionID == "tests", failsTests {
+                failsTests = false
+                throw URLError(.timedOut)
+            }
+            return .locked(remaining: nil)
+        }
+        let answers = ["environment": "prod", "notes": "Window seat"]
+
+        await appState.respondToClarifyForm(requestId: "conduit-push-batch1", answers: answers)
+
+        XCTAssertEqual(sent, ["environment=prod", "tests=", "notes=Window seat"], "A failed field doesn't hold up the rest")
+        let failed = try XCTUnwrap(clarifyCard(in: appState, requestId: "conduit-push-batch1"))
+        XCTAssertEqual(failed.questions.map(\.status), [.answered, .error, .answered])
+
+        await appState.respondToClarifyForm(requestId: "conduit-push-batch1", answers: answers)
+
+        XCTAssertEqual(sent.last, "tests=", "Send again goes with only what is still open")
+        XCTAssertEqual(sent.count, 4)
+        let settled = try XCTUnwrap(clarifyCard(in: appState, requestId: "conduit-push-batch1"))
+        XCTAssertEqual(settled.status, .answered)
+        XCTAssertTrue(settled.questions[1].isSkipped)
+    }
+
+    func testFormStopsSendingOnceHermesStopsWaiting() async throws {
+        let (appState, _) = makeAppState()
+        appState.messages = [
+            ChatMessage(id: "clarify-relay", role: .clarify, content: "relay", timestamp: "1", clarify: makeRelayBatchCard())
+        ]
+        var sent: [String] = []
+        appState.relayQuestionResponder = { _, questionID, _ in
+            sent.append(questionID)
+            return .decisionReleased
+        }
+
+        await appState.respondToClarifyForm(requestId: "conduit-push-batch1", answers: ["environment": "prod"])
+
+        XCTAssertEqual(sent, ["environment"], "The rest of the form went with the request")
+        XCTAssertEqual(clarifyCard(in: appState, requestId: "conduit-push-batch1")?.status, .expired)
+    }
+
+    func testFormDoesNotSendAFieldAnotherDeviceAnswered() async throws {
+        let (appState, _) = makeAppState()
+        appState.messages = [
+            ChatMessage(id: "clarify-req-batch", role: .clarify, content: "batch", timestamp: "1", clarify: makeBatchActivity())
+        ]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        try await installConnectedClient(appState, socket: socket, transport: transport)
+        // Another device answers "tests" while the form sends its first field.
+        var open = ["environment", "tests", "notes"]
+        socket.onSend = { [unowned socket] in
+            guard let request = (try? JSONSerialization.jsonObject(with: Data((socket.sentTexts.last ?? "").utf8))) as? [String: Any],
+                  request["method"] as? String == "clarify.respond",
+                  let id = request["id"] as? Int,
+                  let questionID = (request["params"] as? [String: Any])?["question_id"] as? String else { return }
+            open.removeAll { $0 == questionID || $0 == "tests" }
+            let response: [String: Any] = ["jsonrpc": "2.0", "id": id, "result": ["status": "ok", "remaining": open]]
+            socket.deliver(String(decoding: try! JSONSerialization.data(withJSONObject: response), as: UTF8.self))
+        }
+
+        await appState.respondToClarifyForm(
+            requestId: "req-batch",
+            answers: ["environment": "staging", "tests": ClarifyQuestion.multiSelectAnswer(["ui"]), "notes": "Window seat"]
+        )
+
+        let sent = socket.sentTexts
+            .compactMap { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any] }
+            .filter { $0["method"] as? String == "clarify.respond" }
+            .compactMap { ($0["params"] as? [String: Any])?["question_id"] as? String }
+        XCTAssertEqual(sent, ["environment", "notes"], "Hermes no longer waited on tests")
+        let settled = try XCTUnwrap(clarifyCard(in: appState, requestId: "req-batch"))
+        XCTAssertEqual(settled.status, .answered)
+        XCTAssertEqual(settled.questions[1].status, .answered)
+        XCTAssertNil(settled.questions[1].answer, "Answered on the other device, not with this form's picks")
+        XCTAssertEqual(settled.questions[2].answer, "Window seat")
+    }
+
+    func testFormStopsOnceHermesHasEveryAnswer() async throws {
+        let (appState, _) = makeAppState()
+        appState.messages = [
+            ChatMessage(id: "clarify-relay", role: .clarify, content: "relay", timestamp: "1", clarify: makeRelayBatchCard())
+        ]
+        var sent: [String] = []
+        appState.relayQuestionResponder = { _, questionID, _ in
+            sent.append(questionID)
+            // The rest were answered on another device meanwhile.
+            return .locked(remaining: [])
+        }
+
+        await appState.respondToClarifyForm(requestId: "conduit-push-batch1", answers: ["environment": "prod", "notes": "Window seat"])
+
+        XCTAssertEqual(sent, ["environment"], "Nothing more goes once Hermes has every answer")
+        let settled = try XCTUnwrap(clarifyCard(in: appState, requestId: "conduit-push-batch1"))
+        XCTAssertEqual(settled.status, .answered, "Answered, not expired")
+        XCTAssertEqual(settled.questions.map(\.status), [.answered, .answered, .answered])
+        XCTAssertEqual(settled.questions[0].answer, "prod")
+        XCTAssertNil(settled.questions[1].answer)
+        XCTAssertNil(settled.questions[2].answer)
+        XCTAssertNil(settled.error)
+    }
+
+    func testOnlyAFormsQuestionCanBeLeftBlank() async throws {
+        let (appState, _) = makeAppState()
+        var choicesOnly = makeRelayBatchCard()
+        choicesOnly.questions.removeLast()
+        appState.messages = [
+            ChatMessage(id: "clarify-relay", role: .clarify, content: "relay", timestamp: "1", clarify: choicesOnly)
+        ]
+        var sent: [String] = []
+        appState.relayQuestionResponder = { _, questionID, answer in
+            sent.append("\(questionID)=\(answer)")
+            return .locked(remaining: nil)
+        }
+
+        await appState.respondToClarify(requestId: "conduit-push-batch1", questionId: "environment", answer: nil)
+        await appState.respondToClarifyForm(requestId: "conduit-push-batch1", answers: [:])
+
+        XCTAssertTrue(sent.isEmpty, "Outside a form every question waits for an answer")
+        XCTAssertEqual(clarifyCard(in: appState, requestId: "conduit-push-batch1")?.questions[0].status, .pending)
+
+        appState.messages = [
+            ChatMessage(id: "clarify-relay", role: .clarify, content: "relay", timestamp: "1", clarify: makeRelayBatchCard())
+        ]
+        await appState.respondToClarify(requestId: "conduit-push-batch1", questionId: "environment", answer: nil)
+
+        XCTAssertEqual(sent, ["environment="])
+        let form = try XCTUnwrap(clarifyCard(in: appState, requestId: "conduit-push-batch1"))
+        XCTAssertTrue(form.questions[0].isSkipped, "Shown as Skipped")
+        XCTAssertEqual(form.questions[1].status, .pending)
+    }
+
     // MARK: - Model helpers
 
     func testMultiSelectAnswerSerializationRoundTrips() throws {
@@ -1478,8 +1852,32 @@ final class ClarifyFakeSocket: HermesWebSocket {
         held.forEach { $0(error) }
     }
 
+    /// A gateway without `approval.pending` until the first
+    /// `approval.respond`: the queue read a card without a request id makes
+    /// before it answers is refused at once (-32601, so the answer goes by
+    /// session as before) and kept out of `sentTexts` and `onSend`, so a
+    /// test about what follows keeps its frame positions.
+    var refusesApprovalPendingBeforeRespond = false
+    private var sawApprovalRespond = false
+
     func send(_ message: URLSessionWebSocketTask.Message, completionHandler: @escaping @Sendable (Error?) -> Void) {
         if case .string(let text) = message {
+            let request = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any]
+            let method = request?["method"] as? String
+            if method == "approval.respond" { sawApprovalRespond = true }
+            if refusesApprovalPendingBeforeRespond, !sawApprovalRespond,
+               method == "approval.pending", let id = request?["id"] as? Int {
+                completionHandler(nil)
+                deliver(String(
+                    decoding: try! JSONSerialization.data(withJSONObject: [
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": ["code": -32601, "message": "unknown method: approval.pending"]
+                    ]),
+                    as: UTF8.self
+                ))
+                return
+            }
             sentTexts.append(text)
             onSend?()
         }

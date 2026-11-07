@@ -25,6 +25,14 @@ final class ComposerDictationService: ObservableObject {
     /// Stopped, and the words are still on their way (a Hermes upload).
     /// A new dictation waits for them rather than dropping them.
     @Published private(set) var isTranscribing = false
+    /// Stopped, and its usual settle has passed: Send's Stop may end it
+    /// now, keeping the draft's words, rather than wait out a slow host.
+    @Published private(set) var settleCanEnd = false
+
+    /// How long a settle runs before Send's Stop may cut it short: longer
+    /// than either Apple engine's whole settle (1.5 and 3 seconds), so only
+    /// a slower one (Hermes) ever offers Done (#1315 review).
+    nonisolated static let settleGrace: Duration = .milliseconds(3_500)
 
     /// The whole transcript of this dictation so far, each time it changes.
     /// Cleared when the dictation ends: the view that set it is captured.
@@ -37,6 +45,8 @@ final class ComposerDictationService: ObservableObject {
     var onFailure: ((String) -> Void)?
 
     private let audioCoordinator: VoiceAudioSessionCoordinator
+    /// Where a Hermes dictation keeps its recording until its words land.
+    private let clipInbox: DictationClipInbox
     private let audioSink = DictationAudioSink()
     private var engine: AVAudioEngine?
     private var lease: VoiceAudioLease?
@@ -45,14 +55,30 @@ final class ComposerDictationService: ObservableObject {
     private var audioObservers: [NSObjectProtocol] = []
     private var recognizer: (any DictationRecognizer)?
     private var finishTask: Task<Void, Never>?
+    /// Stops a dictation left running at `maximumDuration`.
+    private var limitTask: Task<Void, Never>?
     private var generation: UInt64 = 0
     private var producedText = false
     /// Bumped by `cancel()` so a reserved start that hasn't run, or is
     /// still awaiting permission, gives up.
     private var startToken: UInt64 = 0
 
-    init(audioCoordinator: VoiceAudioSessionCoordinator? = nil) {
+    /// The longest dictation, as for a voice message: past this it stops
+    /// by itself, as if tapped, and keeps its words (#1004). The Hermes
+    /// engine keeps the whole recording for its upload, about 29 MB here,
+    /// so one left running can't grow until iOS ends the app.
+    static let maximumDuration: Duration = .seconds(VoiceMessageRecorder.maximumDuration)
+
+    private let maximumDuration: Duration
+
+    init(
+        audioCoordinator: VoiceAudioSessionCoordinator? = nil,
+        clipInbox: DictationClipInbox? = nil,
+        maximumDuration: Duration = ComposerDictationService.maximumDuration
+    ) {
         self.audioCoordinator = audioCoordinator ?? .shared
+        self.clipInbox = clipInbox ?? .shared
+        self.maximumDuration = maximumDuration
     }
 
     /// Reserves a start, synchronously: a `cancel()` that lands before
@@ -82,7 +108,7 @@ final class ComposerDictationService: ObservableObject {
         defer { if startToken == token { isStarting = false } }
         let recognizer: any DictationRecognizer
         do {
-            recognizer = try await makeRecognizer(choice, words: words, hermesGateway: hermesGateway)
+            recognizer = try await Self.makeRecognizer(choice, words: words, hermesGateway: hermesGateway, clips: clipInbox)
         } catch {
             // Cancelled (the composer went away) meanwhile: cancel()
             // already cleared the callbacks.
@@ -134,13 +160,21 @@ final class ComposerDictationService: ObservableObject {
         audioSink.replace(with: input)
         isCapturing = true
         isDictating = true
+        limitTask = Task { @MainActor [weak self, maximumDuration] in
+            try? await Task.sleep(for: maximumDuration)
+            guard let self, !Task.isCancelled, self.generation == generation else { return }
+            self.stop()
+        }
     }
 
     /// Permission, language and the model, before the microphone opens.
-    private func makeRecognizer(
+    /// Voice messages transcribe with the same engine; they send their own
+    /// recording, so only dictation passes `clips` to keep Hermes' one.
+    static func makeRecognizer(
         _ choice: DictationEngine,
         words: [String],
-        hermesGateway: () -> HermesVoiceGateway?
+        hermesGateway: () -> HermesVoiceGateway?,
+        clips: DictationClipInbox? = nil
     ) async throws -> any DictationRecognizer {
         switch choice {
         case .hermes:
@@ -153,7 +187,7 @@ final class ComposerDictationService: ObservableObject {
             guard let gateway = hermesGateway() else {
                 throw DictationError.message(AppLocalization.string("Dictation with Hermes needs a connection to Hermes."))
             }
-            return HermesDictationRecognizer(gateway: gateway)
+            return HermesDictationRecognizer(gateway: gateway, clips: clips)
         case .apple, .appleSpeechAnalyzer:
             guard await AppleSpeechWakeWordService.requestPermissions() else {
                 throw DictationError.message(AppLocalization.string("Dictation needs microphone and speech recognition access. You can allow them in Settings."))
@@ -169,6 +203,8 @@ final class ComposerDictationService: ObservableObject {
     /// last words, briefly. The microphone is let go at once.
     func stop() {
         guard isCapturing else { return }
+        limitTask?.cancel()
+        limitTask = nil
         isCapturing = false
         stopAudio()
         releaseAudio()
@@ -179,9 +215,17 @@ final class ComposerDictationService: ObservableObject {
         isTranscribing = (recognizer?.holdsWordsWhileSettling ?? false) && !producedText
         let generation = generation
         let timeout = recognizer?.settleTimeout ?? .milliseconds(1_500)
+        settleCanEnd = false
         finishTask?.cancel()
         finishTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: timeout)
+            if timeout > Self.settleGrace {
+                try? await Task.sleep(for: Self.settleGrace)
+                guard !Task.isCancelled, self?.generation == generation else { return }
+                self?.settleCanEnd = true
+                try? await Task.sleep(for: timeout - Self.settleGrace)
+            } else {
+                try? await Task.sleep(for: timeout)
+            }
             guard let self, !Task.isCancelled, self.generation == generation else { return }
             // Its words never came: say so rather than end in silence.
             if self.isTranscribing {
@@ -242,6 +286,9 @@ final class ComposerDictationService: ObservableObject {
             if !text.isEmpty {
                 producedText = true
                 onTranscript?(text)
+                // Its words are in the draft now: from here it settles like
+                // any engine's, and typing or Done can end it (#1315).
+                isTranscribing = false
             }
             // A final result after the stop ends it; one while still
             // listening (a recognizer error) does too.
@@ -256,6 +303,8 @@ final class ComposerDictationService: ObservableObject {
         generation &+= 1
         finishTask?.cancel()
         finishTask = nil
+        limitTask?.cancel()
+        limitTask = nil
         recognizer?.cancel()
         recognizer = nil
         audioSink.replace(with: nil)
@@ -263,10 +312,30 @@ final class ComposerDictationService: ObservableObject {
         releaseAudio()
         isCapturing = false
         isTranscribing = false
+        settleCanEnd = false
         isDictating = false
         let onFinish = onFinish
         clearCallbacks()
         onFinish?(producedText)
+    }
+
+    /// What Send's Stop shows now (#1309).
+    var slotFace: ComposerDictation.SlotFace {
+        ComposerDictation.slotFace(
+            isCapturing: isCapturing,
+            isStarting: isStarting,
+            isTranscribing: isTranscribing,
+            settleCanEnd: settleCanEnd
+        )
+    }
+
+    /// A tap on Send's Stop, or Return in its place.
+    func tapSlot() {
+        switch ComposerDictation.slotTap(slotFace) {
+        case .stop: stop()
+        case .cancelStart: cancel()
+        case .start, .nothing: break
+        }
     }
 
     private func clearCallbacks() {
@@ -277,14 +346,31 @@ final class ComposerDictationService: ObservableObject {
 
     /// Opens the microphone and returns the format its buffers come in.
     private func startAudio() throws -> AVAudioFormat {
+        var format: AVAudioFormat?
+        try VoiceAudioEngineRecovery.startFresh(
+            rebuild: { stopAudio() },
+            reassert: { try audioCoordinator.reassert() },
+            start: { format = try startAudioAttempt() }
+        )
+        guard let format else { throw VoiceAudioInputFormatUnavailable() }
+        return format
+    }
+
+    private func startAudioAttempt() throws -> AVAudioFormat {
         let engine = AVAudioEngine()
         let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw DictationError.message(AppLocalization.string("The microphone is not available right now."))
+        let hardwareFormat = input.inputFormat(forBus: 0)
+        let nodeOutputFormat = input.outputFormat(forBus: 0)
+        guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0,
+              nodeOutputFormat.sampleRate > 0, nodeOutputFormat.channelCount > 0 else {
+            throw VoiceAudioInputFormatUnavailable()
         }
+        let tapFormat = VoiceAudioEngineRecovery.tapFormat(
+            nodeOutput: nodeOutputFormat,
+            hardware: hardwareFormat
+        )
         let sink = audioSink
-        input.installTap(onBus: 0, bufferSize: 1_024, format: format) { buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 1_024, format: tapFormat) { buffer, _ in
             sink.append(buffer)
         }
         engine.prepare()
@@ -296,7 +382,7 @@ final class ComposerDictationService: ObservableObject {
             throw error
         }
         self.engine = engine
-        return format
+        return tapFormat ?? nodeOutputFormat
     }
 
     private func stopAudio() {
@@ -333,7 +419,8 @@ enum ComposerDictation {
         case start
         /// Listening: stop, keeping the words.
         case stop
-        /// Still coming up (permission, microphone): call it off.
+        /// Still coming up (permission, microphone): call it off. Send's
+        /// Stop also uses it to end a settle, keeping the draft's words.
         case cancelStart
         case nothing
     }
@@ -344,6 +431,46 @@ enum ComposerDictation {
         // Its words are on their way; a new dictation waits for them.
         if isTranscribing { return .nothing }
         return canDictate ? .start : .nothing
+    }
+
+    /// While a dictation runs, from the tap that starts it until its last
+    /// words are in, Send's slot holds a Stop instead (#1309): the words
+    /// are looked over before anything goes.
+    static func holdsSendSlot(isDictating: Bool, isStarting: Bool) -> Bool {
+        isDictating || isStarting
+    }
+
+    /// What that Stop shows.
+    enum SlotFace: Equatable {
+        /// Listening: stop, keeping the words.
+        case stop
+        /// Still coming up: call it off.
+        case cancelStart
+        /// Stopped, with words in the draft, past the usual settle and the
+        /// last ones still coming: done ends it there, so a slow host never
+        /// holds Send back.
+        case finishing
+        /// Stopped, and its last words are on their way: within the usual
+        /// settle, or none of its words have reached the draft yet (a
+        /// Hermes upload). Wait, or they're lost.
+        case transcribing
+    }
+
+    static func slotFace(isCapturing: Bool, isStarting: Bool, isTranscribing: Bool, settleCanEnd: Bool) -> SlotFace {
+        if isCapturing { return .stop }
+        if isStarting { return .cancelStart }
+        return isTranscribing || !settleCanEnd ? .transcribing : .finishing
+    }
+
+    /// What a tap on that Stop, or Return in its place, does: it never
+    /// starts a dictation. Calling off (cancel) ends it at once, keeping
+    /// whatever words the draft has.
+    static func slotTap(_ face: SlotFace) -> Tap {
+        switch face {
+        case .stop: return .stop
+        case .cancelStart, .finishing: return .cancelStart
+        case .transcribing: return .nothing
+        }
     }
 
     /// Whether a change the full editor reported counts as typing: any

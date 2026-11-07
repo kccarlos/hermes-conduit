@@ -34,6 +34,7 @@ final class ConfigFieldLocalizationTests: XCTestCase {
         "memory.provider": [],
         "context.engine": ["default"],
         "display.memory_notifications": ["default", "on", "off"],
+        ReasoningDisplayMode.settingKey: ["show", "on_request", "off"],
         "display.tool_progress": ["all", "off"],
         "updates.non_interactive_local_changes": ["stash", "discard"],
     ]
@@ -154,7 +155,7 @@ final class ConfigFieldLocalizationTests: XCTestCase {
                     XCTAssertEqual(a, b)
                 case (.toggle(let a), .toggle(let b)):
                     XCTAssertEqual(a, b)
-                case (.stringList, .stringList):
+                case (.stringList, .stringList), (.timeZone, .timeZone):
                     break
                 default:
                     XCTFail("\(before.key) control changed shape under \(language)")

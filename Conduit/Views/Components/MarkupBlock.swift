@@ -15,6 +15,7 @@
 //  bound how many pages mount.
 //
 
+import CryptoKit
 import SwiftUI
 import UIKit
 import WebKit
@@ -45,6 +46,9 @@ struct MarkupBlock: View {
     @Environment(\.markupDrawsInPlace) private var drawsInPlace
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.chatTextSize) private var chatTextSize
+    /// The room the card holds and the height it has taken (#1238).
+    @StateObject private var cardHeight = ChatCardHeight()
+    /// A page's failure, when it reported one or never reported.
     @State private var report: MarkupDrawReport?
     /// Bumped by Try again, which rebuilds the page.
     @State private var attempt = 0
@@ -65,7 +69,7 @@ struct MarkupBlock: View {
             kind: kind,
             source: source,
             light: colorScheme == .light,
-            fontSize: kind == .math ? ChatTypography.font(for: .body, chatSize: chatTextSize).pointSize : 0
+            fontSize: kind == .math ? ChatTypography.font(for: .body, appearance: chatTextSize).pointSize : 0
         )
     }
 
@@ -74,7 +78,8 @@ struct MarkupBlock: View {
     /// Whether the block draws now, or shows its source until it can.
     private var draws: Bool { isComplete && drawsInPlace }
 
-    /// What the current page reported; nil while it's still drawing.
+    /// What the current page reported and shows; nil while it's still
+    /// drawing.
     private var outcome: MarkupDrawReport.Outcome? {
         report?.key == key ? report?.outcome : nil
     }
@@ -100,6 +105,12 @@ struct MarkupBlock: View {
         .task(id: MarkupDrawTask(key: key, draws: draws)) {
             await offerRetryIfStillDrawing()
         }
+        // Another page (the theme or text size changed, Try again) draws in
+        // the same room and shows once it reports; a failure the page before
+        // reported goes with it (`outcome`).
+        .onChange(of: key) {
+            cardHeight.pageReplaced()
+        }
     }
 
     private var title: String { kind == .mermaid ? "Mermaid" : "LaTeX" }
@@ -107,7 +118,7 @@ struct MarkupBlock: View {
     private var header: some View {
         HStack(spacing: 14) {
             Label(title, systemImage: kind == .mermaid ? "point.3.connected.trianglepath.dotted" : "function")
-                .font(.caption2.monospaced().weight(.semibold))
+                .scaledFont(.caption2.monospaced().weight(.semibold))
                 .foregroundStyle(.secondary)
             // Only for a block still being written; one waiting for a large
             // reply to settle isn't working on anything yet.
@@ -118,7 +129,7 @@ struct MarkupBlock: View {
             Button {
                 UIPasteboard.general.string = source
                 Haptics.light()
-            } label: { Label("Copy source", systemImage: "doc.on.doc").font(.caption2.weight(.semibold)) }
+            } label: { Label("Copy source", systemImage: "doc.on.doc").scaledFont(.caption2.weight(.semibold)) }
                 .tint(.conduitAccent)
             // A failed page has nothing to zoom; Try again is the way on.
             if draws, !hasFailed {
@@ -126,7 +137,7 @@ struct MarkupBlock: View {
                     showsFullScreen = true
                 } label: {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.caption2.weight(.semibold))
+                        .scaledFont(.caption2.weight(.semibold))
                 }
                 .tint(.conduitAccent)
                 .accessibilityLabel(Text("Open full screen"))
@@ -134,9 +145,9 @@ struct MarkupBlock: View {
         }
     }
 
+    /// The current page's height, once it has reported and taken it.
     private var drawnHeight: CGFloat? {
-        if case .drawn(let height) = outcome { return height }
-        return nil
+        cardHeight.isDrawn(key) ? cardHeight.taken : nil
     }
 
     private var hasFailed: Bool {
@@ -154,7 +165,12 @@ struct MarkupBlock: View {
         }
         .id(attempt)
         .frame(maxWidth: .infinity)
-        .frame(height: drawnHeight ?? MarkupHeights.height(for: document) ?? Self.placeholderHeight(for: kind))
+        // The room the page draws in, held from the card's first frame and
+        // through a redraw; it changes only when the page has measured
+        // itself.
+        .frame(height: cardHeight.frameHeight(
+            reserving: TranscriptPictureMemory.height(for: Self.heightKey(for: document)) ?? Self.placeholderHeight(for: kind)
+        ))
         .opacity(drawnHeight == nil ? 0 : 1)
         .overlay {
             if drawnHeight == nil {
@@ -182,17 +198,17 @@ struct MarkupBlock: View {
     private func failure(_ detail: String?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(kind == .mermaid ? AppLocalization.string("Couldn't draw this diagram.") : AppLocalization.string("Couldn't draw this formula."))
-                .font(.footnote.weight(.semibold))
+                .scaledFont(.footnote.weight(.semibold))
             if let detail, !detail.isEmpty {
                 Text(verbatim: detail)
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
             }
             Button {
                 attempt += 1
             } label: {
-                Label("Try again", systemImage: "arrow.clockwise").font(.caption.weight(.semibold))
+                Label("Try again", systemImage: "arrow.clockwise").scaledFont(.caption.weight(.semibold))
             }
             .tint(.conduitAccent)
         }
@@ -201,7 +217,7 @@ struct MarkupBlock: View {
     private var sourcePreview: some View {
         SelectableTextView(
             text: source,
-            font: ChatTypography.font(for: .sourceCode, chatSize: chatTextSize),
+            font: ChatTypography.font(for: .sourceCode, appearance: chatTextSize),
             textColor: .label,
             maximumNumberOfLines: 5
         )
@@ -212,10 +228,12 @@ struct MarkupBlock: View {
         case .height(let height):
             // A page measured before it had a width reports nothing useful.
             guard height >= 1 else { return }
-            MarkupHeights.store(height, for: key.document)
-            let next = MarkupDrawReport(key: key, outcome: .drawn(height: height))
-            if report != next { report = next }
+            TranscriptPictureMemory.rememberHeight(height, for: Self.heightKey(for: key.document))
+            // A page already replaced reports to nobody.
+            guard key == self.key else { return }
+            cardHeight.pageMeasured(height, page: key)
         case .failed(let detail):
+            guard key == self.key else { return }
             report = MarkupDrawReport(key: key, outcome: .failed(detail))
         }
     }
@@ -223,11 +241,20 @@ struct MarkupBlock: View {
     /// A page that never reports (the renderer didn't download, WebKit
     /// stalled) turns into the failure card instead of spinning forever.
     private func offerRetryIfStillDrawing() async {
-        guard draws, outcome == nil else { return }
+        guard draws, outcome == nil, drawnHeight == nil else { return }
         let key = self.key
         try? await Task.sleep(for: Self.drawTimeout)
-        guard !Task.isCancelled, report?.key != key else { return }
+        guard !Task.isCancelled, report?.key != key, !cardHeight.isDrawn(key) else { return }
         report = MarkupDrawReport(key: key, outcome: .failed(nil))
+    }
+
+    /// Where a page's height is kept across launches: by what decides it,
+    /// the kind, the text size (formulas) and the source, never the theme.
+    /// A digest, so the memo holds no sources.
+    static func heightKey(for document: MarkupDocument) -> String {
+        let kind = document.kind == .mermaid ? "mermaid" : "math"
+        let digest = SHA256.hash(data: Data("\(kind)\u{1f}\(document.fontSize)\u{1f}\(document.source)".utf8))
+        return "markup|" + digest.prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -254,43 +281,16 @@ extension EnvironmentValues {
     }
 }
 
-/// What a block's page last reported, and for which page.
+/// A block's page failing, and which page: its heights go through
+/// ChatCardHeight instead.
 struct MarkupDrawReport: Equatable {
     enum Outcome: Equatable {
-        case drawn(height: CGFloat)
         /// The renderer's own message, when it gave one.
         case failed(String?)
     }
 
     let key: MarkupDrawKey
     let outcome: Outcome
-}
-
-/// Measured heights by document. The chat list rebuilds a row it scrolls
-/// back to, and its diagram reserves its real height instead of growing
-/// from the placeholder while it redraws. Keyed by the document's hash so
-/// the cache holds no sources; a collision only misplaces a placeholder,
-/// which the page's own report corrects.
-@MainActor
-enum MarkupHeights {
-    private static var heights: [Int: CGFloat] = [:]
-    private static let limit = 256
-
-    static func height(for document: MarkupDocument) -> CGFloat? {
-        heights[document.hashValue]
-    }
-
-    static func store(_ height: CGFloat, for document: MarkupDocument) {
-        let key = document.hashValue
-        if heights[key] == nil, heights.count >= limit {
-            // Drop half rather than all, so a long session doesn't lose
-            // every height at once.
-            for stale in Array(heights.keys.prefix(limit / 2)) {
-                heights[stale] = nil
-            }
-        }
-        heights[key] = height
-    }
 }
 
 /// The page a block draws in. It takes no touches: the chat scrolls over it
@@ -375,7 +375,7 @@ struct MarkupWebView: UIViewRepresentable {
             }
         }
 
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
             decisionHandler(MarkupHTML.allowsNavigation(to: navigationAction.request.url) ? .allow : .cancel)
         }
     }
@@ -431,7 +431,7 @@ struct MarkupPreviewSheet: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     SelectableTextView(
                         text: document.source,
-                        font: ChatTypography.font(for: .sourceCode, chatSize: chatTextSize),
+                        font: ChatTypography.font(for: .sourceCode, appearance: chatTextSize),
                         textColor: .label,
                         wrapsLines: false
                     )
@@ -446,7 +446,7 @@ struct MarkupPreviewSheet: View {
     }
 }
 
-private struct SafeMarkupWebView: UIViewRepresentable {
+struct SafeMarkupWebView: UIViewRepresentable {
     let html: String
 
     func makeUIView(context: Context) -> WKWebView {
@@ -486,7 +486,7 @@ private struct SafeMarkupWebView: UIViewRepresentable {
             webView.loadHTMLString(html, baseURL: MarkupHTML.baseURL)
         }
 
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
             decisionHandler(MarkupHTML.allowsNavigation(to: navigationAction.request.url) ? .allow : .cancel)
         }
     }
@@ -549,13 +549,47 @@ enum MarkupHTML {
         case "conduit.local":
             return url.path.isEmpty || url.path == "/"
         case "cdn.jsdelivr.net":
-            return rendererPathPrefixes.contains { url.path.hasPrefix($0) }
+            return rendererPaths.contains(url.path) || url.path.hasPrefix(rendererFontFolder)
         default:
             return false
         }
     }
 
-    private static let rendererPathPrefixes = ["/npm/mermaid@", "/npm/katex@"]
+    /// Only the hashed files below and KaTeX's fonts, so a reference to
+    /// another file or version can't load around the hashes.
+    private static let rendererPaths = [mermaidScript, katexScript, katexStylesheet].compactMap { URL(string: $0.url)?.path }
+    private static let rendererFontFolder = (URL(string: katexStylesheet.url)?.deletingLastPathComponent().path ?? "") + "/fonts/"
+
+    /// The renderers' files, pinned by version and by hash: a file the CDN
+    /// serves changed doesn't run. A version bump takes new hashes: hash the
+    /// files in the npm tarball (`openssl dgst -sha384 -binary <file> | base64`)
+    /// after checking the tarball against the registry's `dist.integrity`.
+    /// A wrong hash shows "Couldn't draw" on every diagram or formula.
+    static let mermaidScript = Subresource(
+        url: "https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js",
+        integrity: "sha384-T/0lMUdJpd2S1ZHtRiofG3htU3xPCrFVeAQ1UUE2TJwlEJSV5NUwn30kP28n238E"
+    )
+    static let katexScript = Subresource(
+        url: "https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js",
+        integrity: "sha384-cMkvdD8LoxVzGF/RPUKAcvmm49FQ0oxwDF3BGKtDXcEc+T1b2N+teh/OJfpU0jr6"
+    )
+    static let katexStylesheet = Subresource(
+        url: "https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css",
+        integrity: "sha384-5TcZemv2l/9On385z///+d7MSYlvIEw9FuZTIdZ14vJLqWphw7e7ZPuOiCHJcFCP"
+    )
+
+    struct Subresource {
+        let url: String
+        let integrity: String
+
+        var scriptTag: String {
+            #"<script src="\#(url)" integrity="\#(integrity)" crossorigin="anonymous"></script>"#
+        }
+
+        var stylesheetTag: String {
+            #"<link rel="stylesheet" href="\#(url)" integrity="\#(integrity)" crossorigin="anonymous">"#
+        }
+    }
 
     static func page(_ document: MarkupDocument, presentation: Presentation) -> String {
         switch document.kind {
@@ -584,7 +618,7 @@ enum MarkupHTML {
         <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
         <style>html,body{margin:0;padding:0;background:\(background);color:\(palette.foreground)}#content{padding:\(padding);box-sizing:border-box}svg{display:block;max-width:100%;height:auto;margin:auto}\(heightLimit).error{font:14px -apple-system,sans-serif;color:#d14b4b;white-space:pre-wrap}</style>
         </head><body><div id="content"></div>
-        <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js"></script>
+        \(mermaidScript.scriptTag)
         <script>\(reportingScript(failureTitle: AppLocalization.string("Couldn't draw this diagram.")))
         (async function(){const content=document.getElementById('content');if(typeof mermaid==='undefined'){fail('');return;}try{mermaid.initialize({startOnLoad:false,securityLevel:'strict',suppressErrorRendering:true,theme:'base',themeVariables:{background:'\(palette.background)',primaryColor:'\(palette.primary)',primaryTextColor:'\(palette.foreground)',primaryBorderColor:'\(palette.border)',lineColor:'\(palette.muted)',fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif'}});const result=await mermaid.render('conduit-diagram',\(jsonString(MermaidSourceRepair.repaired(document.source))));content.innerHTML=result.svg;const send=()=>report({height:Math.ceil(content.getBoundingClientRect().height)});new ResizeObserver(send).observe(content);send();}catch(error){fail(String(error&&error.message?error.message:error));}})();</script></body></html>
         """
@@ -606,10 +640,10 @@ enum MarkupHTML {
             : "function fit(){}"
         return """
         <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+        \(katexStylesheet.stylesheetTag)
         <style>html,body{margin:0;padding:0;background:\(background);color:\(palette.foreground)}body{font-size:\(fontSize)}\(contentStyle).error{font:14px -apple-system,sans-serif;color:#d14b4b;white-space:pre-wrap}</style>
         </head><body><div id="content"></div>
-        <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+        \(katexScript.scriptTag)
         <script>\(reportingScript(failureTitle: AppLocalization.string("Couldn't draw this formula.")))
         (function(){const content=document.getElementById('content');if(typeof katex==='undefined'){fail('');return;}try{katex.render(\(jsonString(document.source)),content,{displayMode:true,throwOnError:\(throwsOnError),trust:false});}catch(error){fail(String(error&&error.message?error.message:error));return;}\(fitting)const send=()=>{fit();report({height:Math.ceil(content.getBoundingClientRect().height)});};new ResizeObserver(send).observe(content);document.fonts.ready.then(send);send();})();</script></body></html>
         """

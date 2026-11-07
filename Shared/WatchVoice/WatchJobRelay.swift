@@ -48,8 +48,10 @@ enum WatchJobAnswer {
     static func arguments(name: String, _ arguments: [String: String]) -> [String: Any]? {
         switch name {
         case startJob:
-            let instructions = WatchBridgeDelegation.removingQuickMarker(arguments["instructions"] ?? "")
-            return instructions.isEmpty ? nil : ["instructions": instructions]
+            let requested = arguments["instructions"] ?? ""
+            let instructions = WatchBridgeDelegation.removingQuickMarker(requested)
+            guard !instructions.isEmpty else { return nil }
+            return ["instructions": instructions, "joins_call": joinsCall(requested, profile: arguments["profile"])]
         case cancelJob:
             let jobID = arguments["job_id"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return jobID.isEmpty ? [:] : ["job_id": jobID]
@@ -60,10 +62,25 @@ enum WatchJobAnswer {
             let message = arguments["message"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             // Clipped as GPT-Live's words are, under the plugin's 3,000-byte cap.
             let words = WatchBridgeDelegation.clipped(message, bytes: WatchBridgeDelegation.maxRequestBytes)
-            return jobID.isEmpty || message.isEmpty ? nil : ["job_id": jobID, "message": words]
+            guard !jobID.isEmpty, !message.isEmpty else { return nil }
+            // add steers the job, change (or none) redirects it, as on the phone.
+            let kind = arguments["kind"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            var relayed: [String: Any] = ["job_id": jobID, "message": words]
+            if let kind, ["add", "change"].contains(kind) { relayed["kind"] = kind }
+            return relayed
         default:
             return nil
         }
+    }
+
+    /// Whether a start_job is ordinary work, which goes to the chat the
+    /// call's first such job made (#1250): not asked for in the background,
+    /// in a separate chat or quickly, and not for another profile. Read on
+    /// the words as the model sent them, "Quick:" included. A plugin before
+    /// 0.78 ignores it and starts a chat for each job.
+    static func joinsCall(_ instructions: String, profile: String?) -> Bool {
+        (profile ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !VoiceJobRouting.wantsJobOfItsOwn(instructions)
     }
 
     /// GeminiLiveToolBridge's answers to an interrupt_job it can't send.
@@ -196,6 +213,18 @@ enum WatchJobAnswer {
         var requestID: String
         var command: String
         var description: String
+        /// The host's name for the request as shown here, sent back with
+        /// the answer: without a request id Hermes answers its oldest
+        /// pending request, so the host checks it's still this one
+        /// (hermes-conduit-notifier#232). Empty from older plugins.
+        var fingerprint = ""
+        /// The card offers Approve once. A Local Live call's request offers
+        /// Deny only while more are pending or its command is cut.
+        var canApproveOnce = true
+
+        /// A Local Live call's own request (no job): answered on the call's
+        /// stream, `requestID` being the host's id for it.
+        var isCallRequest: Bool { grantID.isEmpty && jobID.isEmpty }
     }
 
     struct News: Equatable {
@@ -213,6 +242,7 @@ enum WatchJobAnswer {
         struct OpenApproval: Equatable {
             var jobID: String
             var requestID: String
+            var fingerprint = ""
         }
 
         var items: [Item]
@@ -237,7 +267,8 @@ enum WatchJobAnswer {
                     title: title,
                     requestID: request["request_id"] as? String ?? "",
                     command: request["command"] as? String ?? "",
-                    description: request["description"] as? String ?? ""
+                    description: request["description"] as? String ?? "",
+                    fingerprint: request["fingerprint"] as? String ?? ""
                 )
             }
             return News.Item(
@@ -252,9 +283,77 @@ enum WatchJobAnswer {
         }
         let open = (body["approvals"] as? [[String: Any]] ?? []).compactMap { item -> News.OpenApproval? in
             guard let jobID = item["job_id"] as? String else { return nil }
-            return News.OpenApproval(jobID: jobID, requestID: item["request_id"] as? String ?? "")
+            return News.OpenApproval(jobID: jobID, requestID: item["request_id"] as? String ?? "",
+                                     fingerprint: item["fingerprint"] as? String ?? "")
         }
         return News(items: items, running: body["running"] as? Int ?? 0, more: body["more"] as? Bool ?? false, openApprovals: open)
+    }
+
+    /// A card's key in the host's list of open requests. The host gives
+    /// the same fingerprint in a request's news and in that list.
+    static func openKey(jobID: String, requestID: String, fingerprint: String) -> String {
+        [jobID, requestID, fingerprint].joined(separator: "\u{0}")
+    }
+
+    /// answer_approval's arguments for the card the user read.
+    static func answerArguments(_ approval: Approval, choice: String) -> [String: Any] {
+        var arguments: [String: Any] = ["job_id": approval.jobID, "request_id": approval.requestID, "choice": choice]
+        if !approval.fingerprint.isEmpty { arguments["fingerprint"] = approval.fingerprint }
+        return arguments
+    }
+
+    /// Hermes took the answer: not refused, failed, or held back because
+    /// the request changed after the card was shown (its new card follows
+    /// with the next news). "not_pending" counts as taken: the request was
+    /// settled elsewhere, so the card stays gone and the model doesn't ask
+    /// again.
+    static func answerTaken(_ result: [String: String]) -> Bool {
+        result["error"] == nil && result["status"] != "failed" && result["status"] != "changed"
+    }
+
+    /// A news item's statuses that settle its job.
+    static let settledStatuses: Set<String> = ["finished", "failed", "cancelled"]
+
+    /// A settled job whose outcome the Watch holds for the model and
+    /// hasn't said yet.
+    struct UnsaidJob: Equatable {
+        let jobID: String
+        let title: String
+        let status: String
+    }
+
+    /// The host's list_jobs answer with the jobs whose outcome the Watch
+    /// hasn't said yet: the host counts an outcome told once the Watch has
+    /// it, but the user hears it only at the next quiet moment. The iPhone
+    /// lists such a job until it's said (VoiceBackgroundJobSupervisor
+    /// .listedJobs, #1210).
+    static func listing(_ result: [String: String], unsaid: [UnsaidJob]) -> [String: String] {
+        guard result["error"] == nil else { return result }
+        let entries = result.filter { $0.key.hasPrefix("job_") }
+        let listed = Set(entries.values.compactMap { entry -> String? in
+            guard entry.hasPrefix("id=") else { return nil }
+            return entry.dropFirst(3).split(separator: ";").first.map(String.init)
+        })
+        var merged = result
+        // After the host's highest number, in case its numbers have gaps.
+        var number = entries.keys.compactMap { Int($0.dropFirst(4)) }.max() ?? 0
+        var lines: [String] = []
+        for job in unsaid where !listed.contains(job.jobID) {
+            number += 1
+            merged["job_\(number)"] = "id=\(job.jobID); title=\(job.title); status=\(job.status)"
+            switch job.status {
+            case "failed": lines.append("\(job.title) failed.")
+            case "cancelled": lines.append("\(job.title) was cancelled.")
+            default: lines.append("\(job.title) has finished.")
+            }
+        }
+        guard !lines.isEmpty else { return result }
+        let summary = result["summary"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Nothing listed: its summary says so (in the app's language, from
+        // the iPhone), which the unsaid jobs now contradict.
+        let before = summary.isEmpty || entries.isEmpty ? [] : [summary]
+        merged["summary"] = (before + lines).joined(separator: " ")
+        return merged
     }
 
     /// What the model hears about a news item, as the iPhone's supervisor
@@ -300,6 +399,7 @@ enum WatchJobAnswer {
 
     /// VoiceBackgroundJobSupervisor.completionPrompt.
     static func completionPrompt(title: String, result: String) -> String {
+        let result = GatewayMediaTags.namingFiles(in: result)
         let clipped = result.count > maximumResultCharacters
             ? String(result.prefix(maximumResultCharacters)) + "\n[…]"
             : result

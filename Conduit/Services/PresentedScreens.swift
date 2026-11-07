@@ -38,6 +38,46 @@ struct PresentedMapsTarget: Equatable {
     }
 }
 
+/// Something Hermes put on the screen of the user's voice call with
+/// `conduit_show`: a table, steps, a chart. Shown once, never answered.
+struct PresentedCard: Identifiable, Equatable {
+    /// The Hermes tool that shows one.
+    static let toolName = "conduit_show"
+
+    let id: String
+    let title: String
+    /// What to show, as Markdown.
+    let markdown: String
+    /// Maps and places drawn above the Markdown, as the card schema
+    /// normalized them.
+    let cards: [[String: Any]]
+
+    init(id: String, title: String, markdown: String, cards: [[String: Any]] = []) {
+        self.id = id
+        self.title = title
+        self.markdown = markdown
+        self.cards = cards
+    }
+
+    init?(json: Any?) {
+        guard let entry = json as? [String: Any],
+              let id = entry["id"] as? String, !id.isEmpty,
+              let markdown = (entry["markdown"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !markdown.isEmpty else { return nil }
+        let cards = RichCardSchema.bundled?.normalizeCards(entry["cards"]) ?? []
+        // Markdown that's only the cards' own text (plugin 0.45.1+) would
+        // show the places twice beside the drawn cards.
+        let isFallback = !cards.isEmpty && entry["fallback"] as? Bool == true
+        self.init(id: id, title: (entry["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                  markdown: isFallback ? "" : markdown, cards: cards)
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.title == rhs.title && lhs.markdown == rhs.markdown
+            && RichCard.cards(lhs.cards) == RichCard.cards(rhs.cards)
+    }
+}
+
 /// One confirmation Hermes is waiting on.
 struct PresentedConfirm: Identifiable, Equatable {
     let id: String
@@ -100,6 +140,13 @@ struct PresentedConfirm: Identifiable, Equatable {
     func isConfirmed(by words: String) -> Bool {
         if VoiceCallDecisionOutcome.isYes(words) { return true }
         guard !words.contains("?"), !words.contains("？") else { return false }
+        // What a refusal is, the handset decides, not Hermes: whatever
+        // phrases it put in spoken_yes, the user's "no", "cancel" or
+        // "wait" in any shipped language, anywhere in their words ("send
+        // it, no wait", "absolutely not", "我不想发"), never confirms.
+        // "No problem" still does: the handset's own check above
+        // classifies it as a yes.
+        if VoiceThreadRouting.containsRefusal(words) { return false }
         let said = Self.words(in: words)
         guard !said.isEmpty else { return false }
         let leads: Set<String> = ["yes", "yeah", "yep", "ok", "okay", "sure", "please"]
@@ -152,8 +199,22 @@ final class PresentedScreensSync: ObservableObject {
     static let path = "/api/plugins/conduit_push/present/exchange"
     static let capability = "present-v1"
     /// What this Conduit does with a confirmation beyond showing it, told to
-    /// the host in each exchange.
-    static let features = ["maps-navigate"]
+    /// the host in each exchange. "show-cards": it shows the cards
+    /// `conduit_show` puts on a voice call's screen. "chat-cards": it draws
+    /// conduit_show's map and place cards in a chat, so the host offers the
+    /// tool there too. "info-cards": it also draws stats, charts, forecasts,
+    /// comparisons and steps (plugin 0.46+). "media-cards": photos, videos,
+    /// audio and contacts; "live-cards": statuses and cards kept up to date
+    /// under a live name (plugin 0.47+); "text-drafts": Send text for a
+    /// contact card's message (plugin 0.67+); "board-cards": tables,
+    /// timelines, checklists, lists, progress and callouts, up to 12 cards
+    /// as a stack or tabs, and follow-ups (plugin 0.128+); "room-boards": a
+    /// group room's boards under its agents' messages (plugin 0.129+);
+    /// "diff-cards": changes line by line (plugin 0.133+).
+    static let features = ["maps-navigate", "show-cards", "chat-cards", "info-cards", "media-cards", "live-cards",
+                           "text-drafts", "board-cards", "room-boards", "diff-cards"]
+    /// Card ids remembered as seen, so a card is shown at most once.
+    private static let maxSeenCards = 200
     private static let resultsKey = "conduit.presentedScreens.results.v1"
     private static let maxResults = 40
 
@@ -173,6 +234,12 @@ final class PresentedScreensSync: ObservableObject {
     /// The user's last turn in the call when each confirmation appeared:
     /// words from before it was on screen can't confirm it.
     private(set) var userTurnWhenShown: [String: UUID] = [:]
+    /// New cards from Hermes, as each exchange brings them.
+    var onCards: (@MainActor (_ cards: [PresentedCard]) -> Void)?
+    /// Cards already handed on, oldest first. Nil until the first exchange
+    /// with this host and profile, which only notes what's there: those
+    /// cards were for a conversation before this app's.
+    private var seenCardIDs: [String]?
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
@@ -190,6 +257,7 @@ final class PresentedScreensSync: ObservableObject {
             self.scope = scope
             prompts = []
             userTurnWhenShown = [:]
+            seenCardIDs = nil
         }
         latest = (profile, installationID, isCurrent, request)
         if syncing {
@@ -197,15 +265,17 @@ final class PresentedScreensSync: ObservableObject {
             return
         }
         syncing = true
-        defer { syncing = false }
-        var rounds = 0
+        // The request holds the dashboard bridge: not kept past the sync.
+        defer { syncing = false; latest = nil }
+        // Every round answers a call that came meanwhile (an answer to send,
+        // a tool that finished), and that call has already returned: none is
+        // dropped. Rounds never ask for more themselves, so this ends.
         repeat {
             syncAgain = false
-            rounds += 1
             guard let current = self.scope, let next = latest else { return }
             await syncOnce(scope: current, profile: next.profile, installationID: next.installationID,
                            isCurrent: next.isCurrent, request: next.request)
-        } while syncAgain && rounds < 3
+        } while syncAgain
     }
 
     /// Notes the user's last call turn as a confirmation goes on screen.
@@ -240,6 +310,19 @@ final class PresentedScreensSync: ObservableObject {
             .filter { !answered.contains($0.id) && !$0.isExpired() }
         let listed = Set(prompts.map(\.id))
         userTurnWhenShown = userTurnWhenShown.filter { listed.contains($0.key) }
+        takeCards(response["cards"])
+    }
+
+    private func takeCards(_ json: Any?) {
+        let cards = (json as? [Any] ?? []).compactMap(PresentedCard.init(json:))
+        guard let seen = seenCardIDs else {
+            seenCardIDs = cards.map(\.id)
+            return
+        }
+        let fresh = cards.filter { !seen.contains($0.id) }
+        guard !fresh.isEmpty else { return }
+        seenCardIDs = Array((seen + fresh.map(\.id)).suffix(Self.maxSeenCards))
+        onCards?(fresh)
     }
 
     /// Records the user's answer and takes the confirmation off screen; the
@@ -268,6 +351,7 @@ final class PresentedScreensSync: ObservableObject {
         latest = nil
         prompts = []
         userTurnWhenShown = [:]
+        seenCardIDs = nil
     }
 
     private func results(for scope: String) -> [[String: Any]] {

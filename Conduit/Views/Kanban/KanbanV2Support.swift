@@ -50,6 +50,17 @@ enum KanbanLanePolicy {
             ?? columns.first?.name
     }
 
+    /// The lane a new task starts from. The V2 sideways board shows the
+    /// column it is scrolled to (or its leading one), and never sets the chip
+    /// selection, so it asks the scroll position; the chip board asks the
+    /// effective selection. No columns: the chip answer, which is nil.
+    static func newTaskLane(columnsLayout: Bool, scrolledColumn: String?, selected: String?, columns: [KanbanColumn]) -> String? {
+        if columnsLayout, let visible = KanbanColumnBoardPolicy.currentColumn(scrolledTo: scrolledColumn, in: columns) {
+            return visible
+        }
+        return effectiveSelectedLane(selected: selected, columns: columns)
+    }
+
     /// Creation target derived from the effective visible lane. Locked lanes
     /// are never valid creation targets (upstream gives them no add button);
     /// they collapse to the backend's default unlocked landing lane.
@@ -420,10 +431,14 @@ enum KanbanActivityFormatter {
 
         switch event.kind {
         case "created":
-            var parts: [String] = []
-            if let s = status("status") { parts.append("as \(s)") }
-            if let a = string("assignee") { parts.append("for \(a)") }
-            return Row(label: AppLocalization.string("Task created"), detail: parts.isEmpty ? nil : parts.joined(separator: " "))
+            let detail: String?
+            switch (status("status"), string("assignee")) {
+            case let (s?, a?): detail = AppLocalization.string("as \(s) for \(a)")
+            case let (s?, nil): detail = AppLocalization.string("as \(s)")
+            case let (nil, a?): detail = AppLocalization.string("for \(a)")
+            case (nil, nil): detail = nil
+            }
+            return Row(label: AppLocalization.string("Task created"), detail: detail)
         case "status":
             let reason = string("reason")
             let detail: String?
@@ -451,7 +466,12 @@ enum KanbanActivityFormatter {
         case "completed":
             return Row(label: AppLocalization.string("Completed"), detail: nil)
         case "blocked":
-            return Row(label: AppLocalization.string("Blocked"), detail: string("reason"))
+            // Hermes' own `initial_status` code reads as what it means.
+            let reason = string("reason")
+            return Row(
+                label: AppLocalization.string("Blocked"),
+                detail: reason == KanbanBlockedQuestion.createdBlockedReason ? AppLocalization.string("Created as Blocked") : reason
+            )
         case "unblocked":
             return Row(label: AppLocalization.string("Unblocked → \(status("status") ?? "")"), detail: nil)
         case "reclaimed":
@@ -503,30 +523,63 @@ enum KanbanActivityFormatter {
 /// such as parent_reopened), `unblocked`, claim or completion - makes the
 /// question stale and yields nil. A manual or dependency block yields nil.
 ///
+/// `initial_status` is the one reason Hermes writes on a `blocked` event
+/// itself: it marks a task created already Blocked (`initial_status="blocked"`),
+/// so `wait(in:)` says that in plain words instead of showing the code (issue
+/// #1601). Hermes logs its dependency codes (`parent_not_done`) on
+/// `dependency_wait` and `status` rows, never as a block reason.
+///
 /// Events arrive newest-first, so array order breaks ties between blocked
 /// events, and an event without a timestamp is taken as the newest.
 enum KanbanBlockedQuestion {
+    /// What the current block waits on, for the task screen's callout.
+    enum Wait: Equatable {
+        /// The worker asked something (upstream `kanban_block(reason)`).
+        case question(String)
+        /// The task was created already Blocked; nobody asked anything.
+        case createdBlocked
+        /// Blocked with no reason: by hand, or a blocked run with no summary.
+        case noReason
+    }
+
+    static let createdBlockedReason = "initial_status"
+
     static let transitionKinds: Set<String> = [
         "blocked", "unblocked", "status", "claimed", "completed", "reclaimed", "scheduled", "promoted", "archived",
     ]
 
     static func reason(in detail: KanbanTaskDetail) -> String? {
+        if case .question(let question)? = wait(in: detail) { return question }
+        return nil
+    }
+
+    /// Nil when the current block isn't waiting on the operator: a
+    /// dependency block (a `status` row), a block a newer transition made
+    /// stale, or no block recorded at all.
+    static func wait(in detail: KanbanTaskDetail) -> Wait? {
         let transitions = detail.events.enumerated().filter { transitionKinds.contains($0.element.kind) }
-        let question: String?
+        let wait: Wait?
         let blockTime: Int
         if let block = transitions.filter({ $0.element.kind == "blocked" }).max(by: { lhs, rhs in
             let left = lhs.element.createdAt ?? Int.max
             let right = rhs.element.createdAt ?? Int.max
             return left == right ? lhs.offset > rhs.offset : left < right
         }) {
-            question = nonEmpty(block.element.payload?.objectValue?["reason"]?.stringValue)
+            let reason = nonEmpty(block.element.payload?.objectValue?["reason"]?.stringValue)
+            if reason == createdBlockedReason {
+                wait = .createdBlocked
+            } else if let reason {
+                wait = .question(reason)
+            } else {
+                wait = .noReason
+            }
             blockTime = block.element.createdAt ?? Int.max
         } else {
             let blockedRuns = detail.runs.filter { ($0.outcome ?? $0.status) == "blocked" }
             guard let run = blockedRuns.max(by: { ($0.endedAt ?? $0.startedAt ?? 0) < ($1.endedAt ?? $1.startedAt ?? 0) }) else {
                 return nil
             }
-            question = nonEmpty(run.summary)
+            wait = nonEmpty(run.summary).map(Wait.question) ?? .noReason
             blockTime = run.endedAt ?? run.startedAt ?? Int.max
         }
         // A transition strictly newer than the block supersedes it. One
@@ -535,7 +588,7 @@ enum KanbanBlockedQuestion {
         let superseded = transitions.contains { other in
             other.element.kind != "blocked" && (other.element.createdAt ?? Int.max) > blockTime
         }
-        return superseded ? nil : question
+        return superseded ? nil : wait
     }
 
     private static func nonEmpty(_ value: String?) -> String? {
@@ -628,5 +681,46 @@ enum KanbanCompactDuration {
         formatter.allowedUnits = unit
         formatters.setObject(formatter, forKey: key)
         return formatter
+    }
+}
+
+// MARK: - V2 column board
+
+/// One lane of the V2 board as its column header and jump bar show it.
+struct KanbanBoardColumnSummary: Identifiable, Equatable {
+    let status: String
+    let title: String
+    let systemImage: String
+    let count: Int
+    /// A system-owned lane (Scheduled, Running, Review, or one Conduit
+    /// doesn't know): shown with a lock, never a manual destination.
+    let isLocked: Bool
+
+    var id: String { status }
+}
+
+/// The V2 board's columns: every lane the server reported, in workflow
+/// order, Blocked and Done included. The board shows them side by side and
+/// lists them all in the jump bar above, so a lane past the screen's edge is
+/// one tap away and never hidden behind a swipe.
+enum KanbanColumnBoardPolicy {
+    static func summaries(for columns: [KanbanColumn]) -> [KanbanBoardColumnSummary] {
+        columns.map { column in
+            let presentation = KanbanStatusPresentation.forStatus(column.name)
+            return KanbanBoardColumnSummary(
+                status: column.name,
+                title: presentation.displayName,
+                systemImage: presentation.systemImage,
+                count: column.tasks.count,
+                isLocked: presentation.isBackendControlled
+            )
+        }
+    }
+
+    /// The lane the jump bar marks: the one the board is scrolled to, else
+    /// the first.
+    static func currentColumn(scrolledTo status: String?, in columns: [KanbanColumn]) -> String? {
+        if let status, columns.contains(where: { $0.name == status }) { return status }
+        return columns.first?.name
     }
 }

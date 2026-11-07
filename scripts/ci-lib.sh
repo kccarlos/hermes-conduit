@@ -2,30 +2,42 @@
 #
 # Shared CI runner primitives for Hermes Conduit CI v2.
 #
-# Sourced by ci-build-for-testing.sh and ci-test-lane.sh. Bash 3.2 compatible
+# Sourced by ci-build-for-testing.sh and ci-prepare-smoke.sh. Bash 3.2 compatible
 # (GitHub macOS runners default to /bin/bash).
 #
 # Helpers:
 #   run_with_deadline          - xcodebuild under a wall-clock watchdog; kills
 #                                the whole process group (xcodebuild + xctest +
-#                                simulator agents) on expiry. Returns 124. If
-#                                the log already carries xcodebuild's terminal
-#                                result marker when the budget expires, one
-#                                bounded finalize-grace extension lets the
-#                                finished session write its xcresult and exit.
+#                                simulator agents) on expiry. Returns 124. Once
+#                                the log says the test session ended, the
+#                                deadline becomes a bounded finalize grace, so
+#                                a hung finalize step cannot spend the rest of
+#                                the test budget.
 #   bounded_run                - any short command under a deadline so a wedged
 #                                CoreSimulatorService costs a bounded warning,
 #                                not the job. Output lands in BOUNDED_OUTPUT.
 #   simulator_udid             - resolve the destination device UDID.
 #   reset_and_boot_simulator   - bounded shutdown/erase/boot recovery.
 #   now_iso                    - UTC timestamp for lane result documents.
+#   decimal_seconds            - a seconds override read as base 10, with a
+#                                fallback and a one-day ceiling.
 
-# Terminal xcodebuild result markers (test and test-without-building forms).
-# Presence means the test session itself ENDED and xcodebuild is only
-# finalizing; the result verdict still comes exclusively from the process
-# exit status.
+# Whether the test session itself has ENDED and xcodebuild is only finalizing.
+# Two markers say so: xcodebuild's own "** TEST [EXECUTE ]SUCCEEDED/FAILED **"
+# (printed last, once finalizing is done), and XCTest's top-level suite summary
+# ("Test Suite 'Selected tests' passed at ...", 'All tests' for an unfiltered
+# run), printed before finalizing, which can hang. Only the LAST top-level
+# suite line counts: under -retry-tests-on-failure a failed summary is followed
+# by a new "started" line for the retry iteration. The result verdict still
+# comes exclusively from the process exit status.
 log_has_terminal_result_marker() {
-  grep -q -E '\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*' "$1" 2>/dev/null
+  local last
+  grep -q -E '\*\* TEST (EXECUTE )?(SUCCEEDED|FAILED) \*\*' "$1" 2>/dev/null && return 0
+  last=$(grep -E "^Test Suite '(Selected tests|All tests)' (started|passed|failed) at " "$1" 2>/dev/null | tail -n 1)
+  case "$last" in
+    *"' passed at "*|*"' failed at "*) return 0 ;;
+  esac
+  return 1
 }
 
 # Stream log lines not yet printed. $1 = log path, $2 = NAME of the caller's
@@ -46,27 +58,55 @@ stream_new_lines() {
   fi
 }
 
+# Print a seconds override as a plain decimal number, or $2 when $1 is empty
+# or not all digits. Every such value ends up inside $(( )), where bash reads
+# a leading zero as octal (08 and 09 abort, 060 is 48) and silently wraps an
+# oversized number, possibly to a negative one. So leading zeros are dropped
+# as text and anything above one day (86400) is clamped to one day. The
+# fallback must itself be all digits: a caller that passes anything else gets
+# a message on stderr and status 2, never the bad value printed back.
+decimal_seconds() {
+  local value="$1"
+  case "$2" in
+    ''|*[!0-9]*)
+      echo "decimal_seconds: fallback '$2' is not a whole number of seconds" >&2
+      return 2 ;;
+  esac
+  case "$value" in ''|*[!0-9]*) value="$2" ;; esac
+  value="${value#"${value%%[!0]*}"}"
+  [ -z "$value" ] && value=0
+  if [ "${#value}" -gt 5 ] || [ "$value" -gt 86400 ]; then
+    value=86400
+  fi
+  printf '%s\n' "$value"
+}
+
 # Run the command given after the first two args under a wall-clock deadline
 # (arg 1 = budget seconds, arg 2 = log path). Streams the log into the step
 # log; returns the command's exit status, or 124 when the deadline killed it.
 # The caller owns retry policy - this function never retries.
 #
-# Finalize grace: when the budget expires but the log already contains
-# xcodebuild's terminal result marker, the TEST SESSION is finished and the
-# process is only writing out its xcresult. Killing there converts a
-# completed run into a timeout (and can truncate the result bundle), so the
-# deadline is extended ONCE by XCODEBUILD_FINALIZE_GRACE_S (default 180s) and
-# the process is allowed to exit on its own. Success is still only ever
-# returned from the process's real exit status - the marker never fakes a
-# result - and a process that outlives the grace window is killed and
-# classified as a timeout exactly as before.
+# Finalize grace: as soon as the log says the TEST SESSION is finished, the
+# process is only finalizing (writing its xcresult, collecting diagnostics),
+# and the deadline becomes NOW + XCODEBUILD_FINALIZE_GRACE_S (default 180s).
+# That extends a nearly spent budget, so a completed run is not converted into
+# a timeout (run #500) or a truncated result bundle, and it shortens a large
+# one, so a hung finalize step cannot spend the rest of the test budget. If a
+# retry iteration starts afterwards, the test budget's deadline applies again.
+# Success is still only ever returned from the process's real exit status -
+# the marker never fakes a result - and a process that outlives the grace
+# window is killed and classified as a timeout exactly as before.
 run_with_deadline() {
   local budget="$1"
   local log="$2"
   shift 2
   local started deadline poll printed heartbeat timed_out now remaining runner grace
-  local finalize_grace grace_granted
-  finalize_grace="${XCODEBUILD_FINALIZE_GRACE_S:-180}"
+  local finalize_grace grace_granted budget_deadline
+  # A non-numeric override would make the deadline arithmetic read it as 0
+  # (an instant kill) or abort the script, and a leading zero (08, 09) is
+  # invalid octal there; decimal_seconds falls back to 180 and reads base 10.
+  finalize_grace=$(decimal_seconds "${XCODEBUILD_FINALIZE_GRACE_S:-}" 180)
+  [ "$finalize_grace" -lt 1 ] && finalize_grace=1
   # Poll cadence. 15s keeps hosted-lane log streaming and deadline checks
   # cheap for minute-scale invocations; the state-machine tests shrink it so
   # stub invocations (which exit instantly) do not each pay a full interval.
@@ -75,7 +115,8 @@ run_with_deadline() {
   [ "$poll" -lt 1 ] && poll=1
 
   started=$(date +%s)
-  deadline=$(( started + budget ))
+  budget_deadline=$(( started + budget ))
+  deadline=$budget_deadline
   rm -f "$log"
 
   # Job control (set -m) puts this one background job into its own process
@@ -94,17 +135,21 @@ run_with_deadline() {
   grace_granted=0
   while kill -0 "$runner" 2>/dev/null; do
     now=$(date +%s)
-    remaining=$(( deadline - now ))
-    if [ "$remaining" -le 0 ]; then
-      if [ "$grace_granted" -eq 0 ] && log_has_terminal_result_marker "$log"; then
+    if log_has_terminal_result_marker "$log"; then
+      if [ "$grace_granted" -eq 0 ]; then
         grace_granted=1
         deadline=$(( now + finalize_grace ))
-        remaining=$finalize_grace
-        echo "::warning::xcodebuild reached its "${budget}"s budget after printing its final result - allowing "${finalize_grace}"s finalize grace so the xcresult is written completely"
-      else
-        timed_out=1
-        break
+        echo "::warning::xcodebuild's test session ended but the process is still running - allowing "${finalize_grace}"s finalize grace for the xcresult and diagnostics"
       fi
+    elif [ "$grace_granted" -eq 1 ]; then
+      grace_granted=0
+      deadline=$budget_deadline
+      echo "xcodebuild started another test iteration - back on its "${budget}"s test budget"
+    fi
+    remaining=$(( deadline - now ))
+    if [ "$remaining" -le 0 ]; then
+      timed_out=1
+      break
     fi
     stream_new_lines "$log" printed
     heartbeat=$(( heartbeat + 1 ))
@@ -120,7 +165,11 @@ run_with_deadline() {
   stream_new_lines "$log" printed
 
   if [ "$timed_out" -eq 1 ]; then
-    echo "::error::xcodebuild exceeded its "${budget}"s budget - killing the process group (pid $runner)"
+    if [ "$grace_granted" -eq 1 ]; then
+      echo "::error::xcodebuild did not exit within its "${finalize_grace}"s finalize grace after the test session ended - killing the process group (pid $runner)"
+    else
+      echo "::error::xcodebuild exceeded its "${budget}"s budget - killing the process group (pid $runner)"
+    fi
     # TERM the whole group so nothing is orphaned, grace window, then KILL.
     kill -TERM -- "-$runner" 2>/dev/null || kill -TERM "$runner" 2>/dev/null || true
     grace=10
@@ -368,7 +417,8 @@ reset_and_boot_simulator() {
   # GATE_SLEEP_SCALE: 1 (default) everywhere except the gate's stubbed
   # integration suite, which scales settling sleeps to 0 - deadlines are
   # wall-clock (`date`), so watchdog budgets never depend on this multiplier.
-  sleep $(( 3 * ${GATE_SLEEP_SCALE:-1} ))
+  # Read as base 10 like every other override that reaches $(( )).
+  sleep $(( 3 * $(decimal_seconds "${GATE_SLEEP_SCALE:-}" 1) ))
   if ! udid=$(resolve_own_udid); then
     echo "::warning::could not resolve simulator UDID - letting xcodebuild boot the destination itself"
     [ "$erase" -eq 1 ] && return 1
@@ -440,9 +490,10 @@ build_destination() {
 # error. It is strictly a gate: the pinned name is never substituted with
 # another device.
 wait_for_destination_device() {
-  local budget="${DESTINATION_SETTLE_TIMEOUT_S:-180}"
-  # A non-numeric override must not defeat the deadline comparison.
-  case "$budget" in ''|*[!0-9]*) budget=180 ;; esac
+  # A non-numeric or leading-zero override must not defeat (or abort) the
+  # deadline arithmetic below.
+  local budget
+  budget=$(decimal_seconds "${DESTINATION_SETTLE_TIMEOUT_S:-}" 180)
   # Wall-clock deadline, not a sleep counter: each simulator_udid probe can
   # itself block up to its own 60s bound on a wedged CoreSimulatorService,
   # and the budget must cap total wall time, not just idle time.

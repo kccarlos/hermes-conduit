@@ -15,7 +15,7 @@ import Foundation
 import NaturalLanguage
 import OSLog
 
-private let onDeviceSpeechLog = Logger(subsystem: "com.milim.conduit", category: "OnDeviceSpeech")
+private let onDeviceSpeechLog = Logger(subsystem: "com.milim.relay", category: "OnDeviceSpeech")
 
 /// Who speaks Classic voice replies.
 enum VoiceSpeechOutput: String, Codable, Equatable {
@@ -66,6 +66,8 @@ final class OnDeviceSpeechStream: VoiceSpeechStream {
     private var queue: [String] = []
     private var speaking = false
     private var language: String?
+    /// The language is the app's, until a sentence is long enough to tell.
+    private var languageIsGuess = false
     private var sampleRate: Double?
     private var finishRequested = false
     private var terminal = false
@@ -123,8 +125,21 @@ final class OnDeviceSpeechStream: VoiceSpeechStream {
             if finishRequested { complete(.success(sampleRate != nil)) }
             return
         }
-        let text = queue.removeFirst()
-        if language == nil { language = Self.language(of: text) ?? fallbackLanguage }
+        // Markdown marks are written, not said: "**Québec**" reads "Québec".
+        // Hermes' own speech strips them on the gateway; this voice is ours.
+        let text = PreviewText.plain(queue.removeFirst())
+        guard !text.isEmpty else { return speakNext() }
+        // A reply that opens too short to tell ("OK.", "42.") speaks in the
+        // app's language until a sentence says what the reply is in.
+        if language == nil || languageIsGuess {
+            if let detected = Self.language(of: text) {
+                language = detected
+                languageIsGuess = false
+            } else if language == nil {
+                language = fallbackLanguage
+                languageIsGuess = true
+            }
+        }
         speaking = true
         synthesizer.speak(
             text,
@@ -196,13 +211,35 @@ final class OnDeviceSpeechStream: VoiceSpeechStream {
         case .simplifiedChinese: return "zh-CN"
         case .traditionalChinese: return "zh-TW"
         case .undetermined: return nil
-        default: return best.key.rawValue
+        default: return detectedTag(best.key.rawValue)
         }
     }
 
+    /// The tag a detected language is spoken by. Cantonese ("yue") goes to
+    /// zh-HK, the tag iOS gives its Cantonese voices, so it reaches them and
+    /// a Traditional Chinese pick.
+    nonisolated static func detectedTag(_ raw: String) -> String {
+        raw.lowercased() == "yue" ? "zh-HK" : raw
+    }
+
     nonisolated static var appLanguage: String? {
-        let locale = AppLanguage.current.locale ?? Locale(identifier: Locale.preferredLanguages.first ?? "en")
-        return locale.language.languageCode?.identifier
+        speechLanguage(of: AppLanguage.current.locale ?? Locale(identifier: Locale.preferredLanguages.first ?? "en"))
+    }
+
+    /// A locale's language as speech picks voices by it: the language code,
+    /// and for Chinese its script, as language(of:) tells replies apart, so
+    /// an app in Traditional Chinese speaks short replies with a Traditional
+    /// voice.
+    nonisolated static func speechLanguage(of locale: Locale) -> String? {
+        guard let code = locale.language.languageCode?.identifier else { return nil }
+        guard code == "zh" else { return detectedTag(code) }
+        // A script named outright wins over the region (zh-Hans-HK is Simplified).
+        switch locale.language.script?.identifier {
+        case "Hant": return "zh-TW"
+        case "Hans": return "zh-CN"
+        default:
+            return ["TW", "HK", "MO"].contains(locale.language.region?.identifier ?? "") ? "zh-TW" : "zh-CN"
+        }
     }
 }
 
@@ -217,9 +254,6 @@ final class SystemSpeechSynthesizer: NSObject, OnDeviceSpeechSynthesizing, AVSpe
     private var watchdog: Task<Void, Never>?
     /// When the current utterance last produced audio (or started).
     private var lastAudio = ContinuousClock.now
-    /// Best voice per language, shared by every reply; a cached nil means
-    /// none is installed.
-    private static var voices: [String: AVSpeechSynthesisVoice?] = [:]
 
     override init() {
         super.init()
@@ -289,6 +323,7 @@ final class SystemSpeechSynthesizer: NSObject, OnDeviceSpeechSynthesizing, AVSpe
             while let self, self.utterance == id {
                 do { try await Task.sleep(until: self.lastAudio + quiet, clock: .continuous) } catch { return }
                 if ContinuousClock.now - self.lastAudio >= quiet {
+                    onDeviceSpeechLog.notice("iPhone speech went quiet without ending; moving on")
                     self.finish(id)
                     return
                 }
@@ -309,28 +344,12 @@ final class SystemSpeechSynthesizer: NSObject, OnDeviceSpeechSynthesizing, AVSpe
         }
     }
 
-    /// The best voice installed for `language`: Premium, then Enhanced,
-    /// then the default one, preferring the iPhone's own region. Novelty
-    /// and Personal Voices are never picked.
+    /// The voice picked for `language` in Settings, or else the best one
+    /// installed (IPhoneVoices).
     private func voice(for language: String?) -> AVSpeechSynthesisVoice? {
-        let key = language ?? ""
-        if let cached = Self.voices[key] { return cached }
         let wanted = language ?? AVSpeechSynthesisVoice.currentLanguageCode()
-        let base = wanted.split(separator: "-").first.map(String.init) ?? wanted
-        let region = Locale.current.region?.identifier
-        let candidates = AVSpeechSynthesisVoice.speechVoices().filter { voice in
-            !voice.voiceTraits.contains(.isNoveltyVoice)
-                && !voice.voiceTraits.contains(.isPersonalVoice)
-                && (voice.language == wanted || voice.language.hasPrefix(base + "-") || voice.language == base)
-        }
-        func rank(_ voice: AVSpeechSynthesisVoice) -> (Int, Int, Int) {
-            let exact = voice.language == wanted ? 1 : 0
-            let local = region.map { voice.language.hasSuffix("-" + $0) } == true ? 1 : 0
-            return (voice.quality.rawValue, exact, local)
-        }
-        let chosen = candidates.max { rank($0) < rank($1) } ?? AVSpeechSynthesisVoice(language: wanted)
+        let chosen = IPhoneVoices.voice(for: wanted)
         if chosen == nil { onDeviceSpeechLog.notice("No iPhone voice for \(wanted, privacy: .public)") }
-        Self.voices[key] = .some(chosen)
         return chosen
     }
 
@@ -403,9 +422,15 @@ final class FallbackSpeechStream: VoiceSpeechStream {
         let stream = FallbackSpeechStream(openOnDevice: onDevice, onFallback: onFallback, onStart: onStart, onPCM16: onPCM16)
         do {
             stream.current = try await hermes(
-                { [weak stream] rate in stream?.audioStarted = true; try onStart(rate) },
-                { [weak stream] data, rate in stream?.audioStarted = true; try onPCM16(data, rate) },
-                { [weak stream] data in stream?.audioStarted = true; try onEncodedAudio(data) }
+                { rate in try onStart(rate) },
+                { [weak stream] data, rate in
+                    try onPCM16(data, rate)
+                    if !data.isEmpty { stream?.audioStarted = true }
+                },
+                { [weak stream] data in
+                    try onEncodedAudio(data)
+                    if !data.isEmpty { stream?.audioStarted = true }
+                }
             )
         } catch is CancellationError {
             throw CancellationError()

@@ -15,7 +15,7 @@ struct NotifierPluginStatus: Equatable {
     static let path = "/api/plugins/conduit_push/capabilities"
 
     /// Plugin features Conduit uses, by the plugin's capability id. Must match
-    /// ROUTE_CAPABILITIES in hermes-conduit-notifier's dashboard/plugin_api.py.
+    /// ROUTE_CAPABILITIES in hermes-conduit-notifier's dashboard/api/capabilities.py.
     static let usedCapabilities = [
         "session-takeover",
         "voice-sessions",
@@ -25,11 +25,13 @@ struct NotifierPluginStatus: Equatable {
         "memory",
         "web-search",
         "gemini-live",
+        "qwen-live",
         "gpt-live",
         "grok-live",
         "e2e-notifications",
         "desktop-views",
         "hermes-calls",
+        DashboardPath.dashboardProfilesCapability,
         // "watch-chats" is left out on purpose: only Watch calls use it, and
         // they fall back to the phone without it, so it's no reason to nag.
     ]
@@ -46,16 +48,58 @@ struct NotifierPluginStatus: Equatable {
         var bootID: String?
     }
 
-    /// The plugin version this Conduit build was made against. Below it, the
-    /// update notice shows even when no feature is missing yet.
-    static let recommendedVersion = "0.43.1"
+    /// The plugin version this Conduit build was made against: the least it
+    /// offers, even when GitHub can't be reached for the latest
+    /// (`latestVersion`).
+    static let recommendedVersion = "0.48.0"
+
+    /// The plugin version on notifier main when this build was archived
+    /// (scripts/stamp-plugin-version.py): the stable version a build asks
+    /// for by default, so each build moves it forward. Nil for a Run or CI
+    /// build, or when GitHub couldn't be reached at archive time.
+    static let archivedVersion = Bundle.main.object(forInfoDictionaryKey: "ConduitArchivedPluginVersion") as? String
 
     /// Where Hermes installs it from (`hermes plugins install …`).
     static let repository = "kaishi00/hermes-conduit-notifier"
 
     var state: State = .unknown
+    /// The plugin's copy in Hermes' plugin list, read only while the
+    /// capabilities route is missing. Nil when not read, or the host
+    /// couldn't say.
+    var hostCopy: HostCopy?
+
+    enum HostCopy: Equatable {
+        /// Hermes doesn't list the plugin.
+        case missing
+        /// Listed, older than 0.4 (or without a version): it predates the
+        /// capabilities route, so an update brings it.
+        case old
+        /// Listed at 0.4 or newer, yet its routes don't answer: turned off,
+        /// or installed after the dashboard started. Neither an install
+        /// (Hermes refuses one over an existing copy) nor an update fixes
+        /// it: turning it on and restarting the dashboard does
+        /// (`isNotServed`).
+        case notServed
+    }
+
+    /// The first plugin version that serves the capabilities route.
+    static let capabilitiesVersion = "0.4.0"
     /// Nil until a plugin 0.24+ reports it.
     var runtime: Runtime?
+    /// The plugin on its repository's main branch, when Conduit has read it
+    /// (NotifierPluginLatestVersion.swift).
+    var latestVersion: String?
+    /// The stable plugin version (notifier main's channels.yaml), when read.
+    /// It can raise the archived one between builds, never lower it.
+    var stableVersion: String?
+    /// This build's archived plugin version (`Self.archivedVersion`).
+    var archivedVersion: String? = Self.archivedVersion
+    /// The notice asks for every version on main; otherwise only up to the
+    /// stable one (NotifierPluginNoticeChannel).
+    var followsMain = true
+    /// False: nothing asks for an update unprompted, only for the restart
+    /// of one already on the host (NotifierPluginNoticeChannel.never).
+    var asksToUpdate = true
 
     /// The version installed on disk, as the plugin reports it.
     var version: String? {
@@ -94,23 +138,91 @@ struct NotifierPluginStatus: Equatable {
         }
     }
 
+    /// Installing it is the step: the capabilities route is missing and
+    /// the host's list has no copy of it, or couldn't be read.
+    var offersInstall: Bool {
+        state == .predatesCapabilities && (hostCopy == .missing || hostCopy == nil)
+    }
+
+    /// The host has a 0.4+ copy that this dashboard doesn't run: Conduit
+    /// offers no install or update, only the steps that turn it on.
+    var isNotServed: Bool {
+        state == .predatesCapabilities && hostCopy == .notServed
+    }
+
+    /// Settings points at the plugin's page: an update or the install is
+    /// asked for, a restart is left, or the copy on the host isn't running.
+    var needsAttention: Bool {
+        updateRecommended || restartPending || isNotServed
+    }
+
     /// Worth offering an update: something Conduit uses is missing, or the
-    /// plugin is older than this build's recommended version. A plugin that
-    /// is already new enough on disk only needs its restart.
+    /// plugin is older than the version an update brings. A plugin that
+    /// is already new enough on disk only needs its restart. Settings >
+    /// Conduit plugin offers it; the notice waits for `updateRecommended`.
     var updateAvailable: Bool {
+        isUpdate(below: offeredVersion)
+    }
+
+    /// Worth asking for an update unprompted: the update notice, the
+    /// Settings badge and Finish setting up. On the stable channel a newer
+    /// plugin on main alone doesn't count; on Never nothing does but an
+    /// install, since installing isn't updating.
+    var updateRecommended: Bool {
+        (asksToUpdate || offersInstall) && isUpdate(below: noticeVersion)
+    }
+
+    private func isUpdate(below target: String) -> Bool {
         switch state {
         case .unknown:
             return false
         case .predatesCapabilities:
-            return true
+            return !isNotServed
         case .reported(let version, _):
-            let older = Self.isOlder(version, than: Self.recommendedVersion)
+            let older = Self.isOlder(version, than: target)
             return restartPending ? older : (needsUpdate || older)
         }
     }
 
-    /// The version an update brings, for the notice.
-    var offeredVersion: String { Self.recommendedVersion }
+    /// The version an update brings: the latest plugin, or this build's
+    /// floor when the latest isn't known or is older.
+    var offeredVersion: String {
+        // Not older also means readable: an unreadable version counts as older.
+        guard let latestVersion, !Self.isOlder(latestVersion, than: floorVersion) else {
+            return floorVersion
+        }
+        return latestVersion
+    }
+
+    /// The least an update brings: this build's recommended version, or the
+    /// plugin it was archived with, which main had then.
+    var floorVersion: String {
+        guard let archivedVersion, !Self.isOlder(archivedVersion, than: Self.recommendedVersion) else {
+            return Self.recommendedVersion
+        }
+        return archivedVersion
+    }
+
+    /// The version below which the notice asks for an update: every
+    /// version on main, or on the stable channel the newer of the archived
+    /// and stable ones (never below this build's floor, never above what an
+    /// update brings).
+    var noticeVersion: String {
+        guard !followsMain else { return offeredVersion }
+        var target = floorVersion
+        if let stableVersion, !Self.isOlder(stableVersion, than: target) {
+            target = stableVersion
+        }
+        return Self.isOlder(offeredVersion, than: target) ? offeredVersion : target
+    }
+
+    /// The version a "Not now" on the notice belongs to: the asked-for
+    /// version, or for a restart the version waiting on disk, so the next
+    /// update's restart asks again.
+    var noticeDismissalVersion: String {
+        guard restartPending, !updateRecommended, let version else { return noticeVersion }
+        return version
+    }
 
     /// Dotted numeric versions compared part by part ("0.9.1" < "0.10.0").
     /// An unreadable or missing version counts as older.
@@ -149,6 +261,18 @@ struct NotifierPluginStatus: Equatable {
         return true
     }
 
+    /// True until the plugin says what it serves (offline, just connected)
+    /// and once it reports this one, so what a screen kept from its routes
+    /// may show meanwhile. Unlike `mightSupport`, a plugin that predates
+    /// reporting, or isn't installed, rules it out.
+    func mayServe(_ capability: String) -> Bool {
+        switch state {
+        case .unknown: return true
+        case .predatesCapabilities: return false
+        case .reported(_, let capabilities): return capabilities.contains(capability)
+        }
+    }
+
     /// The plugin version whose /voice-tools serves the location tool.
     static let locationVoiceVersion = "0.28.0"
 
@@ -156,6 +280,15 @@ struct NotifierPluginStatus: Equatable {
     /// Older ones serve /voice-tools with health only.
     var servesLocationVoice: Bool {
         reports("voice-tools") && !Self.isOlder(runningVersion, than: Self.locationVoiceVersion)
+    }
+
+    /// Whether the running plugin takes `?conduit_profile=` on the routes
+    /// that need the dashboard process (DashboardPath.conduitProfileParameter).
+    var servesDashboardProfiles: Bool { reports(DashboardPath.dashboardProfilesCapability) }
+
+    /// The query parameter that names the profile on those routes.
+    var dashboardProfileParameter: String {
+        servesDashboardProfiles ? DashboardPath.conduitProfileParameter : "profile"
     }
 
     /// True only when the plugin reported this capability.
@@ -180,10 +313,61 @@ struct NotifierPluginStatus: Equatable {
         )
     }
 
+    /// Hermes' list of installed plugins, which `hostCopy` is read from.
+    static let pluginsHubPath = "/api/dashboard/plugins/hub"
+
+    /// This plugin in Hermes' plugin list, under its manifest name or the
+    /// folder it was cloned into. Nil when the answer has no list.
+    static func hostCopy(inPluginsHub response: [String: Any]) -> HostCopy? {
+        guard response["plugins"] is [Any] else { return nil }
+        let names: Set<String> = ["conduit_push", "hermes-conduit-notifier"]
+        guard let row = AgentPluginRow.list(from: response).first(where: { names.contains($0.name) || names.contains($0.folderName) }) else {
+            return .missing
+        }
+        return isOlder(row.version, than: capabilitiesVersion) ? .old : .notServed
+    }
+
     static func state(from error: Error) -> State {
         if case DashboardTicketBridgeError.http(let status, _) = error, status == 404 || status == 405 {
             return .predatesCapabilities
         }
         return .unknown
+    }
+}
+
+/// What the update notice over the main screen offers while no update
+/// runs (AppState.showsNotifierPluginUpdateNotice).
+enum NotifierPluginNoticeOffer: Equatable {
+    case none
+    /// The plugin isn't on the host, as far as Conduit can tell.
+    case install
+    case update
+    /// The new plugin is on the host and waits for Hermes to restart.
+    case restart
+}
+
+extension NotifierPluginStatus {
+    /// `finishSetupOffersInstall`: the Finish setting up card is still
+    /// pending, and its Conduit plugin row offers Install itself. One call
+    /// to action is enough, and an Update for a plugin that isn't there
+    /// misleads.
+    func noticeOffer(finishSetupOffersInstall: Bool) -> NotifierPluginNoticeOffer {
+        switch state {
+        case .unknown:
+            return .none
+        case .predatesCapabilities:
+            switch hostCopy {
+            case .old: return asksToUpdate ? .update : .none
+            // Nothing one tap fixes; Settings > Conduit plugin has the steps.
+            case .notServed: return .none
+            // Installing isn't updating: Never still points at a missing
+            // plugin, which most of Conduit needs.
+            case .missing, nil: return finishSetupOffersInstall ? .none : .install
+            }
+        case .reported:
+            if updateRecommended { return .update }
+            if restartPending { return .restart }
+            return .none
+        }
     }
 }

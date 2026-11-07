@@ -102,6 +102,12 @@ struct VoiceProfilePreferences: Codable, Equatable {
     /// phone locked or Conduit in the background, like a live call. Nil is
     /// off.
     var keepListeningWhenLocked: Bool? = nil
+    /// Push to talk in Classic voice (#886): hold the main button to speak,
+    /// release to send. Silence never ends a held turn. Nil is off.
+    var pushToTalk: Bool? = nil
+    /// What the big button beside a chat's composer does on this profile
+    /// (`ChatVoiceButtonAction` raw value). Nil follows the app's choice.
+    var chatVoiceButton: String? = nil
     /// Spoken phrases that stop the current reply. Nil follows the app
     /// language's built-ins (`resolvedSpokenStopPhrases`); a list is the
     /// user's own. An empty list disables the category.
@@ -135,6 +141,16 @@ struct VoiceProfilePreferences: Codable, Equatable {
     var geminiLiveMemory: Bool? = nil
     /// Whether Gemini Live speaks as the profile's SOUL.md persona. Nil is off.
     var geminiLivePersonality: Bool? = nil
+    var qwenLiveEnabled: Bool = false
+    /// Where Qwen Live's quick lookups search. Nil is automatic.
+    var qwenLiveSearch: GeminiLiveSearchMode? = nil
+    /// Qwen Live's prebuilt voice ("Tina", "Serena"…). Nil is Qwen's
+    /// default voice.
+    var qwenLiveVoice: String? = nil
+    /// Whether Qwen Live gets the Hermes host's memory. Nil is off.
+    var qwenLiveMemory: Bool? = nil
+    /// Whether Qwen Live speaks as the profile's SOUL.md persona. Nil is off.
+    var qwenLivePersonality: Bool? = nil
     /// Opt-in GPT-Live voice mode on the host's ChatGPT subscription (off by
     /// default; older blobs decode off). Never on together with Gemini Live.
     var gptLiveEnabled: Bool = false
@@ -166,10 +182,18 @@ struct VoiceProfilePreferences: Codable, Equatable {
     var grokLiveMemory: Bool? = nil
     /// Whether Grok Live speaks as the profile's SOUL.md persona. Nil is off.
     var grokLivePersonality: Bool? = nil
+    /// Whether Local Live's fast model (agent mode) speaks as the profile's
+    /// SOUL.md persona (issue 583). Nil is off.
+    var localLivePersonality: Bool? = nil
     /// Opt-in Local Live voice mode: a live call through the user's own
     /// speech server, with Hermes answering each turn in the call's chat
     /// (off by default; older blobs decode off). Never on with another live mode.
     var localLiveEnabled: Bool = false
+    /// Local Live in agent mode (Voice mode Live > Local): the host's fast
+    /// model answers and hands the work to Hermes as jobs. Off is Classic's
+    /// hands-free option on the speech server: one Hermes turn per
+    /// utterance (older blobs decode off, so a call works as it did).
+    var localLiveAgent: Bool = false
     /// Model for the Hermes sessions voice background jobs create. Nil keeps
     /// the profile's current model (the pre-existing behavior).
     var voiceJobModel: String? = nil
@@ -177,10 +201,10 @@ struct VoiceProfilePreferences: Codable, Equatable {
     /// Reasoning effort for voice jobs ("none", "low", …). Nil keeps the
     /// profile default.
     var voiceJobReasoningEffort: String? = nil
-    /// Whether live voice calls (Gemini Live, GPT-Live, Grok Live) are saved to the Hermes
+    /// Whether live voice calls (Gemini Live, Qwen Live, GPT-Live, Grok Live) are saved to the Hermes
     /// host's session history. Nil is on.
     var saveVoiceCalls: Bool? = nil
-    /// Whether Gemini Live and Grok Live keep the microphone open while
+    /// Whether Gemini Live, Qwen Live and Grok Live keep the microphone open while
     /// the model speaks on the loudspeaker or in the car, with echo
     /// cancellation. Nil is off (experimental).
     var liveVoiceSpeakerBargeIn: Bool? = nil
@@ -196,6 +220,9 @@ struct VoiceProfilePreferences: Codable, Equatable {
     /// Whether live calls start asking before sending a request to Hermes
     /// (#451). Nil is off.
     var liveVoiceAskBeforeSending: Bool? = nil
+    /// The user's own instructions for every live model, after Conduit's
+    /// rules (issue 583). Nil is none.
+    var liveVoiceExtraInstructions: String? = nil
 
     var liveVoiceStyle: LiveVoiceStyle {
         LiveVoiceStyle(
@@ -203,7 +230,8 @@ struct VoiceProfilePreferences: Codable, Equatable {
             backchannels: liveVoiceBackchannels ?? true,
             greeting: liveVoiceGreeting,
             answerLength: liveVoiceAnswerLength ?? .standard,
-            asksBeforeSending: liveVoiceAskBeforeSending ?? false
+            asksBeforeSending: liveVoiceAskBeforeSending ?? false,
+            extraInstructions: liveVoiceExtraInstructions
         )
     }
 
@@ -226,6 +254,8 @@ struct VoiceProfilePreferences: Codable, Equatable {
         continuousConversation = try container.decodeIfPresent(Bool.self, forKey: .continuousConversation) ?? true
         continueWakeConversation = try container.decodeIfPresent(Bool.self, forKey: .continueWakeConversation) ?? false
         keepListeningWhenLocked = try? container.decodeIfPresent(Bool.self, forKey: .keepListeningWhenLocked)
+        pushToTalk = try? container.decodeIfPresent(Bool.self, forKey: .pushToTalk)
+        chatVoiceButton = try? container.decodeIfPresent(String.self, forKey: .chatVoiceButton)
         // A list that is still a built-in list as shipped follows the app
         // language now; a customized one is kept.
         spokenStopPhrases = try container.decodeIfPresent([String].self, forKey: .spokenStopPhrases)
@@ -252,6 +282,13 @@ struct VoiceProfilePreferences: Codable, Equatable {
         geminiLiveVoice = (try? container.decodeIfPresent(String.self, forKey: .geminiLiveVoice)) ?? nil
         geminiLiveMemory = (try? container.decodeIfPresent(Bool.self, forKey: .geminiLiveMemory)) ?? nil
         geminiLivePersonality = (try? container.decodeIfPresent(Bool.self, forKey: .geminiLivePersonality)) ?? nil
+        qwenLiveEnabled = try container.decodeIfPresent(Bool.self, forKey: .qwenLiveEnabled) ?? false
+        // An unknown mode (a newer build's) falls back to automatic rather
+        // than failing the whole blob.
+        qwenLiveSearch = (try? container.decodeIfPresent(GeminiLiveSearchMode.self, forKey: .qwenLiveSearch)) ?? nil
+        qwenLiveVoice = (try? container.decodeIfPresent(String.self, forKey: .qwenLiveVoice)) ?? nil
+        qwenLiveMemory = (try? container.decodeIfPresent(Bool.self, forKey: .qwenLiveMemory)) ?? nil
+        qwenLivePersonality = (try? container.decodeIfPresent(Bool.self, forKey: .qwenLivePersonality)) ?? nil
         gptLiveEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .gptLiveEnabled)) ?? false
         gptLiveVoice = (try? container.decodeIfPresent(String.self, forKey: .gptLiveVoice)) ?? nil
         gptLiveMemory = (try? container.decodeIfPresent(Bool.self, forKey: .gptLiveMemory)) ?? nil
@@ -266,6 +303,8 @@ struct VoiceProfilePreferences: Codable, Equatable {
         grokLiveMemory = (try? container.decodeIfPresent(Bool.self, forKey: .grokLiveMemory)) ?? nil
         grokLivePersonality = (try? container.decodeIfPresent(Bool.self, forKey: .grokLivePersonality)) ?? nil
         localLiveEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .localLiveEnabled)) ?? false
+        localLiveAgent = (try? container.decodeIfPresent(Bool.self, forKey: .localLiveAgent)) ?? false
+        localLivePersonality = (try? container.decodeIfPresent(Bool.self, forKey: .localLivePersonality)) ?? nil
         voiceJobModel = try container.decodeIfPresent(String.self, forKey: .voiceJobModel)
         voiceJobProvider = try container.decodeIfPresent(String.self, forKey: .voiceJobProvider)
         voiceJobReasoningEffort = try container.decodeIfPresent(String.self, forKey: .voiceJobReasoningEffort)
@@ -278,6 +317,7 @@ struct VoiceProfilePreferences: Codable, Equatable {
         // An unknown length (a newer build's) is Default.
         liveVoiceAnswerLength = try? container.decodeIfPresent(LiveVoiceAnswerLength.self, forKey: .liveVoiceAnswerLength)
         liveVoiceAskBeforeSending = try? container.decodeIfPresent(Bool.self, forKey: .liveVoiceAskBeforeSending)
+        liveVoiceExtraInstructions = (try? container.decodeIfPresent(String.self, forKey: .liveVoiceExtraInstructions)) ?? nil
     }
 
     /// What a voice job's `session.create` asks for: the chosen voice-job
@@ -377,6 +417,12 @@ enum ReadAloudSpeed: Double, CaseIterable, Identifiable {
     /// system media players.
     var label: String {
         String(format: "%gx", locale: Locale(identifier: "en_US_POSIX"), rawValue)
+    }
+
+    /// The choice nearest a rate, for showing a rate that came from
+    /// elsewhere.
+    static func closest(to rate: Float) -> ReadAloudSpeed {
+        allCases.min { abs($0.rate - rate) < abs($1.rate - rate) } ?? .normal
     }
 
     /// The stored choice; anything missing or unrecognised reads as 1x.
@@ -480,6 +526,7 @@ struct GPTLiveVoice: Equatable, Identifiable {
     static let apiNames = [
         "marin", "cedar", "quartz", "ripple", "vesper", "willow", "stone",
         "gleam", "meridian", "bossa", "tempo", "beacon", "delta", "cinder",
+        "nuri", "juni", "flitz", "brise", "sillage", "nira", "harema", "shida", "noeul",
     ]
 
     /// The name as shown in the picker ("Cove · Composed").
@@ -599,9 +646,19 @@ enum VoiceSteerOutcome: Equatable {
 enum VoiceAssistantEvent: Equatable {
     case started(sessionID: String)
     case delta(sessionID: String, text: String)
-    case completed(sessionID: String, content: String?)
+    /// Seals one speech segment, but leaves the Hermes turn running.
+    case interim(sessionID: String, text: String, alreadyStreamed: Bool)
+    case completed(sessionID: String, content: String?, alreadyShown: Bool = false)
     case failed(sessionID: String, message: String)
     case interrupted(sessionID: String)
+
+    var sessionID: String {
+        switch self {
+        case let .started(sessionID), let .delta(sessionID, _), let .interim(sessionID, _, _),
+             let .completed(sessionID, _, _), let .failed(sessionID, _), let .interrupted(sessionID):
+            return sessionID
+        }
+    }
 }
 
 struct VoiceConversationTranscriptEntry: Identifiable, Equatable {
@@ -613,11 +670,14 @@ struct VoiceConversationTranscriptEntry: Identifiable, Equatable {
     let id: UUID
     let speaker: Speaker
     var text: String
+    /// Cards a live model showed at this point of a saved call.
+    var cards: [RichCard] = []
 
-    init(id: UUID = UUID(), speaker: Speaker, text: String) {
+    init(id: UUID = UUID(), speaker: Speaker, text: String, cards: [RichCard] = []) {
         self.id = id
         self.speaker = speaker
         self.text = text
+        self.cards = cards
     }
 }
 
@@ -739,6 +799,12 @@ protocol SpeechPlaybackService: AnyObject {
     /// Conversation playback joins the capture-owned session; standalone
     /// flows (Read Aloud, provider tests) own the session alone.
     var ownershipIntent: VoiceAudioIntent { get set }
+    /// Called, on a later main-actor turn, when something takes the
+    /// microphone while this playback holds the session (composer
+    /// dictation, a voice message, a call): the owner then stops, so the
+    /// microphone never hears it. Read Aloud sets it; conversations, whose
+    /// own capture is what arrives, leave it nil (issue 1770).
+    var onTakenOverByCapture: (@MainActor () -> Void)? { get set }
     /// Speed applied to the next stream or clip; 1.0 is normal speed.
     var playbackRate: Float { get set }
     func start(sampleRate: Double) throws
@@ -748,16 +814,30 @@ protocol SpeechPlaybackService: AnyObject {
     func drain() async
     func stop()
     /// Holds the current audio in place (Now Playing pause, #373). Returns
-    /// false when nothing is playing that can be paused. Scheduled and
-    /// newly enqueued audio waits until `resume()`.
+    /// false when nothing is playing that can be paused; a stream whose
+    /// engine a route change just stopped still pauses. Scheduled and newly
+    /// enqueued audio waits until `resume()`.
     func pause() -> Bool
     func resume()
-    /// Whether audio is currently held by `pause()`. A stream restart (route
-    /// change) clears it even though nobody resumed.
+    /// Whether audio is currently held by `pause()`. A route change keeps
+    /// it (the fresh engine starts paused); a stream that settles clears it
+    /// even though nobody resumed.
     var isPaused: Bool { get }
+    /// Builds every stream so `changeRate` can retime it while it plays
+    /// (Read Aloud's player, #759). Off for conversations, which keep the
+    /// plain graph.
+    var keepsRateAdjustable: Bool { get set }
+    /// Retimes the audio already playing as well as the next stream.
+    func changeRate(_ rate: Float)
 }
 
 extension SpeechPlaybackService {
+    /// Services that never give way keep playing.
+    var onTakenOverByCapture: (@MainActor () -> Void)? {
+        get { nil }
+        set {}
+    }
+
     /// Services without a speed control play at normal speed.
     var playbackRate: Float {
         get { 1 }
@@ -768,6 +848,14 @@ extension SpeechPlaybackService {
     func pause() -> Bool { false }
     func resume() {}
     var isPaused: Bool { false }
+
+    /// Services that cannot retime live apply the rate from the next stream.
+    var keepsRateAdjustable: Bool {
+        get { false }
+        set {}
+    }
+
+    func changeRate(_ rate: Float) { playbackRate = rate }
 }
 
 @MainActor

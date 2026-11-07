@@ -1,6 +1,7 @@
 import ActivityKit
 import Foundation
 import os
+import UIKit
 
 private let liveActivityLog = Logger(subsystem: "com.milim.relay", category: "LiveActivity")
 
@@ -19,7 +20,8 @@ enum LiveTurnProgress {
         case .messageStart, .reasoningDelta:
             next.phase = HermesTurnPhase.thinking.rawValue
             next.tool = nil
-        case .messageDelta:
+        case .messageDelta, .messageInterim:
+            // Interim commentary is the Codex runtime's only text carrier.
             next.phase = HermesTurnPhase.writing.rawValue
             next.tool = nil
         case .toolStart(_, let name, _, _):
@@ -76,6 +78,87 @@ enum LiveTurnProgress {
         return Array(events[start...])
     }
 
+    /// What one live-registry snapshot says about a running turn.
+    enum RegistryVerdict: Equatable {
+        /// One of the chat's ids is still working, waiting or starting.
+        case running
+        /// None of them is: the turn may be over.
+        case absent
+        /// The snapshot says nothing about it: another dashboard or
+        /// profile, a turn already ended, or one too new to be in it.
+        case unknown
+    }
+
+    /// What the gateway's live registry (`session.active_list`) says about
+    /// a running turn: whether any of the chat's ids is among the sessions
+    /// still working, waiting on the user or starting. Only the snapshot's
+    /// own dashboard and profile count (an activity that names neither is
+    /// from an older build, and goes by its chat ids), and an absence within
+    /// `grace` of the turn's start counts for nothing: a snapshot read just
+    /// before the prompt landed can miss it.
+    static func registryVerdict(
+        attributes: HermesTurnAttributes,
+        state: HermesTurnAttributes.ContentState,
+        liveSessionIDs: Set<String>,
+        profile: String,
+        dashboardID: String?,
+        now: Date,
+        grace: TimeInterval
+    ) -> RegistryVerdict {
+        guard !state.turnPhase.isFinished else { return .unknown }
+        if let own = attributes.dashboardID, own != dashboardID { return .unknown }
+        if case .session(_, let own?, _)? = ConduitAppLink(url: attributes.link), own != profile { return .unknown }
+        guard Set(attributes.sessionIDs).isDisjoint(with: liveSessionIDs) else { return .running }
+        return now.timeIntervalSince(attributes.startedAt) >= grace ? .absent : .unknown
+    }
+
+    /// Absences of running turns' chats from the live registry. One is not
+    /// enough to end a turn: a gateway restarting or reloading can serve an
+    /// empty or partial registry for a moment. A turn is over once its chat
+    /// stays absent from one snapshot to another at least `span` later,
+    /// with no snapshot in between that runs it (a burst of reads at the
+    /// same moment counts once). An absence older than `staleSpans` spans
+    /// (Conduit was away, or on another profile) starts over: the turn
+    /// could have run unseen since.
+    struct RegistryAbsences {
+        /// When each activity's chat was first seen absent, by activity id.
+        private var since: [String: Date] = [:]
+        static let staleSpans: Double = 4
+
+        /// Where a turn stands after one snapshot.
+        enum Outcome: Equatable {
+            /// Nothing to do.
+            case none
+            /// Its chat was just seen absent for the first time: a snapshot
+            /// `span` from now settles it.
+            case started
+            /// Its chat has stayed absent: the turn is over.
+            case over
+        }
+
+        /// Records `verdict` for activity `id`.
+        mutating func record(_ verdict: RegistryVerdict, for id: String, at now: Date, span: TimeInterval) -> Outcome {
+            switch verdict {
+            case .unknown:
+                return .none
+            case .running:
+                since[id] = nil
+                return .none
+            case .absent:
+                guard let first = since[id], now.timeIntervalSince(first) <= span * Self.staleSpans else {
+                    since[id] = now
+                    return .started
+                }
+                return now.timeIntervalSince(first) >= span ? .over : .none
+            }
+        }
+
+        /// The activity ended: its absence goes with it.
+        mutating func forget(_ id: String) {
+            since[id] = nil
+        }
+    }
+
     static func finished(
         _ state: HermesTurnAttributes.ContentState,
         _ phase: HermesTurnPhase,
@@ -96,7 +179,12 @@ enum LiveTurnProgress {
 /// chat's ids).
 @MainActor
 final class LiveTurnActivities {
-    static let shared = LiveTurnActivities()
+    /// Nil on a Mac, which has no Lock Screen or Dynamic Island for an
+    /// iPhone app. ActivityKit is weak-linked (project.yml) because macOS
+    /// 14 has none for iPhone and iPad apps, so nothing may touch it there
+    /// (issue 1877: Conduit didn't launch on Sonoma).
+    static let shared: LiveTurnActivities? = isAvailable ? LiveTurnActivities() : nil
+    nonisolated static var isAvailable: Bool { !ProcessInfo.processInfo.isiOSAppOnMac }
     /// Settings > Notifications "Progress on the Lock Screen"; on unless
     /// turned off.
     nonisolated static let enabledDefaultsKey = "conduit.liveActivities.enabled"
@@ -110,18 +198,35 @@ final class LiveTurnActivities {
         let sessionIDs: Set<String>
         var state: HermesTurnAttributes.ContentState
         var pushToken: String?
+        /// The relay installation that took `pushToken`, through which the
+        /// Conduit plugin can update and end the activity by push. It only
+        /// counts while it is still this iPhone's installation: turning
+        /// notifications off or moving relays drops it.
+        var tokenInstallationID: String?
         var tokenTask: Task<Void, Never>?
         var stateTask: Task<Void, Never>?
         /// The last update handed to ActivityKit; each waits for the one
         /// before it, so a burst of events lands in order.
         var updateTask: Task<Void, Never>?
+        /// Sends the state the throttle holds once its interval is up.
+        var heldTask: Task<Void, Never>?
     }
 
     /// How long after a turn starts an idle `session.busy` / `session.info`
     /// is not taken as its end.
     static let idleSignalGrace: TimeInterval = 5
+    /// How long after a turn starts the live registry's word that its chat
+    /// isn't running is not taken as its end.
+    nonisolated static let registryGrace: TimeInterval = 30
+    /// How long a chat must stay out of the live registry before its turn
+    /// is taken as over: two of the chat list's 4-second poll intervals, so
+    /// the third absent snapshot in a row ends it.
+    nonisolated static let registryAbsenceSpan: TimeInterval = 8
 
     private var running: [String: Running] = [:]
+    private var registryAbsences = LiveTurnProgress.RegistryAbsences()
+    /// At most one stream update every 2 seconds per activity.
+    private var throttle = LiveActivityUpdateThrottle()
     private var adopted = false
     /// Stream events of chats whose prompt is still being submitted: the
     /// gateway can stream before prompt.submit answers, and those events
@@ -138,6 +243,20 @@ final class LiveTurnActivities {
         UserDefaults.standard.object(forKey: enabledDefaultsKey) as? Bool ?? true
     }
 
+    private init() {
+        // Nothing stays held across a suspension: on resuming, its wait
+        // would end at once and send a state older than what the relay
+        // may have pushed meanwhile.
+        for name in [UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { LiveTurnActivities.shared?.sendAllHeld() }
+            }
+        }
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { LiveTurnActivities.shared?.registerUnregistered() }
+        }
+    }
+
     /// A prompt is about to be submitted: its chat's events are held until
     /// `turnStarted` (or dropped by the chat's next submission).
     func turnSubmitting(sessionIDs: Set<String>) {
@@ -151,7 +270,9 @@ final class LiveTurnActivities {
 
     /// A prompt Conduit sent was accepted: the turn gets an activity, and an
     /// older one for the same chat ends.
-    func turnStarted(sessionIDs: Set<String>, primaryID: String, title: String, profile: String?, profileName: String? = nil, glowHex: String? = nil) {
+    /// `linkID` is the id the card's tap opens the chat by (its durable
+    /// one); the runtime `primaryID` stops resolving once Hermes reaps it.
+    func turnStarted(sessionIDs: Set<String>, primaryID: String, linkID: String? = nil, title: String, profile: String?, profileName: String? = nil, glowHex: String? = nil, dashboardID: String? = nil) {
         adoptExisting()
         let held = early.first { !$0.sessionIDs.isDisjoint(with: sessionIDs) }
             .map { LiveTurnProgress.newTurnEvents($0.events) } ?? []
@@ -164,10 +285,11 @@ final class LiveTurnActivities {
             chatTitle: title,
             startedAt: Date(),
             language: AppLanguageStore.shared.selection.rawValue,
-            link: ConduitAppLink.session(id: primaryID, profile: profile).url,
+            link: ConduitAppLink.session(id: linkID.flatMap { $0.isEmpty ? nil : $0 } ?? primaryID, profile: profile, dashboard: dashboardID).url,
             sessionIDs: Array(sessionIDs).sorted(),
             profileName: profileName,
-            glowHex: glowHex
+            glowHex: glowHex,
+            dashboardID: dashboardID
         )
         let state = HermesTurnAttributes.ContentState(phase: .thinking)
         do {
@@ -183,7 +305,7 @@ final class LiveTurnActivities {
                 observe(event, sessionID: primary)
             }
         } catch {
-            liveActivityLog.notice("Live Activity not started: \(error.localizedDescription, privacy: .public)")
+            liveActivityLog.notice("Live Activity not started: \(LogRedaction.message(error), privacy: .public)")
         }
     }
 
@@ -211,15 +333,139 @@ final class LiveTurnActivities {
                 finish(id, phase: next.turnPhase, dismissal: .after(Date().addingTimeInterval(Self.dismissAfterEnd)))
             } else {
                 running[id]?.state = next
-                let content = ActivityContent(state: next, staleDate: Date().addingTimeInterval(Self.staleAfter))
-                let previous = entry.updateTask
-                running[id]?.updateTask = Task {
-                    await previous?.value
-                    guard !Task.isCancelled else { return }
-                    await entry.activity.update(content)
+                // Its stream is live: an absence from the registry (an id
+                // that rotated mid-turn) is moot.
+                registryAbsences.forget(id)
+                switch throttle.offer(next, for: id, at: Date()) {
+                case .now:
+                    running[id]?.heldTask?.cancel()
+                    running[id]?.heldTask = nil
+                    update(id, to: next)
+                case .at(let due):
+                    guard running[id]?.heldTask == nil else { break }
+                    running[id]?.heldTask = Task { [weak self] in
+                        let wait = max(0, due.timeIntervalSinceNow)
+                        do {
+                            try await Task.sleep(for: .seconds(wait), tolerance: .milliseconds(250))
+                        } catch {
+                            return
+                        }
+                        // Cancelled after its wait ended: a newer task or
+                        // send took over.
+                        guard !Task.isCancelled else { return }
+                        self?.sendHeld(id)
+                    }
                 }
             }
         }
+    }
+
+    /// The newest state held back by the throttle, now its interval is up.
+    private func sendHeld(_ id: String) {
+        guard running[id] != nil else { return }
+        running[id]?.heldTask?.cancel()
+        running[id]?.heldTask = nil
+        guard let state = throttle.due(for: id, at: Date()) else { return }
+        update(id, to: state)
+    }
+
+    /// Conduit is leaving the screen: every held state goes now.
+    private func sendAllHeld() {
+        for id in running.keys where throttle.holds(id) {
+            sendHeld(id)
+        }
+    }
+
+    /// Hands `state` to ActivityKit after the update before it.
+    private func update(_ id: String, to state: HermesTurnAttributes.ContentState) {
+        guard let entry = running[id] else { return }
+        let content = ActivityContent(state: state, staleDate: Date().addingTimeInterval(Self.staleAfter))
+        let previous = entry.updateTask
+        running[id]?.updateTask = Task {
+            await previous?.value
+            guard !Task.isCancelled else { return }
+            await entry.activity.update(content)
+        }
+    }
+
+    /// A full `session.active_list` snapshot of `profile` on `dashboardID`:
+    /// a turn whose chat is no longer running there ended without Conduit
+    /// seeing it (it finished while Conduit was closed, or in a chat not on
+    /// screen, with no relay to end it), so its activity ends as done
+    /// instead of counting up for hours, once its chat has stayed out of
+    /// the registry for `registryAbsenceSpan` (`RegistryAbsences`).
+    /// `liveSessionIDs` are the ids of the rows still working, waiting or
+    /// starting. True when a chat was just seen absent for the first time,
+    /// so another snapshot `registryAbsenceSpan` from now is needed to
+    /// settle it.
+    @discardableResult
+    func reconcile(liveSessionIDs: Set<String>, profile: String, dashboardID: String?, now: Date = Date()) -> Bool {
+        guard !running.isEmpty else { return false }
+        var over: [String] = []
+        var confirmationNeeded = false
+        for (id, entry) in running {
+            let verdict = LiveTurnProgress.registryVerdict(
+                attributes: entry.activity.attributes,
+                state: entry.state,
+                liveSessionIDs: liveSessionIDs,
+                profile: profile,
+                dashboardID: dashboardID,
+                now: now,
+                grace: Self.registryGrace
+            )
+            switch registryAbsences.record(verdict, for: id, at: now, span: Self.registryAbsenceSpan) {
+            case .none: break
+            case .started: confirmationNeeded = true
+            case .over: over.append(id)
+            }
+        }
+        // Ended only after the walk: finish removes from `running`.
+        for id in over {
+            // When it ended is unknown: no time shows rather than a wrong one.
+            finish(id, phase: .done, dismissal: .after(now.addingTimeInterval(Self.dismissAfterEnd)), endKnown: false)
+        }
+        return confirmationNeeded
+    }
+
+    /// Conduit stops following `dashboardID`'s turns (its sign-in expired
+    /// with no push route to end them, or the user disconnected or signed
+    /// out): their activities go now rather than counting up on a turn
+    /// nothing will end. `keepingThoseOnRelay` keeps the ones whose push
+    /// token this iPhone's current relay installation took, which the
+    /// Conduit plugin still ends by push (`endsTurn`).
+    func endTurns(ofDashboard dashboardID: String?, keepingThoseOnRelay: Bool = false) {
+        adoptExisting()
+        let installationID = PushNotificationService.shared.installationID
+        let ending = running.filter { _, entry in
+            Self.endsTurn(
+                activityDashboardID: entry.activity.attributes.dashboardID,
+                tokenInstallationID: entry.tokenInstallationID,
+                ofDashboard: dashboardID,
+                keepingThoseOnRelay: keepingThoseOnRelay,
+                currentInstallationID: installationID
+            )
+        }.map(\.key)
+        for id in ending {
+            finish(id, phase: .stopped, dismissal: .immediate)
+        }
+    }
+
+    /// Whether `endTurns(ofDashboard:)` ends an activity. Another
+    /// dashboard's activities stay, except one started by a build before
+    /// `dashboardID`: naming no dashboard, it ends whichever dashboard this
+    /// is. That only holds through the upgrade, until the system has ended
+    /// those older activities. With `keepingThoseOnRelay`, one whose token
+    /// the relay installation still in use took stays too.
+    nonisolated static func endsTurn(
+        activityDashboardID: String?,
+        tokenInstallationID: String?,
+        ofDashboard dashboardID: String?,
+        keepingThoseOnRelay: Bool,
+        currentInstallationID: String?
+    ) -> Bool {
+        if let own = activityDashboardID, own != dashboardID { return false }
+        if keepingThoseOnRelay, let tokenInstallationID, tokenInstallationID == currentInstallationID { return false }
+        return true
     }
 
     /// Lock Screen progress was turned off: every activity goes.
@@ -232,6 +478,26 @@ final class LiveTurnActivities {
         for activity in Activity<HermesTurnAttributes>.activities where !tracked.contains(activity.id) {
             Task { await activity.end(nil, dismissalPolicy: .immediate) }
         }
+    }
+
+    /// Every id the chat behind a card linking to `id` answers to, so a
+    /// tap still finds a chat whose linked id Hermes no longer knows. Only
+    /// cards of `profile` on `dashboardID` count (one naming neither is
+    /// from an older build): ids from another workspace say nothing here.
+    nonisolated static func sessionIDs(linkedTo id: String, profile: String, dashboardID: String?) -> [String] {
+        guard isAvailable else { return [] }
+        return sessionIDs(linkedTo: id, profile: profile, dashboardID: dashboardID, in: Activity<HermesTurnAttributes>.activities.map(\.attributes))
+    }
+
+    nonisolated static func sessionIDs(linkedTo id: String, profile: String, dashboardID: String?, in cards: [HermesTurnAttributes]) -> [String] {
+        guard !id.isEmpty else { return [] }
+        return cards.filter { card in
+            guard case .session(let linked, let own, _)? = ConduitAppLink(url: card.link), linked == id else { return false }
+            if let own, own.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(profile.trimmingCharacters(in: .whitespacesAndNewlines)) != .orderedSame { return false }
+            if let owner = card.dashboardID, owner != dashboardID { return false }
+            return true
+        }.flatMap { $0.sessionIDs.filter { $0 != id } }
     }
 
     /// Activities a previous run of Conduit started are taken over, so the
@@ -295,35 +561,85 @@ final class LiveTurnActivities {
             }
         }
         running[id] = Running(activity: activity, sessionIDs: sessionIDs, state: state, tokenTask: tokenTask, stateTask: stateTask)
+        throttle.started(id, showing: state, at: Date())
     }
 
     private func forget(_ id: String) async {
+        registryAbsences.forget(id)
+        throttle.forget(id)
         guard let entry = running.removeValue(forKey: id) else { return }
         entry.tokenTask?.cancel()
         entry.stateTask?.cancel()
         entry.updateTask?.cancel()
+        entry.heldTask?.cancel()
         if let token = entry.pushToken {
             await PushNotificationService.shared.unregisterLiveActivity(token: token)
         }
     }
 
     private func register(token: String, for id: String, sessionIDs: Set<String>) async {
-        guard running[id] != nil else { return }
-        let previous = running[id]?.pushToken
+        guard let entry = running[id] else { return }
+        // Finished even if Conduit leaves the screen right after sending:
+        // until the relay has the token, nothing from the host can end the
+        // activity.
+        let endBackground = BackgroundTaskHold.begin("conduit.liveActivity.register")
+        defer { endBackground() }
+        let previous = entry.pushToken
         running[id]?.pushToken = token
+        if previous != token { running[id]?.tokenInstallationID = nil }
         if let previous, previous != token {
             await PushNotificationService.shared.unregisterLiveActivity(token: previous)
         }
-        await PushNotificationService.shared.registerLiveActivity(token: token, sessionIDs: Array(sessionIDs).sorted())
+        let installationID = await PushNotificationService.shared.registerLiveActivity(
+            token: token,
+            sessionIDs: Array(sessionIDs).sorted(),
+            startedAgo: Date().timeIntervalSince(entry.activity.attributes.startedAt)
+        )
+        // Unless a newer token replaced it meanwhile. One that ended, or
+        // was replaced, while the registration was on its way goes again,
+        // in case the removal reached the relay first.
+        guard running[id]?.pushToken == token else {
+            if installationID != nil {
+                await PushNotificationService.shared.unregisterLiveActivity(token: token)
+            }
+            return
+        }
+        running[id]?.tokenInstallationID = installationID
     }
 
-    private func finish(_ id: String, phase: HermesTurnPhase, dismissal: ActivityUIDismissalPolicy) {
+    /// Whether an activity's token still has to reach the relay: it has
+    /// one, and no relay installation took it yet.
+    nonisolated static func needsRegistration(pushToken: String?, tokenInstallationID: String?) -> Bool {
+        pushToken != nil && tokenInstallationID == nil
+    }
+
+    /// Conduit is back on screen: an activity whose registration didn't
+    /// reach the relay (no network, or Conduit was suspended first) tries
+    /// again. One whose turn ended meanwhile is ended by the relay at once.
+    private func registerUnregistered() {
+        for (id, entry) in running {
+            guard Self.needsRegistration(pushToken: entry.pushToken, tokenInstallationID: entry.tokenInstallationID),
+                  let token = entry.pushToken else { continue }
+            let sessionIDs = entry.sessionIDs
+            Task { [weak self] in
+                await self?.register(token: token, for: id, sessionIDs: sessionIDs)
+            }
+        }
+    }
+
+    private func finish(_ id: String, phase: HermesTurnPhase, dismissal: ActivityUIDismissalPolicy, endKnown: Bool = true) {
+        registryAbsences.forget(id)
+        // The end goes out at once, with the newest state: nothing held
+        // back follows it.
+        throttle.forget(id)
         guard let entry = running.removeValue(forKey: id) else { return }
         entry.tokenTask?.cancel()
         entry.stateTask?.cancel()
-        let lastState = entry.state.turnPhase.isFinished
+        entry.heldTask?.cancel()
+        var lastState = entry.state.turnPhase.isFinished
             ? entry.state
             : LiveTurnProgress.finished(entry.state, phase, now: Date())
+        if !endKnown, !entry.state.turnPhase.isFinished { lastState.endedAt = nil }
         let pendingUpdate = entry.updateTask
         Task {
             await pendingUpdate?.value

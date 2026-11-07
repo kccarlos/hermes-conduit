@@ -54,9 +54,23 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
     /// `Task.yield` settles cannot always cover on a loaded runner.
     private let reconnectDelay: @MainActor @Sendable (Int) async throws -> Void
 
-    private var socket: GeminiLiveSocket?
+    private var socket: GeminiLiveSocket? {
+        // Frames queued for a socket that's no longer the session's fail
+        // instead of going out on it. The old writer is let go before it
+        // fails them: a failure handler that sends again gets a writer for
+        // the new socket, which must outlive this.
+        didSet {
+            guard let old = writer, old.socket !== socket else { return }
+            writer = nil
+            old.close()
+        }
+    }
+    /// Sends the current socket's frames in order, with bounded audio.
+    private var writer: LiveVoiceSocketWriter?
     /// Identity of the current connection; frames from any other are ignored.
     private var connectionID = UUID()
+    /// The connection's capture, upsampled as one stream.
+    private var inputUpsampler = GrokInputUpsampler()
     private var receiveTask: Task<Void, Never>?
     private var connectTask: Task<Void, Never>?
     private var hasConnectedOnce = false
@@ -88,15 +102,20 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
     /// Whether the current response's transcript came as deltas; if not,
     /// its final transcript is shown instead.
     private var responseHadTranscript = false
-    /// The longest input transcript snapshot seen per xAI item on this
-    /// connection, so a repeated or growing snapshot adds only its new words.
-    private var inputSnapshots: [String: String] = [:]
-    /// Item ids in the order they arrived, oldest first.
-    private var inputSnapshotOrder: [String] = []
+    /// The newest draft of the input item in flight, held until its
+    /// completed transcript replaces it.
+    private var pendingInput: (itemID: String?, text: String)?
+    /// Items whose transcript went out, oldest first: a draft or a repeat
+    /// arriving after it adds nothing.
+    private var finishedInputItems: [String] = []
     private static let rememberedInputItems = 4
     /// Function calls already passed on, on this connection: one call can
     /// arrive both as its arguments event and as its finished item.
     private var deliveredCallIDs: Set<String> = []
+    /// The user's turns as the turn detector heard them, for the trace.
+    private var turnTrace = LiveTurnTrace()
+    /// Whether this connection already traced dropping microphone audio.
+    private var tracedAudioDrop = false
 
     init(
         client: GrokLiveConnecting,
@@ -131,28 +150,30 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
     }
 
     func stop() {
+        finishPendingInput()
         closeConnection()
         state = .stopped
     }
 
     func send(_ message: LiveVoiceClientMessage, onSent: (@MainActor () -> Void)?, onFailure: (@MainActor () -> Void)?) {
-        let (frames, wantsResponse) = GrokLiveProtocol.frames(for: message)
+        // Before the upsampler moves: capture dropped while (re)connecting
+        // must not become the next connection's held sample.
         guard state == .ready, let socket else {
             onFailure?()
             return
         }
+        let (frames, wantsResponse) = GrokLiveProtocol.frames(for: message, upsampler: &inputUpsampler)
         let texts = frames.compactMap { try? GrokLiveProtocol.encode($0) }
         guard texts.count == frames.count else {
             onFailure?()
             return
         }
         let id = connectionID
-        Task { [weak self] in
-            do {
-                for text in texts { try await socket.send(text) }
-            } catch {
+        let writer = socketWriter(for: socket)
+        let queued = writer.enqueue(texts, isAudio: message.isAudio) { [weak self] error in
+            if let error {
                 onFailure?()
-                self?.connectionFailed(id, error: error)
+                self?.writeFailed(id, error: error)
                 return
             }
             guard wantsResponse else {
@@ -165,11 +186,12 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
             // update is requeued instead of dropped.
             switch self?.takeResponseRequest(on: id, turn: (sent: onSent, failed: onFailure)) {
             case .send(let create)?:
-                do {
-                    try await socket.send(create)
-                } catch {
-                    // Settles the turn with the rest of the connection's.
-                    self?.connectionFailed(id, error: error)
+                // A failure settles the turn with the rest of the
+                // connection's. Holding `writer` here is safe: the frame
+                // that holds this closure leaves its queue once it is sent
+                // or failed.
+                writer.enqueue([create], isAudio: false) { error in
+                    if let error { self?.writeFailed(id, error: error) }
                 }
             case .queued?:
                 break
@@ -179,6 +201,29 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
                 onFailure?()
             }
         }
+        // Only audio the server gets counts toward the turn's levels.
+        if queued, let onTrace, case .audio(let pcm16) = message, let step = turnTrace.add(pcm16) { onTrace(step) }
+        if !queued {
+            if message.isAudio, !tracedAudioDrop {
+                tracedAudioDrop = true
+                onTrace?("Microphone audio dropped: the connection fell behind")
+            }
+            onFailure?()
+        }
+    }
+
+    private func socketWriter(for socket: GeminiLiveSocket) -> LiveVoiceSocketWriter {
+        if let writer, writer.socket === socket { return writer }
+        let writer = LiveVoiceSocketWriter(socket: socket)
+        self.writer = writer
+        return writer
+    }
+
+    /// A send that failed on the socket loses the connection; one a closed
+    /// writer cancelled belongs to a connection already gone.
+    private func writeFailed(_ id: UUID, error: Error) {
+        guard !(error is CancellationError) else { return }
+        connectionFailed(id, error: error)
     }
 
     // MARK: Responses
@@ -224,12 +269,8 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
         queuedTurns = []
         beginRequest(with: turns)
         let id = connectionID
-        Task { [weak self] in
-            do {
-                try await socket.send(text)
-            } catch {
-                self?.connectionFailed(id, error: error)
-            }
+        socketWriter(for: socket).enqueue([text], isAudio: false) { [weak self] error in
+            if let error { self?.writeFailed(id, error: error) }
         }
     }
 
@@ -285,6 +326,7 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
     }
 
     private func fail(_ message: String) {
+        finishPendingInput()
         closeConnection()
         state = .failed(message)
     }
@@ -300,6 +342,7 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
         socket?.close()
         socket = nil
         connectionID = UUID()
+        inputUpsampler.reset()
         dropResponseState()
     }
 
@@ -344,10 +387,13 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
         awaitingSetup = (id, attempt)
         responseActive = false
         responseRequested = false
-        // Item ids belong to the xAI session, which a new connection replaces.
-        inputSnapshots = [:]
-        inputSnapshotOrder = []
+        // Item ids belong to the xAI session, which a new connection
+        // replaces: a draft the old one never completed is all there is.
+        finishPendingInput()
+        finishedInputItems = []
         deliveredCallIDs = []
+        turnTrace.reset()
+        tracedAudioDrop = false
         receiveTask = Task { [weak self] in await self?.receiveLoop(socket, id: id) }
         // A server that neither confirms the session nor closes would leave
         // the call connecting forever.
@@ -416,7 +462,14 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
                 failUnconfirmedTurns()
                 if responseRequested { sendResponseCreate() }
             }
+        case .turnDetection(let summary):
+            onTrace?("Turn detection: \(summary)")
+        case .speechStarted:
+            if let onTrace { onTrace(turnTrace.speechStarted()) }
+        case .speechStopped:
+            if let onTrace { onTrace(turnTrace.speechStopped()) }
         case .responseStarted:
+            onTrace?("Reply started")
             responseActive = true
             confirmRequest()
             responseHadTranscript = false
@@ -431,22 +484,20 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
             onTrace?("Grok took \(names.count) of \(functions.filter { !GrokLiveProtocol.reservedToolNames.contains($0.name) }.count) functions: \(names.sorted().joined(separator: ", "))")
         case .outputTranscriptDone(let text):
             if !responseHadTranscript { onEvent?(.outputTranscription(text)) }
-        case .inputTranscriptSnapshot(let itemID, let text):
-            // Without an item id there is nothing to compare against: the
-            // snapshot goes through as it is.
-            guard let itemID else {
-                onEvent?(.inputTranscription(text))
-                return
-            }
-            let previous = inputSnapshots[itemID] ?? ""
-            // The longest snapshot is the baseline: a shorter revision adds
-            // nothing, and must not lower what later snapshots diff against.
-            // Assumes an item id names one utterance, as conversation item
-            // ids do in the Realtime protocol xAI follows; unverified on a
-            // real xAI call.
-            if text.count > previous.count { rememberInputSnapshot(text, for: itemID) }
-            if let added = GrokLiveProtocol.inputTranscriptDelta(previous: previous, snapshot: text) {
-                onEvent?(.inputTranscription(added))
+        case .inputTranscriptSnapshot(let itemID, let text, let stage):
+            if let itemID, finishedInputItems.contains(itemID) { return }
+            // An item that never got its completed transcript keeps its
+            // newest draft once the next item starts.
+            if let pending = pendingInput, pending.itemID != itemID { finishPendingInput() }
+            switch stage {
+            case .draft:
+                // Drafts rewrite earlier words, so none of them is appended:
+                // the completed transcript, sent before the reply's, replaces
+                // them whole (#1324).
+                pendingInput = (itemID, text)
+            case .completed, .unstated:
+                pendingInput = nil
+                finishInput(text, itemID: itemID)
             }
         case .event(.toolCall(let calls)):
             let fresh = calls.filter { deliveredCallIDs.insert($0.id).inserted }
@@ -463,16 +514,21 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
         }
     }
 
-    /// Keeps a few recent items only: xAI's snapshots belong to the item in
-    /// flight, and a long call would otherwise hold every utterance.
-    private func rememberInputSnapshot(_ text: String, for itemID: String) {
-        if inputSnapshots[itemID] == nil {
-            inputSnapshotOrder.append(itemID)
-            while inputSnapshotOrder.count > Self.rememberedInputItems {
-                inputSnapshots[inputSnapshotOrder.removeFirst()] = nil
-            }
+    private func finishPendingInput() {
+        guard let pending = pendingInput else { return }
+        pendingInput = nil
+        finishInput(pending.text, itemID: pending.itemID)
+    }
+
+    /// Passes an item's transcript on once. Without an item id there is
+    /// nothing to remember it by, so it goes through as it is. Keeps a few
+    /// recent items only: a long call would otherwise hold every utterance.
+    private func finishInput(_ text: String, itemID: String?) {
+        if let itemID {
+            finishedInputItems.append(itemID)
+            if finishedInputItems.count > Self.rememberedInputItems { finishedInputItems.removeFirst() }
         }
-        inputSnapshots[itemID] = text
+        onEvent?(.inputTranscription(text))
     }
 
     private func connectionFailed(_ id: UUID, error: Error, serverClose: GeminiLiveServerClose? = nil) {
@@ -490,6 +546,7 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
         setupTimeoutTask?.cancel()
         setupTimeoutTask = nil
         connectionID = UUID()
+        inputUpsampler.reset()
         dropResponseState()
         if let serverClose, Self.isRefusal(serverClose) {
             fail(Self.refusalMessage(serverClose))
@@ -534,7 +591,9 @@ final class GrokLiveSession: GeminiLiveSessionControlling {
     /// other 4xxx is the plugin or xAI refusing what a retry would resend,
     /// as is a dashboard that refused the upgrade.
     nonisolated static func isRefusal(_ close: GeminiLiveServerClose) -> Bool {
-        if close.isHTTPStatus { return [400, 401, 403, 404].contains(close.code) }
+        // A redirect (never followed) wants a browser session: retrying
+        // can't change that.
+        if close.isHTTPStatus { return [400, 401, 403, 404].contains(close.code) || (300...399).contains(close.code) }
         if close.code == 4502 { return false }
         return [1003, 1007, 1008, 1009].contains(close.code) || (4000...4999).contains(close.code)
     }

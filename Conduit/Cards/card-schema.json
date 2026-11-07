@@ -1,0 +1,540 @@
+{
+  "version": 5,
+  "about": "Conduit's rich cards: the one definition both the conduit_push plugin and Conduit read. Conduit ships a byte-identical copy (Conduit/Cards/card-schema.json) and its CI fails when the copy differs from this file on main. 'card' is a JSON Schema subset (type, enum, properties, required, items, minItems, maxItems, maxLength, minimum, maximum, format uri or line) that goes into the tool definitions as is, except that tools take a diff card's diff as 'inputs.diff' (a patch, a patch file or two texts), which the plugin reads into the card's diff. Text is cleaned the same way everywhere: control characters become spaces, and the invisible ones that can make text read differently from what it holds (U+202A to U+202E, U+2066 to U+2069, U+200B, U+2060 and U+FEFF) are dropped, except in a line, where each becomes U+FFFD so it shows. A line (format line) keeps its spaces: it is cut to maxLength, but it is never trimmed. Normalizing is the same on both sides: unknown keys are dropped, text is cleaned and cut to maxLength, an invalid optional value is dropped, an invalid list item is dropped, and an invalid required value makes its object invalid. Before that, a table's cells (and its column names) are made text: a string stays as it is, an empty one or anything that isn't text or a number becomes \u2013, and a number becomes its digits (a whole number with no decimal point, otherwise the shortest form that reads back as the same number). Then the rules in 'rules' apply. 'board' holds the shared definitions of a whole conduit_show call's layout and next, which tools offer beside the cards. cards/card-vectors.json holds the shared examples both test suites run.",
+  "max_cards": 12,
+  "rules": [
+    "A card keeps only its own type's field (places for map, place and places; people for contact; stats, chart, weather, options, steps, media, status, table, timeline, checklist, list, progress, callout or diff for the others), plus title and live, source on every type but map, place and places, needs on steps and ranked on list; a card without its type's field is dropped.",
+    "A route is kept only on a map card, only when every place given survived, when 'to' (and 'from' if given) name places in the list, and when 'from' differs from 'to'.",
+    "A place card keeps only its first place.",
+    "A place's or person's photo is kept only when its url is https.",
+    "A chart keeps only the series with one value per label; a pie keeps only its first series, and no value of a pie may be negative. A chart with no series left is dropped.",
+    "A weather card needs a source and at least one of now, hours or days (an empty list counts as none); a day whose low is above its high is dropped.",
+    "A comparison keeps only its first recommended option.",
+    "A media card needs a source and keeps only items whose url is https (dropped when none is left); artwork is kept only when it is https, and an image keeps no duration or artwork.",
+    "A contact's phone is kept only when it holds 3 to 20 digits and nothing but digits, spaces and + - ( ) . characters; an email only when it is one address like name@example.com, with no spaces, quotes, brackets, commas, semicolons, colons or any of ? # % & =.",
+    "A person's message is kept only when their phone is.",
+    "A table keeps only the rows with one cell per column, and is dropped when none is left.",
+    "A checklist keeps only the first item with a given text, compared without regard to case.",
+    "A list item's photo is kept only when its url is https.",
+    "A progress item is kept only when its goal is above 0 and its value is 0 or more.",
+    "A diff file keeps only the hunk lines that start with +, - or a space, and a hunk with none left is dropped; a binary file keeps no hunks.",
+    "A diff's id is kept only when it is cd- and 16 hex digits.",
+    "Only the first card in a set keeps a given live name."
+  ],
+  "board": {
+    "layout": {"type": "string", "enum": ["stack", "tabs"], "description": "How the cards are laid out: stack (the default) one under another, or tabs, one card at a time with each card's title as its tab. Conduit picks the columns on wide screens itself."},
+    "next": {
+      "type": "array",
+      "maxItems": 4,
+      "description": "Up to four follow-ups the user is likely to ask next, each as the message they would send, in their words, like \"Make it $1,500\" or \"Add a day in Sequoia\". Shown under the cards; a tap sends it. Leave it out when nothing obvious comes next.",
+      "items": {"type": "string", "maxLength": 200}
+    },
+    "rules": [
+      "A follow-up is dropped when it starts with / or !, holds an @ followed by a letter, a digit, an underscore, a slash, a dot or a tilde, or holds a backtick, and only the first of the same follow-ups (compared without regard to case) is kept. This check comes before maxItems, so the first four that pass are kept."
+    ]
+  },
+  "card": {
+    "type": "object",
+    "description": "One card Conduit draws natively. map: a map with a pin per place, and a route when you give one. place: one place in detail. places: several places to swipe through. stats: a few big numbers. chart: a line, bar or pie chart. weather: a forecast. comparison: two to four options side by side. steps: instructions to follow, with timers. media: photos, videos or audio to look at or play. contact: a few people to call, message or email, or someone to text with a message you wrote for the user to send. status: how something in progress is going, like a delivery, a flight, a match or a job. table: rows and columns the user can sort. timeline: a plan by day or phase, each with its stops. checklist: things to tick off, kept across the user's devices. list: a ranked or plain list of things, each with a line and a value. progress: how far along goals are. callout: a tip, note or warning.",
+    "properties": {
+      "type": {
+        "type": "string",
+        "enum": ["map", "place", "places", "stats", "chart", "weather", "comparison", "steps", "media", "contact", "status", "table", "timeline", "checklist", "list", "progress", "callout", "diff"],
+        "description": "The kind of card; fill in its field: places for map, place and places, people for contact, otherwise the field named like the type (options for comparison)."
+      },
+      "title": {
+        "type": "string",
+        "maxLength": 80,
+        "description": "A short heading, a few words."
+      },
+      "live": {"type": "string", "maxLength": 60, "description": "A name for a card you'll keep up to date, like order-4411 or deploy. Show a card with the same live name again in this conversation and it replaces this one wherever it's shown, so give the whole card each time."},
+      "source": {
+        "type": "object",
+        "description": "Every type but map, place and places: where the information is from, when it's from a tool, a site or a service rather than your own knowledge. Required for weather and media. Shown on the card.",
+        "properties": {
+          "name": {"type": "string", "maxLength": 40, "description": "Like Open-Meteo, Yahoo Finance or the user's Health data."},
+          "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "The page it's from."}
+        },
+        "required": ["name"]
+      },
+      "places": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 10,
+        "description": "The places, best first. The phone finds each one in Apple Maps itself and shows Apple Maps' address, category, phone, website, travel time and Look Around: don't fill those in. Give coordinates or the place_id from conduit_maps when you have them; otherwise a name and address precise enough to find it.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "maxLength": 120, "description": "The place's name."},
+            "address": {"type": "string", "maxLength": 200, "description": "Its address or area, to find it."},
+            "lat": {"type": "number", "minimum": -90, "maximum": 90, "description": "Latitude, if known."},
+            "lon": {"type": "number", "minimum": -180, "maximum": 180, "description": "Longitude, if known."},
+            "place_id": {"type": "string", "maxLength": 200, "description": "The Apple Maps place id conduit_maps gave, if any."},
+            "note": {"type": "string", "maxLength": 300, "description": "Your own short note on it, shown as yours: why it fits, what to order."},
+            "rating": {
+              "type": "object",
+              "description": "Only a rating you actually found, with where it's from. Left out without a source.",
+              "properties": {
+                "value": {"type": "number", "minimum": 0, "maximum": 5, "description": "Out of 5."},
+                "count": {"type": "integer", "minimum": 0, "maximum": 100000000, "description": "How many reviews."},
+                "source": {"type": "string", "maxLength": 40, "description": "Where it's from, like Google or Yelp."},
+                "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "The page it's from."}
+              },
+              "required": ["value", "source"]
+            },
+            "hours": {
+              "type": "object",
+              "description": "Opening hours you actually found, with where they're from. Left out without a source.",
+              "properties": {
+                "text": {"type": "string", "maxLength": 120, "description": "Like \"Open until 22:00\" or \"Mon-Fri 9-17\"."},
+                "source": {"type": "string", "maxLength": 40, "description": "Where they're from."},
+                "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "The page they're from."}
+              },
+              "required": ["text", "source"]
+            },
+            "price": {
+              "type": "object",
+              "description": "A price level or price you actually found, with where it's from. Left out without a source.",
+              "properties": {
+                "text": {"type": "string", "maxLength": 24, "description": "Like $$ or 12-18 EUR."},
+                "source": {"type": "string", "maxLength": 40, "description": "Where it's from."},
+                "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "The page it's from."}
+              },
+              "required": ["text", "source"]
+            },
+            "photo": {
+              "type": "object",
+              "description": "A photo of the place you actually found: a direct image URL, with where it's from. Left out without a source.",
+              "properties": {
+                "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "A direct https image URL."},
+                "source": {"type": "string", "maxLength": 40, "description": "Where it's from."},
+                "page_url": {"type": "string", "format": "uri", "maxLength": 500, "description": "The page it's on."}
+              },
+              "required": ["url", "source"]
+            }
+          },
+          "required": ["name"]
+        }
+      },
+      "route": {
+        "type": "object",
+        "description": "map only: draw a route. Places are counted from 0.",
+        "properties": {
+          "to": {"type": "integer", "minimum": 0, "maximum": 9, "description": "The place the route goes to."},
+          "from": {"type": "integer", "minimum": 0, "maximum": 9, "description": "The place it starts at. Leave it out to start where the user is."},
+          "mode": {"type": "string", "enum": ["driving", "walking", "transit", "cycling"], "description": "How to travel; driving if left out."}
+        },
+        "required": ["to"]
+      },
+      "stats": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 6,
+        "description": "stats only: big numbers with labels, most important first.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "label": {"type": "string", "maxLength": 40, "description": "What it is, like Steps or Portfolio."},
+            "value": {"type": "string", "maxLength": 24, "description": "The number as it should read, with its unit, like 8,412 or $12.4k."},
+            "detail": {"type": "string", "maxLength": 60, "description": "A few words under it, like of 10,000 or last 30 days."},
+            "change": {"type": "string", "maxLength": 16, "description": "How it changed, like +3.2% or -40."},
+            "trend": {"type": "string", "enum": ["up", "down", "flat"], "description": "Which way it moved."},
+            "tone": {"type": "string", "enum": ["good", "bad", "neutral"], "description": "Whether the change is good news; neutral if left out."},
+            "spark": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 30,
+              "description": "Recent values, oldest first, drawn as a small line.",
+              "items": {"type": "number", "minimum": -1000000000000, "maximum": 1000000000000}
+            }
+          },
+          "required": ["label", "value"]
+        }
+      },
+      "chart": {
+        "type": "object",
+        "description": "chart only: the data, drawn as a native chart.",
+        "properties": {
+          "kind": {"type": "string", "enum": ["line", "bar", "area", "pie"], "description": "line or area for change over time, bar to compare, pie for shares of a whole."},
+          "labels": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 24,
+            "description": "The x-axis labels in order, or a pie's slice names.",
+            "items": {"type": "string", "maxLength": 24}
+          },
+          "series": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "description": "One or more series, each with one value per label. A pie has one.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string", "maxLength": 40, "description": "Shown in the legend."},
+                "values": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 24,
+                  "description": "One value per label, in order.",
+                  "items": {"type": "number", "minimum": -1000000000000, "maximum": 1000000000000}
+                }
+              },
+              "required": ["values"]
+            }
+          },
+          "unit": {"type": "string", "maxLength": 16, "description": "The values' unit, like %, kg or USD."}
+        },
+        "required": ["kind", "labels", "series"]
+      },
+      "weather": {
+        "type": "object",
+        "description": "weather only: a forecast you got from a weather tool or site, never guessed. Give the card's source.",
+        "properties": {
+          "place": {"type": "string", "maxLength": 80, "description": "Where it's for."},
+          "unit": {"type": "string", "enum": ["C", "F"], "description": "The temperatures' unit."},
+          "now": {
+            "type": "object",
+            "description": "Right now.",
+            "properties": {
+              "temp": {"type": "number", "minimum": -100, "maximum": 150},
+              "condition": {"type": "string", "enum": ["clear", "partly_cloudy", "cloudy", "fog", "drizzle", "rain", "heavy_rain", "thunderstorm", "snow", "sleet", "wind"]},
+              "text": {"type": "string", "maxLength": 60, "description": "A few words, like Feels like 21 or Windy later."}
+            },
+            "required": ["temp", "condition"]
+          },
+          "hours": {
+            "type": "array",
+            "maxItems": 12,
+            "description": "The next hours, in order.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "time": {"type": "string", "maxLength": 12, "description": "Like 14:00."},
+                "temp": {"type": "number", "minimum": -100, "maximum": 150},
+                "condition": {"type": "string", "enum": ["clear", "partly_cloudy", "cloudy", "fog", "drizzle", "rain", "heavy_rain", "thunderstorm", "snow", "sleet", "wind"]},
+                "precip": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Chance of rain or snow, in percent."}
+              },
+              "required": ["time", "temp"]
+            }
+          },
+          "days": {
+            "type": "array",
+            "maxItems": 10,
+            "description": "The next days, in order.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "day": {"type": "string", "maxLength": 12, "description": "Like Today or Tue."},
+                "low": {"type": "number", "minimum": -100, "maximum": 150},
+                "high": {"type": "number", "minimum": -100, "maximum": 150},
+                "condition": {"type": "string", "enum": ["clear", "partly_cloudy", "cloudy", "fog", "drizzle", "rain", "heavy_rain", "thunderstorm", "snow", "sleet", "wind"]},
+                "precip": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Chance of rain or snow, in percent."}
+              },
+              "required": ["day", "low", "high"]
+            }
+          }
+        },
+        "required": ["unit"]
+      },
+      "options": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 4,
+        "description": "comparison only: the options, side by side.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "maxLength": 60, "description": "The option's name."},
+            "summary": {"type": "string", "maxLength": 160, "description": "A sentence on it."},
+            "facts": {
+              "type": "array",
+              "maxItems": 6,
+              "description": "Facts to compare, with the same labels in the same order for every option.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "label": {"type": "string", "maxLength": 30, "description": "Like Price or Battery."},
+                  "value": {"type": "string", "maxLength": 60, "description": "This option's value."}
+                },
+                "required": ["label", "value"]
+              }
+            },
+            "pros": {"type": "array", "maxItems": 4, "description": "What's good about it, a few words each.", "items": {"type": "string", "maxLength": 80}},
+            "cons": {"type": "array", "maxItems": 4, "description": "What's not, a few words each.", "items": {"type": "string", "maxLength": 80}},
+            "recommended": {"type": "boolean", "description": "true on the one you recommend, if any."}
+          },
+          "required": ["name"]
+        }
+      },
+      "needs": {
+        "type": "array",
+        "maxItems": 30,
+        "description": "steps only: what to have ready first, like ingredients or tools.",
+        "items": {"type": "string", "maxLength": 120}
+      },
+      "steps": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "description": "steps only: the steps in order. The user can tick them off.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "text": {"type": "string", "maxLength": 300, "description": "What to do."},
+            "timer": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "Seconds, when the step waits a set time (simmer 10 minutes is 600): the user can start a timer from it."}
+          },
+          "required": ["text"]
+        }
+      },
+      "media": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 12,
+        "description": "media only: the photos, videos or audio, in order. Only files you actually found, as direct links the phone can load; send a file on this machine as an attachment instead.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "kind": {"type": "string", "enum": ["image", "video", "audio"], "description": "What it is."},
+            "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "A direct https link to the file or stream (like .jpg, .png, .mp4, .m3u8, .mp3 or .m4a), not a page."},
+            "title": {"type": "string", "maxLength": 120, "description": "Its title."},
+            "by": {"type": "string", "maxLength": 80, "description": "Who made it: the artist, channel or photographer."},
+            "caption": {"type": "string", "maxLength": 300, "description": "A line about it."},
+            "duration": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "video and audio: its length in seconds, if known."},
+            "artwork": {"type": "string", "format": "uri", "maxLength": 500, "description": "video and audio: a direct link to a still or cover image."},
+            "page": {"type": "string", "format": "uri", "maxLength": 500, "description": "The page it's on."}
+          },
+          "required": ["kind", "url"]
+        }
+      },
+      "people": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 6,
+        "description": "contact only: the people or businesses. The phone checks each against the user's own contacts and says when one is there; anything else reads as yours.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "maxLength": 80, "description": "Their name, or the business's."},
+            "detail": {"type": "string", "maxLength": 120, "description": "Who they are: a role, a business, or how they're related to the user."},
+            "phone": {"type": "string", "maxLength": 40, "description": "A phone number you actually have, with the country code when you know it."},
+            "email": {"type": "string", "maxLength": 120, "description": "An email address you actually have."},
+            "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "Their website or profile page."},
+            "address": {"type": "string", "maxLength": 200, "description": "Their address, when it matters."},
+            "note": {"type": "string", "maxLength": 300, "description": "Your own short note: why you're showing them."},
+            "message": {"type": "string", "maxLength": 1000, "description": "A text message you wrote for the user to send them, only when the user asked you to text or message this person. Conduit shows it with a Send text button that opens Messages with it filled in, and the user taps Send there. Needs their phone. It isn't sent until the user taps Send, so never say it was sent."},
+            "photo": {
+              "type": "object",
+              "description": "A photo of them you actually found: a direct image URL, with where it's from. Left out without a source; the phone uses the contact's own photo when it has one.",
+              "properties": {
+                "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "A direct https image URL."},
+                "source": {"type": "string", "maxLength": 40, "description": "Where it's from."},
+                "page_url": {"type": "string", "format": "uri", "maxLength": 500, "description": "The page it's on."}
+              },
+              "required": ["url", "source"]
+            }
+          },
+          "required": ["name"]
+        }
+      },
+      "status": {
+        "type": "object",
+        "description": "status only: where something in progress stands. Give it a live name and show it again as it changes.",
+        "properties": {
+          "state": {"type": "string", "maxLength": 60, "description": "Where it stands now, a few words: Out for delivery, Boarding, 2-1 at half time, Building."},
+          "phase": {"type": "string", "enum": ["waiting", "active", "done", "problem"], "description": "waiting: not started. active: under way. done: finished. problem: delayed, failed or stuck. active if left out."},
+          "progress": {"type": "number", "minimum": 0, "maximum": 1, "description": "How far along, from 0 to 1, only when you actually know."},
+          "detail": {"type": "string", "maxLength": 200, "description": "A line more: where it is, the score, what's happening."},
+          "eta": {"type": "string", "maxLength": 40, "description": "When it should finish or arrive, like 14:20 or in 5 min."},
+          "milestones": {
+            "type": "array",
+            "maxItems": 8,
+            "description": "The stages, in order, each done or not yet.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {"type": "string", "maxLength": 40, "description": "Like Ordered, Shipped, Out for delivery."},
+                "done": {"type": "boolean", "description": "true once it's happened."}
+              },
+              "required": ["label"]
+            }
+          }
+        },
+        "required": ["state"]
+      },
+      "table": {
+        "type": "object",
+        "description": "table only: data in rows and columns. The user can sort by any column. Numbers are fine as text, like $1.2M or 4.5%.",
+        "properties": {
+          "columns": {"type": "array", "minItems": 1, "maxItems": 6, "description": "The column names, left to right.", "items": {"type": "string", "maxLength": 40}},
+          "rows": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "description": "The rows, each with one cell per column in the same order.",
+            "items": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "maxLength": 80}}
+          }
+        },
+        "required": ["columns", "rows"]
+      },
+      "timeline": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 14,
+        "description": "timeline only: the days or phases in order, each with its stops.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "label": {"type": "string", "maxLength": 40, "description": "Like Day 1, Fri 12 May or Week 2."},
+            "title": {"type": "string", "maxLength": 80, "description": "What the day is about, a few words."},
+            "stops": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 12,
+              "description": "What happens, in order.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "time": {"type": "string", "maxLength": 16, "description": "Like 09:00 or Morning."},
+                  "text": {"type": "string", "maxLength": 200, "description": "What to do."},
+                  "place": {"type": "string", "maxLength": 120, "description": "Where, as a name and area Apple Maps can find, like Glacier Point, Yosemite."},
+                  "note": {"type": "string", "maxLength": 200, "description": "A tip or detail."}
+                },
+                "required": ["text"]
+              }
+            }
+          },
+          "required": ["label", "stops"]
+        }
+      },
+      "checklist": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 40,
+        "description": "checklist only: things to tick off, like a packing or moving list. Ticks are kept, and you hear which are done when the user changes them. Give it a live name to show it again with changes; ticks stay with items of the same text.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "text": {"type": "string", "maxLength": 120, "description": "The item."},
+            "group": {"type": "string", "maxLength": 40, "description": "A heading it goes under, like Clothes or Week before."}
+          },
+          "required": ["text"]
+        }
+      },
+      "list": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "description": "list only: the things, best or first first.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "title": {"type": "string", "maxLength": 80, "description": "Its name."},
+            "detail": {"type": "string", "maxLength": 160, "description": "A line about it."},
+            "value": {"type": "string", "maxLength": 24, "description": "A number or fact to show beside it, like $2.9T or 4.6."},
+            "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "A page to open for it."},
+            "photo": {
+              "type": "object",
+              "description": "A picture of it you actually found: a direct image URL, with where it's from.",
+              "properties": {
+                "url": {"type": "string", "format": "uri", "maxLength": 500, "description": "A direct https image URL."},
+                "source": {"type": "string", "maxLength": 40, "description": "Where it's from."}
+              },
+              "required": ["url", "source"]
+            }
+          },
+          "required": ["title"]
+        }
+      },
+      "ranked": {"type": "boolean", "description": "list only: true to number the items as a ranking."},
+      "progress": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 6,
+        "description": "progress only: goals and how far along each is.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "label": {"type": "string", "maxLength": 40, "description": "Like Savings or Pages read."},
+            "value": {"type": "number", "minimum": 0, "maximum": 1000000000000, "description": "Where it stands now."},
+            "goal": {"type": "number", "minimum": 0, "maximum": 1000000000000, "description": "The goal, above 0."},
+            "unit": {"type": "string", "maxLength": 16, "description": "Like USD, km or pages."}
+          },
+          "required": ["label", "value", "goal"]
+        }
+      },
+      "callout": {
+        "type": "object",
+        "description": "callout only: a short tip, note or warning to stand out.",
+        "properties": {
+          "text": {"type": "string", "maxLength": 500, "description": "What to say."},
+          "tone": {"type": "string", "enum": ["tip", "note", "warning"], "description": "note if left out."}
+        },
+        "required": ["text"]
+      },
+      "diff": {
+        "type": "object",
+        "description": "diff only: changes line by line, as the plugin read them from the tool's diff (inputs.diff): the files, each with its hunks, and the lines added and removed in all. Hunks travel with the card only for a short diff; a longer one lists its files, and id names the whole diff kept on the host (GET /boards/diffs).",
+        "properties": {
+          "files": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 300,
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {"type": "string", "maxLength": 300, "description": "The file's path, the new one for a rename."},
+                "old_path": {"type": "string", "maxLength": 300, "description": "A renamed file's old path."},
+                "status": {"type": "string", "enum": ["modified", "added", "deleted", "renamed"]},
+                "binary": {"type": "boolean", "description": "A binary file: no lines to show."},
+                "added": {"type": "integer", "minimum": 0, "maximum": 100000000},
+                "removed": {"type": "integer", "minimum": 0, "maximum": 100000000},
+                "cut": {"type": "boolean", "description": "Its hunks stop short of all its changes."},
+                "hunks": {
+                  "type": "array",
+                  "maxItems": 5000,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "old_start": {"type": "integer", "minimum": 0, "maximum": 100000000},
+                      "new_start": {"type": "integer", "minimum": 0, "maximum": 100000000},
+                      "context": {"type": "string", "maxLength": 200, "description": "What the diff names after @@, like the function."},
+                      "lines": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20000,
+                        "description": "Each line as the patch has it: + added, - removed, a space unchanged.",
+                        "items": {"type": "string", "format": "line", "maxLength": 1001}
+                      }
+                    },
+                    "required": ["old_start", "new_start", "lines"]
+                  }
+                }
+              },
+              "required": ["path", "status", "added", "removed"]
+            }
+          },
+          "added": {"type": "integer", "minimum": 0, "maximum": 100000000},
+          "removed": {"type": "integer", "minimum": 0, "maximum": 100000000},
+          "more_files": {"type": "integer", "minimum": 0, "maximum": 100000000, "description": "Files changed past those listed."},
+          "id": {"type": "string", "maxLength": 40, "description": "The whole diff, kept on the host."}
+        },
+        "required": ["files", "added", "removed"]
+      }
+    },
+    "required": ["type"]
+  },
+  "inputs": {
+    "diff": {
+      "type": "object",
+      "description": "diff only: changes to show line by line, in code, a config or any text: give patch, patch_file, or before and after. Conduit lists the files with the lines added and removed, and the user opens each to read its changes. Put the pull request or commit in source when there is one.",
+      "properties": {
+        "patch": {"type": "string", "maxLength": 100000, "description": "A unified diff, as git diff, git show, gh pr diff or diff -u print it: one file or many."},
+        "patch_file": {"type": "string", "maxLength": 500, "description": "Instead of patch, for anything longer than a few dozen lines: the absolute path of a file on the Hermes host holding a unified diff, like /tmp/review.diff after git diff main > /tmp/review.diff. Saves writing the diff out."},
+        "before": {"type": "string", "maxLength": 20000, "description": "With after, for two versions of a text that has no diff: the old one."},
+        "after": {"type": "string", "maxLength": 20000, "description": "With before: the new version."},
+        "name": {"type": "string", "maxLength": 200, "description": "With before and after: the file's name, like nginx.conf."}
+      }
+    }
+  }
+}

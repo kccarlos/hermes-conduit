@@ -4,6 +4,9 @@
 //
 //  Full-screen preview for chat media (#195): agent `MEDIA:` images, video,
 //  audio and documents, web images, and the user's own attachments.
+//  Pictures open in the paging picture viewer (ImageGalleryViewer.swift),
+//  which swipes between them and closes on a swipe down; everything else
+//  opens here in Quick Look.
 //
 //  Presentation goes through Quick Look rather than a hand-rolled viewer:
 //  QLPreviewController already gives pinch-to-zoom for images, playback for
@@ -115,6 +118,10 @@ final class MediaPreviewPresenter {
     }
 
     private var sessions: [ObjectIdentifier: Session] = [:]
+    /// Kept for the system's Open In menu's lifetime, and released when it
+    /// closes. The menu is the app handoff for a file another reader can
+    /// take (MDReader, a Markdown editor) without Conduit displaying it.
+    private let openInDelegate = OpenInDelegate()
 
     /// Previews a file already on disk (a local attachment). The file is
     /// left in place afterwards. A type Quick Look must not render opens the
@@ -178,16 +185,6 @@ final class MediaPreviewPresenter {
         return show(Session(url: staged.file, title: staged.file.lastPathComponent, ownedDirectory: staged.directory))
     }
 
-    /// Downloads a web image and previews it. The body is streamed against
-    /// the same 16 MB ceiling as gateway media, so an oversized or endless
-    /// response is abandoned instead of being buffered whole.
-    func presentRemote(url: URL, fallbackName: String) async -> Bool {
-        guard let (data, response) = await Self.boundedDownload(url),
-              !Task.isCancelled else { return false }
-        let name = Self.filename(for: url, response: response, fallback: fallbackName)
-        return await present(data: data, filename: name, mimeType: response.mimeType)
-    }
-
     // MARK: - Presentation
 
     @discardableResult
@@ -202,7 +199,17 @@ final class MediaPreviewPresenter {
         sessions[key] = session
         controller.dataSource = session
         controller.delegate = session
-        controller.modalPresentationStyle = .fullScreen
+        // Over, not in place of, the screens under it: a `.fullScreen`
+        // preview takes the app's views out of the window, and closing it
+        // puts them back, which re-laid out every live tab. Under the
+        // Artifacts page that re-layout of the Chats list never settled and
+        // the watchdog killed the app.
+        controller.modalPresentationStyle = .overFullScreen
+        // As `.fullScreen` did: Quick Look's chrome sets the status bar.
+        controller.modalPresentationCapturesStatusBarAppearance = true
+        // The rows under it stay on screen, so their `onDisappear` no longer
+        // stops an inline clip: Quick Look has its own player.
+        ChatAudioClipPlayer.shared.stop()
         presenter.present(controller, animated: true) {
             session.didPresent = true
         }
@@ -215,6 +222,35 @@ final class MediaPreviewPresenter {
             guard !session.didPresent, controller.presentingViewController == nil else { return }
             self?.sessions[key] = nil
             Self.removeDirectory(session.ownedDirectory)
+        }
+        return true
+    }
+
+    private var galleries: [ObjectIdentifier: ImageGalleryViewController] = [:]
+
+    /// Opens pictures in the paging viewer at `index`; each one's original
+    /// is fetched as its page comes near. `placeholder` shows on the first
+    /// page until its original is in.
+    @discardableResult
+    func presentGallery(_ items: [ImageGalleryItem], startingAt index: Int, placeholder: UIImage? = nil) -> Bool {
+        guard !items.isEmpty, let presenter = Self.topViewController() else { return false }
+        let controller = ImageGalleryViewController(items: items, startingAt: index, placeholder: placeholder)
+        let key = ObjectIdentifier(controller)
+        controller.onFinish = { [weak self] in self?.galleries[key] = nil }
+        galleries[key] = controller
+        // Over the screens under it, as Quick Look is (see `show`).
+        controller.modalPresentationStyle = .overFullScreen
+        controller.modalTransitionStyle = .crossDissolve
+        controller.modalPresentationCapturesStatusBarAppearance = true
+        ChatAudioClipPlayer.shared.stop()
+        presenter.present(controller, animated: true)
+        // As in `show`: a presentation refused while another is in flight
+        // never completes, so its fetched copies are reclaimed. One that
+        // showed and closed by then has finished already; this is a no-op.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            guard controller.presentingViewController == nil else { return }
+            controller.finish()
         }
         return true
     }
@@ -248,6 +284,34 @@ final class MediaPreviewPresenter {
             Self.removeDirectory(ownedDirectory)
         }
         return true
+    }
+
+    /// The system share sheet for a staged file that has no Open In app,
+    /// or when the Open In menu can't present. The caller keeps the file.
+    @discardableResult
+    func presentShare(fileURL: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return false }
+        return share(fileURL: fileURL, ownedDirectory: nil)
+    }
+
+    /// The system's Open In menu for a file another app can read (MDReader,
+    /// a Markdown editor), so the reader the user already trusts opens it
+    /// without a Files-app detour. The staged file belongs to the caller.
+    @discardableResult
+    func presentOpenIn(fileURL: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return false }
+        // A menu still up (or coming up) keeps its controller: a second tap
+        // must not drop the only reference to the one on screen.
+        guard openInDelegate.controller == nil else { return true }
+        guard let presenter = Self.topViewController() else { return false }
+        let controller = UIDocumentInteractionController(url: fileURL)
+        controller.delegate = openInDelegate
+        openInDelegate.controller = controller
+        let source = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY,
+                            width: 0, height: 0)
+        let presented = controller.presentOpenInMenu(from: source, in: presenter.view, animated: true)
+        if !presented { openInDelegate.controller = nil }
+        return presented
     }
 
     private static func topViewController() -> UIViewController? {
@@ -295,10 +359,17 @@ final class MediaPreviewPresenter {
     // MARK: - Download
 
     nonisolated static func boundedDownload(_ url: URL, limit: Int = DataURLLimits.maxDecodedBytes) async -> (Data, URLResponse)? {
+        guard case .downloaded(let data, let response) = await boundedDownloadResult(url, limit: limit) else { return nil }
+        return (data, response)
+    }
+
+    /// `boundedDownload`, telling a body over `limit` apart from a failed
+    /// fetch.
+    nonisolated static func boundedDownloadResult(_ url: URL, limit: Int = DataURLLimits.maxDecodedBytes) async -> BoundedDownloadResult {
         do {
             let (bytes, response) = try await URLSession.shared.bytes(from: url)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return nil }
-            if response.expectedContentLength > Int64(limit) { return nil }
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return .failed }
+            if response.expectedContentLength > Int64(limit) { return .tooLarge }
             var data = Data()
             if response.expectedContentLength > 0 { data.reserveCapacity(Int(response.expectedContentLength)) }
             // Gather into a fixed chunk and append in bulk: appending each
@@ -311,14 +382,14 @@ final class MediaPreviewPresenter {
                 if chunk.count == chunkSize {
                     data.append(contentsOf: chunk)
                     chunk.removeAll(keepingCapacity: true)
-                    if data.count > limit { return nil }
+                    if data.count > limit { return .tooLarge }
                 }
             }
             data.append(contentsOf: chunk)
-            guard data.count <= limit else { return nil }
-            return data.isEmpty ? nil : (data, response)
+            guard data.count <= limit else { return .tooLarge }
+            return data.isEmpty ? .failed : .downloaded(data, response)
         } catch {
-            return nil
+            return .failed
         }
     }
 
@@ -326,6 +397,12 @@ final class MediaPreviewPresenter {
 
     nonisolated static let stagingRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("Conduit-Media-Preview", isDirectory: true)
+
+    /// Writes `text` to `<tmp>/Conduit-Media-Preview/<uuid>/<filename>`.
+    nonisolated static func stage(text: String, filename: String) -> (directory: URL, file: URL)? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return stage(data: data, filename: filename)
+    }
 
     /// Writes `data` to `<tmp>/Conduit-Media-Preview/<uuid>/<filename>`.
     nonisolated static func stage(data: Data, filename: String) -> (directory: URL, file: URL)? {
@@ -383,6 +460,26 @@ final class MediaPreviewPresenter {
     }
 }
 
+/// Retains the Open In controller until the system menu closes: UIKit
+/// holds its delegate weakly.
+private final class OpenInDelegate: NSObject, UIDocumentInteractionControllerDelegate {
+    var controller: UIDocumentInteractionController?
+
+    func documentInteractionControllerDidDismissOpenInMenu(_ controller: UIDocumentInteractionController) {
+        release(controller)
+    }
+
+    func documentInteractionController(_ controller: UIDocumentInteractionController,
+                                       didEndSendingToApplication bundleIdentifier: String?) {
+        release(controller)
+    }
+
+    /// Only the controller that closed lets go of its slot.
+    private func release(_ closed: UIDocumentInteractionController) {
+        if controller === closed { controller = nil }
+    }
+}
+
 private final class PreviewItem: NSObject, QLPreviewItem {
     let previewItemURL: URL?
     let previewItemTitle: String?
@@ -411,4 +508,13 @@ extension View {
     func opensMediaPreview(_ action: @escaping () -> Void) -> some View {
         modifier(MediaPreviewTapModifier(action: action))
     }
+}
+
+/// A streamed download against a size ceiling.
+enum BoundedDownloadResult {
+    case downloaded(Data, URLResponse)
+    /// The body was larger than the ceiling: abandoned, not buffered whole.
+    case tooLarge
+    /// Not a 2xx answer, no body, or the fetch failed.
+    case failed
 }

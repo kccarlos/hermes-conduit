@@ -506,6 +506,24 @@ final class KanbanV3DTests: XCTestCase {
         XCTAssertEqual(converged, .refreshed, "the pending invalidation converges through one refresh")
     }
 
+    /// An event-triggered reload that fails hasn't refreshed anything: the
+    /// batch is retried soon rather than left to the slow poll.
+    func testAFailedEventRefreshAsksForARetry() async throws {
+        let requester = V3DMockRequester()
+        let store = try makeStore(requester: requester)
+        await store.reload()
+        guard let stampA = store.loadedContextStamp else { return XCTFail("expected context") }
+
+        requester.failsBoardFetch = true
+        let failed = await store.refreshFromEvent(expectedContext: stampA, includeArchived: false)
+        XCTAssertEqual(failed, .deferred, "a failed read is retried, not reported refreshed")
+
+        requester.failsBoardFetch = false
+        let converged = await store.refreshFromEvent(expectedContext: stampA, includeArchived: false)
+        XCTAssertEqual(converged, .refreshed)
+        XCTAssertNil(store.errorMessage)
+    }
+
     func testDeferredWhileLoadingIsNotLost() async throws {
         let requester = V3DMockRequester()
         let store = try makeStore(requester: requester)
@@ -676,6 +694,56 @@ final class KanbanV3DTests: XCTestCase {
     }
 
     // MARK: - Polling fallback
+
+    func testTheStreamSaysWhenItIsConnectedSoThePollCanBackOff() async throws {
+        var changes: [Bool] = []
+        let gates = SleeperGate()
+        let coordinator = KanbanEventStreamCoordinator(
+            configuration: .init(stamp: stamp(), boardSlug: "alpha", initialCursor: 10, baseURL: "https://a.test"),
+            socketFactory: { _ in MockSocket() },
+            ticketMinter: { "t" },
+            sleeper: gates.sleeper,
+            heartbeatIntervalNanoseconds: noHeartbeatInterval,
+            pinger: { _ in true },
+            onConnectionChange: { changes.append($0) },
+            onBatch: { _ in .completed }
+        )
+        coordinator.start()
+        await drain()
+        XCTAssertEqual(changes, [true], "Connected once the socket is confirmed")
+        coordinator.stop()
+        XCTAssertEqual(changes, [true, false], "Retired: polls take over")
+        coordinator.stop()
+        XCTAssertEqual(changes, [true, false], "Reported once")
+    }
+
+    func testADroppedStreamSaysSoAndSaysAgainWhenItReconnects() async throws {
+        var changes: [Bool] = []
+        var sockets = 0
+        let gates = SleeperGate()
+        let coordinator = KanbanEventStreamCoordinator(
+            configuration: .init(stamp: stamp(), boardSlug: "alpha", initialCursor: 10, baseURL: "https://a.test"),
+            socketFactory: { _ in
+                sockets += 1
+                // The first socket drops right after it is confirmed.
+                return sockets == 1 ? MockSocket(scripts: [.fail(URLError(.networkConnectionLost))]) : MockSocket()
+            },
+            ticketMinter: { "t" },
+            sleeper: gates.sleeper,
+            heartbeatIntervalNanoseconds: noHeartbeatInterval,
+            pinger: { _ in true },
+            onConnectionChange: { changes.append($0) },
+            onBatch: { _ in .completed }
+        )
+        coordinator.start()
+        await gates.waitUntilHeld(1)
+        XCTAssertEqual(changes, [true, false], "The drop hands the board back to its poll")
+        await gates.releaseAll()
+        await drain()
+        XCTAssertEqual(changes, [true, false, true])
+        coordinator.stop()
+        XCTAssertEqual(changes, [true, false, true, false])
+    }
 
     func testPollingConstantsRemainUnchanged() {
         XCTAssertEqual(KanbanPollingPolicy.boardIntervalNanoseconds, 8_000_000_000)
@@ -1517,6 +1585,8 @@ private final class V3DMockRequester: DashboardJSONRequester {
 
     var boardPayload: [String: Any] = [:]
     var bulkUpdateResponse: [String: Any] = ["results": []]
+    /// The board read fails, as a dropped connection would.
+    var failsBoardFetch = false
     private(set) var calls: [Call] = []
     private(set) var boardsFetches = 0
     private(set) var boardFetches = 0
@@ -1566,6 +1636,7 @@ private final class V3DMockRequester: DashboardJSONRequester {
         }
         if method == "GET", basePath == "/api/plugins/kanban/board" {
             boardFetches += 1
+            if failsBoardFetch { throw URLError(.networkConnectionLost) }
             var board: [String: Any] = [
                 "columns": [
                     ["name": "triage", "tasks": []],

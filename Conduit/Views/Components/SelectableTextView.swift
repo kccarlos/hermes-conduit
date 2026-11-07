@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 /// A non-editable UIKit text surface gives chat text true character-range
 /// selection on the iOS versions Conduit supports. SwiftUI's native text
@@ -149,23 +150,27 @@ struct SelectableTextView: UIViewRepresentable {
     func makeUIView(context: Context) -> SelectableTextViewHostView {
         context.coordinator.openURL = context.environment.openURL
         context.coordinator.quoteAction = context.environment.chatQuoteAction
+        context.coordinator.pinReplyAction = context.environment.chatPinReplyAction
         let hostView = makeUIViewForTests(
             coordinator: context.coordinator,
             drawsUntilTouched: drawsUntilTouched(in: context.environment)
         )
         hostView.selectionTint = context.environment.textSelectionTint
+        hostView.replyMessageID = context.environment.chatPinReplyAction?.messageID
         return hostView
     }
 
     func updateUIView(_ uiView: SelectableTextViewHostView, context: Context) {
         context.coordinator.openURL = context.environment.openURL
         context.coordinator.quoteAction = context.environment.chatQuoteAction
+        context.coordinator.pinReplyAction = context.environment.chatPinReplyAction
         // VoiceOver or Switch Control came on: they read the text view.
         if uiView.canvas != nil, !drawsUntilTouched(in: context.environment) {
             uiView.needsTextView = true
         }
         updateUIViewForTests(uiView, coordinator: context.coordinator)
         uiView.selectionTint = context.environment.textSelectionTint
+        uiView.replyMessageID = context.environment.chatPinReplyAction?.messageID
     }
 
     /// Whether this text is drawn until something needs its text view: on
@@ -322,7 +327,7 @@ struct SelectableTextView: UIViewRepresentable {
         }
 
         let measured = styledText.boundingRect(
-            with: CGSize(width: 100_000, height: CGFloat.greatestFiniteMagnitude),
+            with: CGSize(width: SelectableTextCanvas.unboundedWidth, height: CGFloat.greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             context: nil
         )
@@ -336,15 +341,53 @@ struct SelectableTextView: UIViewRepresentable {
         // A drawn host measures with its canvas even once its text view is
         // mounted, so mounting never changes its size.
         if let canvas = uiView.canvas {
+            // Asked for its ideal width, wrapping text gives its unbroken
+            // width, as the pinned text view's intrinsic size did: an HStack
+            // sizes a sent bubble to fit its text from this.
+            if wrapsLines, selfSizingWidthRange == nil,
+               proposal.width == nil || proposal.width == .infinity {
+                return canvas.naturalSize()
+            }
             return measuredSizeCached(proposalWidth: proposal.width, coordinator: context.coordinator) { width in
                 canvas.height(atWidth: width)
             }
+        }
+        // A mounted text view asked for its ideal width gives its unbroken
+        // width too. Without one, an ideal-width bubble (a group room's, or
+        // any bubble under VoiceOver) shrank to nothing.
+        if wrapsLines, selfSizingWidthRange == nil,
+           proposal.width == nil || proposal.width == .infinity {
+            // Its own slot: the wrapping measurement that follows in the
+            // same layout pass would otherwise evict it every time.
+            let coordinator = context.coordinator
+            if let cached = coordinator.cachedNaturalSize,
+               cached.generation == coordinator.presentationGeneration {
+                return cached.size
+            }
+            let size = Self.naturalSize(of: uiView.mountedTextView)
+            coordinator.cachedNaturalSize = Coordinator.CachedMeasurement(
+                generation: coordinator.presentationGeneration,
+                key: .natural,
+                size: size
+            )
+            return size
         }
         return measuredSizeCached(
             proposalWidth: proposal.width,
             textView: uiView.mountedTextView,
             coordinator: context.coordinator
         )
+    }
+
+    /// The text's unbroken size in a mounted text view, insets included,
+    /// from one layout so the width never wraps the height it came with.
+    @MainActor
+    static func naturalSize(of textView: UITextView) -> CGSize {
+        TranscriptPerf.note(.textKitMeasurement)
+        let measured = textView.sizeThatFits(
+            CGSize(width: SelectableTextCanvas.unboundedWidth, height: CGFloat.greatestFiniteMagnitude)
+        )
+        return CGSize(width: max(1, ceil(measured.width)), height: ceil(measured.height))
     }
 
     /// Cached measurement entry for the SwiftUI sizing hook: an unchanged
@@ -485,7 +528,7 @@ struct SelectableTextView: UIViewRepresentable {
         textView.textContainer.widthTracksTextView = wrapsLines
         textView.textContainer.size = wrapsLines
             ? CGSize(width: max(textView.bounds.width, 1), height: CGFloat.greatestFiniteMagnitude)
-            : CGSize(width: 100_000, height: CGFloat.greatestFiniteMagnitude)
+            : CGSize(width: SelectableTextCanvas.unboundedWidth, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer.maximumNumberOfLines = maximumNumberOfLines
         textView.textContainer.lineBreakMode = maximumNumberOfLines > 0
             ? .byTruncatingTail
@@ -690,11 +733,61 @@ struct SelectableTextView: UIViewRepresentable {
                 bridged.addAttribute(.foregroundColor, value: UIColor(runColor), range: range)
             }
             if let link = run.link {
-                bridged.addAttribute(.link, value: link, range: range)
+                // A group room's @mention is linked only to be found here:
+                // it shows as a tinted tag, not a tappable link.
+                if let kind = GroupRoomMentions.kind(ofLink: link) {
+                    let onAccent = linkColor == .white
+                    // A bot's tag takes the bot's own color.
+                    let tint = onAccent ? nil : GroupRoomMentions.tint(ofLink: link)?.readableColor
+                    bridged.addAttribute(
+                        .foregroundColor,
+                        value: onAccent ? UIColor.white : tint ?? UIColor.conduitAccent,
+                        range: range
+                    )
+                    bridged.addAttribute(
+                        .backgroundColor,
+                        value: tint?.withAlphaComponent(0.12) ?? Self.mentionWash(kind, onAccent: onAccent),
+                        range: range
+                    )
+                    continue
+                }
+                // A link to a file on the Hermes host opens in the Folder,
+                // as a path the reply names does, not on this device.
+                bridged.addAttribute(.link, value: WorkspacePathLinks.url(forLink: link) ?? link, range: range)
                 bridged.addAttribute(.foregroundColor, value: linkColor, range: range)
+            } else {
+                // A file path a reply names opens in the Folder tab (#1389).
+                let text = String(value[run.range].characters)
+                if run.inlinePresentationIntent?.contains(.code) == true {
+                    if let url = WorkspacePathLinks.url(forCode: text) {
+                        bridged.addAttribute(.link, value: url, range: range)
+                        bridged.addAttribute(.foregroundColor, value: linkColor, range: range)
+                    }
+                } else {
+                    for found in WorkspacePathLinks.links(inText: text) {
+                        let linked = NSRange(location: range.location + found.range.location, length: found.range.length)
+                        bridged.addAttribute(.link, value: found.url, range: linked)
+                        bridged.addAttribute(.foregroundColor, value: linkColor, range: linked)
+                    }
+                }
             }
         }
         return bridged
+    }
+
+    private static let accentMentionWash = UIColor { traits in
+        UIColor.conduitAccent.resolvedColor(with: traits).withAlphaComponent(0.10)
+    }
+
+    /// The wash behind a mention: the kinds differ (a member, everyone, the
+    /// user), except on the accent bubble, where every mention is white.
+    private static func mentionWash(_ kind: GroupRoomMentions.Kind, onAccent: Bool) -> UIColor {
+        if onAccent { return UIColor.white.withAlphaComponent(0.22) }
+        switch kind {
+        case .agent: return accentMentionWash
+        case .broadcast: return UIColor.orange.withAlphaComponent(0.10)
+        case .human: return UIColor.yellow.withAlphaComponent(0.12)
+        }
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
@@ -738,6 +831,7 @@ struct SelectableTextView: UIViewRepresentable {
             case nonWrapping
             case selfSizing
             case wrapping(width: CGFloat)
+            case natural
         }
 
         struct CachedMeasurement {
@@ -762,11 +856,17 @@ struct SelectableTextView: UIViewRepresentable {
         /// generation. Invalidated by any generation bump; lives and dies
         /// with the coordinator (i.e. the mounted view).
         var cachedMeasurement: CachedMeasurement?
+        /// A mounted view's unbroken size, kept apart from the wrapping
+        /// measurement asked for in the same layout pass.
+        var cachedNaturalSize: CachedMeasurement?
         /// The environment's link opener, so in-app links (a voice call's
         /// job link) open inside Conduit; others fall through to the system.
         var openURL: OpenURLAction?
         /// Set inside a chat: the selection menu then offers Quote (#385).
         var quoteAction: ChatQuoteAction?
+        /// Set on a reply that can be pinned: the menu then offers Pin for
+        /// the selected passage and Pin reply after Quote (#918, #1147).
+        var pinReplyAction: ChatPinReplyAction?
 
         init(
             linkColor: UIColor,
@@ -794,31 +894,85 @@ struct SelectableTextView: UIViewRepresentable {
 
         /// Inside a chat, the native selection menu gains Quote right after
         /// the standard edit group (Copy), which puts the selection in the
-        /// composer as a `>` quote (#385). Elsewhere the default menu shows.
+        /// composer as a `>` quote (#385), and on a reply that can be pinned,
+        /// Pin for the selected passage and Pin reply after it (#918, #1147).
+        /// Elsewhere the default menu shows.
         func textView(
             _ textView: UITextView,
             editMenuForTextIn range: NSRange,
             suggestedActions: [UIMenuElement]
         ) -> UIMenu? {
-            guard let quoteAction, quoteAction.isAvailable, range.length > 0 else { return nil }
-            let quote = UIAction(
-                title: AppLocalization.string("Quote"),
-                image: UIImage(systemName: "text.quote")
-            ) { [weak textView] _ in
-                guard let textView else { return }
-                // The selection as it is now, should the text have changed
-                // under the open menu.
-                let current = textView.selectedRange
-                Self.quoteSelection(in: textView, range: current.length > 0 ? current : range, with: quoteAction)
+            guard range.length > 0 else { return nil }
+            var added: [UIMenuElement] = []
+            if let quoteAction, quoteAction.isAvailable {
+                added.append(UIAction(
+                    title: AppLocalization.string("Quote"),
+                    image: UIImage(systemName: "text.quote")
+                ) { [weak textView] _ in
+                    guard let textView else { return }
+                    // The selection as it is now, should the text have changed
+                    // under the open menu.
+                    let current = textView.selectedRange
+                    Self.quoteSelection(in: textView, range: current.length > 0 ? current : range, with: quoteAction)
+                })
             }
-            return UIMenu(children: Self.editMenuElements(suggestedActions, adding: quote))
+            // Pin takes the selected passage and Pin reply the whole reply
+            // (#1147); both live here, not in the reply's action row.
+            if let pinReplyAction {
+                let selected = Self.selectedText(in: textView, range: range)
+                if selected.contains(where: { !$0.isWhitespace }) {
+                    let isPinned = pinReplyAction.isPinned(passage: selected)
+                    added.append(UIAction(
+                        title: AppLocalization.string(isPinned ? "Unpin" : "Pin"),
+                        image: UIImage(systemName: isPinned ? "pin.slash" : "pin")
+                    ) { [weak textView] _ in
+                        guard let textView else { return }
+                        // The selection as it is now, should it have changed
+                        // under the open menu.
+                        let current = textView.selectedRange
+                        let passage = current.length > 0
+                            ? Self.selectedText(in: textView, range: current)
+                            : selected
+                        Self.dismissSelection(in: textView)
+                        pinReplyAction.togglePassage(passage)
+                    })
+                }
+                let replyPinned = pinReplyAction.isPinned
+                added.append(UIAction(
+                    title: AppLocalization.string(replyPinned ? "Unpin reply" : "Pin reply"),
+                    image: UIImage(systemName: replyPinned ? "pin.slash.fill" : "pin.fill")
+                ) { [weak textView] _ in
+                    if let textView { Self.dismissSelection(in: textView) }
+                    pinReplyAction()
+                })
+            }
+            guard !added.isEmpty else { return nil }
+            return UIMenu(children: Self.editMenuElements(suggestedActions, adding: added))
         }
 
-        static func editMenuElements(_ suggestedActions: [UIMenuElement], adding quote: UIMenuElement) -> [UIMenuElement] {
+        static func editMenuElements(_ suggestedActions: [UIMenuElement], adding added: [UIMenuElement]) -> [UIMenuElement] {
             var elements = suggestedActions
             let standardEdit = elements.firstIndex { ($0 as? UIMenu)?.identifier == .standardEdit }
-            elements.insert(quote, at: standardEdit.map { $0 + 1 } ?? 0)
+            elements.insert(contentsOf: added, at: standardEdit.map { $0 + 1 } ?? 0)
             return elements
+        }
+
+        /// Clears the selection, which dismisses the menu.
+        @MainActor
+        static func dismissSelection(in textView: UITextView) {
+            (textView as? MarkdownSelectionTextView)?.selectionCoordinator?.clearSelection()
+            textView.selectedRange = NSRange(location: textView.selectedRange.location, length: 0)
+            textView.resignFirstResponder()
+        }
+
+        /// The selected text as Copy would take it: all of a selection
+        /// spanning blocks.
+        @MainActor
+        static func selectedText(in textView: UITextView, range: NSRange) -> String {
+            let fullText = textView.attributedText ?? NSAttributedString()
+            let clamped = NSIntersectionRange(range, NSRange(location: 0, length: fullText.length))
+            return (textView as? MarkdownSelectionTextView)?.coordinatedCopiedAttributedText()?.string
+                ?? MarkdownProseRun.copyableText(fullText.attributedSubstring(from: clamped)).string
         }
 
         /// Hands the selected text to the composer and clears the selection,
@@ -829,8 +983,7 @@ struct SelectableTextView: UIViewRepresentable {
         static func quoteSelection(in textView: UITextView, range: NSRange, with quoteAction: ChatQuoteAction) {
             let fullText = textView.attributedText ?? NSAttributedString()
             let clamped = NSIntersectionRange(range, NSRange(location: 0, length: fullText.length))
-            let selected = (textView as? MarkdownSelectionTextView)?.coordinatedCopiedAttributedText()?.string
-                ?? MarkdownProseRun.copyableText(fullText.attributedSubstring(from: clamped)).string
+            let selected = selectedText(in: textView, range: range)
             guard selected.contains(where: { !$0.isWhitespace }) else { return }
             (textView as? MarkdownSelectionTextView)?.selectionCoordinator?.clearSelection()
             textView.selectedRange = NSRange(location: clamped.location, length: 0)
@@ -943,6 +1096,24 @@ private final class MarkdownSelectionTextView: UITextView {
         super.touchesCancelled(touches, with: event)
     }
 
+    /// VoiceOver pins the whole reply from an action on its text (#918),
+    /// named for the reply as it is now.
+    override var accessibilityCustomActions: [UIAccessibilityCustomAction]? {
+        get {
+            var actions = super.accessibilityCustomActions ?? []
+            if let pin = (delegate as? SelectableTextView.Coordinator)?.pinReplyAction {
+                actions.append(UIAccessibilityCustomAction(
+                    name: AppLocalization.string(pin.isPinned ? "Unpin reply" : "Pin reply")
+                ) { _ in
+                    pin()
+                    return true
+                })
+            }
+            return actions.isEmpty ? nil : actions
+        }
+        set { super.accessibilityCustomActions = newValue }
+    }
+
     override func copy(_ sender: Any?) {
         guard let copied = coordinatedCopiedAttributedText() ?? MarkdownProseRun.copiedSelection(in: self) else {
             super.copy(sender)
@@ -996,9 +1167,10 @@ private final class MarkdownSelectionTextView: UITextView {
 
 /// Tracks the finger during a native text-selection drag without ever
 /// recognizing, so UITextView's private selection gesture and the enclosing
-/// scroll views keep their exact stock behavior. A recognizer that never
-/// leaves `.possible`, always allows simultaneous recognition, and never
-/// cancels touches can't be failed or excluded by those gestures — yet it
+/// scroll views keep their exact stock behavior. A recognizer that stays
+/// `.possible` while a finger is down, always allows simultaneous
+/// recognition, and never cancels touches can't be failed or excluded by
+/// those gestures — yet it
 /// still receives the full touch stream, which is the piece every earlier
 /// cross-block attempt was missing (SwiftUI gestures fought the ScrollView,
 /// a coexisting pan was unpredictably failed by the private gesture, and
@@ -1006,6 +1178,13 @@ private final class MarkdownSelectionTextView: UITextView {
 /// active selection drag, each move is forwarded as a window point and the
 /// coordinator resolves it against every registered block/cell text view,
 /// extending the selection across them.
+///
+/// Once the last finger lifts it fails, as InteractionIdleTouchRecognizer
+/// does. UIKit resets the gestures a touch went through only when every one
+/// of them has finished, so one left `.possible` held the chat's scroll and
+/// the swipe back in their ended or failed states: after a flick from the
+/// screen's left edge over a code box or a table, the chat stopped
+/// scrolling until it was opened again (issue 1687).
 final class MarkdownSelectionObserverGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelegate {
     private weak var observedTextView: MarkdownSelectionTextView?
     /// Set when a touch begins on this text view's existing selection or its
@@ -1050,11 +1229,20 @@ final class MarkdownSelectionObserverGestureRecognizer: UIGestureRecognizer, UIG
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesEnded(touches, with: event)
         handleTouchEnd()
+        failIfLastTouch(touches, event: event)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesCancelled(touches, with: event)
         handleTouchEnd()
+        failIfLastTouch(touches, event: event)
+    }
+
+    /// Fails once every finger has lifted, which resets it, and every
+    /// gesture the touch went through, for the next touch.
+    private func failIfLastTouch(_ touches: Set<UITouch>, event: UIEvent) {
+        guard !UIGestureRecognizer.fingerStillDown(besides: touches, among: event.touches(for: self) ?? []) else { return }
+        state = .failed
     }
 
     func handleMove(toWindowPoint windowPoint: CGPoint) {
@@ -1172,6 +1360,15 @@ final class SelectableTextViewHostView: UIView {
         }
     }
 
+    /// The reply this text belongs to, where its passages can be pinned:
+    /// a pinned passage's jump finds and flashes it here (#1147).
+    var replyMessageID: String? {
+        didSet {
+            guard replyMessageID != oldValue, replyMessageID != nil else { return }
+            PinnedPassageFlasher.register(self)
+        }
+    }
+
     init(textView: UITextView) {
         self.canvas = nil
         self.textView = textView
@@ -1212,11 +1409,12 @@ final class SelectableTextViewHostView: UIView {
 
     /// Assistive technology gets the text view, whose links are targets:
     /// Voice Control and Full Keyboard Access can't be detected, so a drawn
-    /// host mounts its text view when one asks for its elements.
+    /// host mounts its text view, laid out as for a touch, when one asks for
+    /// its elements.
     override var accessibilityElements: [Any]? {
         get {
             guard canvas != nil else { return super.accessibilityElements }
-            return [mountedTextView]
+            return [mountTextViewForTouch()]
         }
         set { super.accessibilityElements = newValue }
     }
@@ -1224,14 +1422,27 @@ final class SelectableTextViewHostView: UIView {
     /// A touch gets the real text view, mounted in place of the drawing as
     /// the touch begins: links, selection, menus and drags then behave
     /// exactly as they always have. Scrolling stays cheap, as the finger is
-    /// still.
+    /// still. The new text view is laid out before the touch is routed:
+    /// mounted but not laid out, it let the tap that mounted it go by
+    /// without opening the link under the finger, so a link in an answer
+    /// opened only on a second tap.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if textView == nil, canvas != nil, event?.type == .touches,
            isUserInteractionEnabled, !isHidden, alpha > 0.01,
            self.point(inside: point, with: event) {
-            mountTextView()
+            mountTextViewForTouch()
         }
         return super.hitTest(point, with: event)
+    }
+
+    /// Mounts the text view for a touch that is starting, laid out so the
+    /// touch finds the link or the text under it.
+    @discardableResult
+    func mountTextViewForTouch() -> UITextView {
+        let mounted = mountTextView()
+        layoutIfNeeded()
+        mounted.layoutIfNeeded()
+        return mounted
     }
 
     @discardableResult

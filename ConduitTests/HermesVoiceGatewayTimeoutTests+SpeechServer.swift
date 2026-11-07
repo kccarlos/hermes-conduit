@@ -138,6 +138,31 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(failure, "Lost the connection to your speech server.")
     }
 
+    /// The server finished every segment it started, with no words, and
+    /// closed during the quiet grace: nothing was heard, which is no
+    /// failure.
+    func testSpeechServerClosingAfterAnEmptyFinishedSegmentIsNotAFailure() async {
+        let socket = SpeechServerSocket()
+        var failure: String?
+        let live = SpeechServerTranscription(
+            socket: socket,
+            sampleRate: 16_000,
+            finishTimeout: .seconds(10),
+            quietGrace: .seconds(5),
+            onPartial: { _ in },
+            onFailure: { failure = $0 }
+        )
+        socket.deliver(#"{"type":"input_audio_buffer.speech_started","item_id":"a"}"#)
+        socket.deliver(#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"a","transcript":""}"#)
+        let finishing = Task { await live.finish() }
+        let committed = await Self.speechServerEventually { socket.sentTypes.last == "input_audio_buffer.commit" }
+        XCTAssertTrue(committed)
+        socket.cancel(with: .abnormalClosure, reason: nil)
+        let transcript = await finishing.value
+        XCTAssertNil(transcript)
+        XCTAssertNil(failure)
+    }
+
     func testSpeechServerFailedSegmentClearsItsWordsFromTheScreen() async {
         let socket = SpeechServerSocket()
         var partials: [String] = []
@@ -248,6 +273,18 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertTrue(spoke)
         XCTAssertEqual(started, [24_000])
         XCTAssertEqual(audio, Data([1, 0, 2, 0, 1, 0, 2, 0]))
+    }
+
+    func testSpeechServerSpeechDoesNotReadMarkdownMarks() async throws {
+        let socket = SpeechServerSocket()
+        let stream = SpeechServerSpeechStream(socket: socket, onStart: { _ in }, onPCM16: { _, _ in })
+        defer { stream.cancel() }
+        try await stream.append("The capital is **Québec**. More")
+        let sent = await Self.speechServerEventually { socket.sentTypes.count >= 3 }
+        XCTAssertTrue(sent)
+        let item = try XCTUnwrap(socket.sentObjects[1]["item"] as? [String: Any])
+        let content = try XCTUnwrap(item["content"] as? [[String: Any]])
+        XCTAssertEqual(content.first?["text"] as? String, "The capital is Québec.")
     }
 
     func testSpeechServerSpeechFailsWhenTheServerAnswersInsteadOfReadingBack() async throws {
@@ -429,6 +466,10 @@ private final class SpeechServerSocket: HermesSpeechSocket, @unchecked Sendable 
                 continuation.resume(throwing: URLError(.cancelled))
             }
         }
+    }
+
+    func sendPing(pongReceiveHandler: @escaping @Sendable (Error?) -> Void) {
+        pongReceiveHandler(nil)
     }
 
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {

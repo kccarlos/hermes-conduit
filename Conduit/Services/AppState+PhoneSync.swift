@@ -58,9 +58,10 @@ extension AppState {
            activeDashboardID == nil || activeDashboardID == destination.dashboardID {
             engine.note(nil)
         }
-        // Frequent moments that are rarely news: a pass at most every half minute.
-        if reason == .foreground || reason == .messageSent || reason == .calendarChanged || reason == .voiceCall,
-           let last = engine.state.lastAttempt, Date().timeIntervalSince(last) < 30 {
+        // Frequent moments that are rarely news: a pass at most every half
+        // minute, longer in Low Power or Low Data Mode (ContextUploadPolicy).
+        let spacing = ContextUploadPolicy.phoneSpacing(for: reason, conditions: deviceConditions())
+        guard ContextUploadPolicy.isDue(lastAttempt: engine.state.lastAttempt, spacing: spacing, now: Date()) else {
             return .unfinished
         }
         let inBackground = !PhoneScenePresence.isInForeground
@@ -78,7 +79,8 @@ extension AppState {
         let deadline = inBackground ? started.addingTimeInterval(25) : Date().addingTimeInterval(60)
         guard engine.preferences.isOn, engine.preferences.destination == destination else { return .off }
         let profile = destination.profile
-        let outcome = await engine.sync(deadline: deadline) { [weak self] path, method, body in
+        let keepalive = ContextUploadPolicy.phoneKeepalive(for: reason)
+        let outcome = await engine.sync(deadline: deadline, keepalive: keepalive) { [weak self] path, method, body in
             guard let self, bridge === self.dashboardTicketBridge, self.activeDashboardID == destination.dashboardID else {
                 throw DashboardTicketBridgeError.notReady
             }
@@ -89,7 +91,7 @@ extension AppState {
                 timeoutMilliseconds: max(1_000, min(30_000, Int(deadline.timeIntervalSinceNow * 1_000)))
             )
         }
-        Self.phoneSyncLog.info("Phone sync (\(reason.rawValue, privacy: .public)): \(String(describing: outcome), privacy: .public)")
+        Self.phoneSyncLog.info("Phone sync (\(reason.rawValue, privacy: .public)): \(String(describing: outcome), privacy: .private)")
         return outcome
     }
 
@@ -199,10 +201,12 @@ extension AppState {
                 path: DashboardPath.withProfile("\(PhoneSyncEngine.base)/wipe", profile: pending.profile),
                 method: "POST", body: ["device_id": pending.deviceID])
             pending.clear()
-        } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
+        } catch DashboardTicketBridgeError.http(let status, let detail)
+                    where status == 404 && !DashboardTicketBridgeError.isPluginOffDetail(detail) {
+            // A profile that turned the plugin off deleted nothing: it waits.
             pending.clear()
         } catch {
-            Self.phoneSyncLog.info("Phone data deletion still pending: \(PhoneSyncEngine.describe(error), privacy: .public)")
+            Self.phoneSyncLog.info("Phone data deletion still pending: \(LogRedaction.redactingURLs(PhoneSyncEngine.describe(error)), privacy: .public)")
             return error
         }
         return nil
@@ -214,6 +218,22 @@ extension AppState {
     func answerPhoneChange(_ prompt: PhoneChangePrompt, approve: Bool) async {
         await phoneSync.answer(prompt, approve: approve)
         await runPhoneSync(reason: .answered)
+    }
+
+    /// A change the user approved on a Pulse card (Add on a suggestion, or
+    /// its Undo): this phone applies it without its own card, as it does an
+    /// answered one, and says how it went right away. On another device,
+    /// or after 15 minutes, the phone asks as usual. Returns how the last
+    /// pass went, so the card can say when this phone didn't get it yet.
+    @discardableResult
+    func applyPulseApproval(_ changeID: String) async -> PhoneSyncEngine.Outcome {
+        await phoneSync.approveFromCard(changeID)
+        let outcome = await runPhoneSync(reason: .answered)
+        // Applied when that pass took it from the host: the next one says so.
+        if phoneSync.state.unreported.contains(where: { $0.id == changeID }) {
+            return await runPhoneSync(reason: .answered)
+        }
+        return outcome
     }
 
     /// A push from the host about a change Hermes asked for. Returns once

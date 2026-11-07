@@ -24,6 +24,11 @@ struct VoiceConversationSheet: View {
     /// view's identity while the presentation binding survives.
     let shouldAutoListen: () -> Bool
     var startsListening: Bool = true
+    /// V2's voice mode menu under the title; nil shows none.
+    var modeSwitch: VoiceModeSwitch? = nil
+    /// Approvals Hermes' turn waits on, whose cards are in the chat behind
+    /// this screen.
+    var approvals: [ChatMessage] = []
 
     @State private var didRequestStart = false
     /// V2 draws the conversation as a call screen, like the live modes.
@@ -31,6 +36,8 @@ struct VoiceConversationSheet: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showsTranscript = false
+    /// Speaker, during a call from Hermes.
+    @ObservedObject private var callSpeaker = VoiceAudioSessionCoordinator.shared.nativeCallSpeaker
     /// When the sheet opened, for V2's call clock.
     @State private var openedAt = Date()
     /// The job whose result V2 shows over the conversation.
@@ -67,11 +74,12 @@ struct VoiceConversationSheet: View {
                 ScrollView {
                     VStack(spacing: 22) {
                         statusCard
+                        if !approvals.isEmpty { approvalPanel }
                         conversationCard
                         backgroundJobsCard
                         controlsCard
                         Text("Your conversation also continues in chat. Close ends this voice session.")
-                            .font(.footnote)
+                            .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 18)
@@ -86,6 +94,14 @@ struct VoiceConversationSheet: View {
         }
     }
 
+    @ViewBuilder
+    private var approvalPanel: some View {
+        if let appState {
+            VoiceApprovalPanel(approvals: approvals)
+                .environmentObject(appState)
+        }
+    }
+
     private var statusCard: some View {
         ConduitSettingsSection(title: AppLocalization.string("\(profileDisplayName) voice"), symbol: stateSymbol, tint: stateTint) {
             HStack(spacing: 12) {
@@ -96,8 +112,8 @@ struct VoiceConversationSheet: View {
                     .background(stateTint.opacity(0.13), in: Circle())
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(statusTitle).font(.headline)
-                    Text(statusDetail).font(.footnote).foregroundStyle(.secondary)
+                    Text(statusTitle).scaledFont(.headline)
+                    Text(statusDetail).scaledFont(.footnote).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
             }
@@ -105,7 +121,7 @@ struct VoiceConversationSheet: View {
             .accessibilityLabel("Voice status: \(statusTitle). \(statusDetail)")
             HStack(spacing: 8) {
                 Text("Mic input")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
                 VoiceInputLevelMeter(level: inputMeterLevel, isActive: isInputMeterActive)
                     .frame(height: 20)
@@ -121,7 +137,7 @@ struct VoiceConversationSheet: View {
         ConduitSettingsSection(title: AppLocalization.string("Conversation"), symbol: "text.bubble", tint: .conduitAura) {
             if controller.conversationTranscript.isEmpty, controller.liveTranscript.isEmpty {
                 Text("Your spoken words and Hermes' replies will appear here.")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
                     .accessibilityLabel("No voice conversation messages yet")
@@ -148,7 +164,7 @@ struct VoiceConversationSheet: View {
         ConduitSettingsSection(title: AppLocalization.string("Background jobs"), symbol: "square.stack.3d.up", tint: .conduitAccent) {
             if backgroundJobs.backgroundJobs.isEmpty {
                 Text("Say “background job” and then a task to run it as its own chat while you keep talking.")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
@@ -161,10 +177,10 @@ struct VoiceConversationSheet: View {
                                 .accessibilityHidden(true)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(job.title)
-                                    .font(.subheadline)
+                                    .scaledFont(.subheadline)
                                     .lineLimit(2)
                                 Text(Self.jobStatusLabel(job.status))
-                                    .font(.caption)
+                                    .scaledFont(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 0)
@@ -173,7 +189,7 @@ struct VoiceConversationSheet: View {
                     }
                 }
                 Text("Each job is its own chat in your session list. Say “job status” or “cancel background jobs” at any time.")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             }
         }
@@ -213,31 +229,54 @@ struct VoiceConversationSheet: View {
     private var controlsCard: some View {
         ConduitSettingsSection(title: AppLocalization.string("Microphone and audio"), symbol: "slider.horizontal.3", tint: .conduitAccent) {
             AdaptiveStack(spacing: 10) {
-                Button { microphoneTapped() } label: {
-                    Label(microphoneLabel, systemImage: microphoneSymbol)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6).frame(minHeight: 48)
+                if controller.isPushToTalkActive {
+                    VoicePushToTalkControl(controller: controller) { cancelling in
+                        Label(pushToTalkTitle(cancelling: cancelling), systemImage: pushToTalkSymbol(cancelling: cancelling))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6).frame(minHeight: 48)
+                            .conduitGlassControl(cornerRadius: 17, tint: controller.isPushToTalkHeld ? .conduitAccent.opacity(0.4) : .conduitAccent.opacity(0.16))
+                    }
+                } else {
+                    Button { microphoneTapped() } label: {
+                        Label(microphoneLabel, systemImage: microphoneSymbol)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6).frame(minHeight: 48)
+                    }
+                    .conduitGlassControl(cornerRadius: 17, tint: .conduitAccent.opacity(0.16))
+                    .accessibilityHint(microphoneHint)
+                    .disabled(controller.state == .transcribing)
                 }
-                .conduitGlassControl(cornerRadius: 17, tint: .conduitAccent.opacity(0.16))
-                .accessibilityHint(microphoneHint)
-                .disabled(controller.state == .transcribing)
 
                 Button { controller.setOutputMuted(!controller.isOutputMuted) } label: {
-                    Label(controller.isOutputMuted ? AppLocalization.string("Unmute") : AppLocalization.string("Mute"), systemImage: controller.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    Label(controller.isOutputMuted ? AppLocalization.string("Unmute") : AppLocalization.string("Mute"), systemImage: controller.isOutputMuted ? LiveVoiceCallButton.silencedSymbol : LiveVoiceCallButton.silenceSymbol)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6).frame(minHeight: 48)
                 }
                 .conduitGlassControl(cornerRadius: 17, tint: controller.isOutputMuted ? .orange.opacity(0.18) : .conduitAura.opacity(0.14))
                 .accessibilityHint("Mutes assistant audio without changing chat messages")
+
+                if callSpeaker.isShown {
+                    Button { VoiceAudioSessionCoordinator.shared.setNativeCallSpeaker(!callSpeaker.isOn) } label: {
+                        Label(AppLocalization.string("Speaker"), systemImage: "speaker.wave.3.fill")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6).frame(minHeight: 48)
+                    }
+                    .conduitGlassControl(cornerRadius: 17, tint: callSpeaker.isOn ? .conduitAccent.opacity(0.4) : .conduitAura.opacity(0.14))
+                    .accessibilityValue(callSpeaker.isOn ? Text("On") : Text("Off"))
+                    .accessibilityHint(Text("Plays the call on the loudspeaker"))
+                }
             }
-            Text("Pause only affects the microphone. Close ends the voice session.")
-                .font(.caption)
+            Text(controller.isPushToTalkActive
+                ? AppLocalization.string("Hold to talk, let go to send. Close ends the voice session.")
+                : AppLocalization.string("Pause only affects the microphone. Close ends the voice session."))
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
     }
 
     private var profileDisplayName: String {
-        profile == "default" ? AppLocalization.string("Default profile") : profile.replacingOccurrences(of: "_", with: " ").capitalized
+        if let appState { return appState.profileDisplayName(profile) }
+        return profile == "default" ? AppLocalization.string("Default profile") : profile.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
     /// Automatic speaker-safe suspension while Hermes audibly speaks on an
@@ -295,6 +334,7 @@ struct VoiceConversationSheet: View {
     }
 
     private var statusTitle: String {
+        if let title = pushToTalkStatusTitle { return title }
         if isInterruptAvailable { return AppLocalization.string("Hermes is speaking") }
         if controller.isMicrophonePaused { return AppLocalization.string("Microphone paused") }
         if controller.isSteeringTurn, controller.state == .listening || controller.state == .transcribing {
@@ -312,6 +352,7 @@ struct VoiceConversationSheet: View {
     }
 
     private var statusDetail: String {
+        if let detail = pushToTalkStatusDetail { return detail }
         if isInterruptAvailable { return AppLocalization.string("Tap Interrupt to speak.") }
         if controller.isMicrophonePaused { return AppLocalization.string("Tap Listen when you are ready to resume.") }
         if controller.isSteeringTurn, controller.state == .listening || controller.state == .transcribing {
@@ -351,6 +392,50 @@ struct VoiceConversationSheet: View {
         }
     }
 
+    // MARK: Push to talk
+
+    private func pushToTalkTitle(cancelling: Bool) -> String {
+        if controller.state == .transcribing { return AppLocalization.string("Transcribing") }
+        guard controller.isPushToTalkHeld else { return AppLocalization.string("Hold to talk") }
+        return cancelling ? AppLocalization.string("Let go to cancel") : AppLocalization.string("Let go to send")
+    }
+
+    private func pushToTalkSymbol(cancelling: Bool) -> String {
+        if controller.state == .transcribing { return "waveform" }
+        guard controller.isPushToTalkHeld else { return "mic.fill" }
+        return cancelling ? "xmark" : "waveform"
+    }
+
+    /// Push to talk's status line; nil keeps the hands-free one.
+    private var pushToTalkStatusTitle: String? {
+        guard controller.isPushToTalkActive else { return nil }
+        if controller.isPushToTalkHeld, controller.state == .listening {
+            return controller.isSteeringTurn
+                ? AppLocalization.string("Steering Hermes")
+                : AppLocalization.string("Listening… let go to send")
+        }
+        if controller.state == .idle { return AppLocalization.string("Hold to talk") }
+        return nil
+    }
+
+    private var pushToTalkStatusDetail: String? {
+        guard controller.isPushToTalkActive else { return nil }
+        if controller.isPushToTalkHeld, controller.state == .listening {
+            return AppLocalization.string("Slide away before letting go to cancel.")
+        }
+        if isInterruptAvailable || controller.state == .speaking {
+            return AppLocalization.string("Hold to talk over Hermes.")
+        }
+        switch controller.state {
+        case .idle: return AppLocalization.string("Hold the button while you speak, then let go to send.")
+        case .thinking, .muted:
+            return controller.canPushToTalkNow
+                ? AppLocalization.string("Hold to talk to steer Hermes while it works.")
+                : AppLocalization.string("Hold to talk once Hermes answers.")
+        default: return nil
+        }
+    }
+
     private func microphoneTapped() {
         if isInterruptAvailable {
             Task { await controller.interruptAssistantPlayback() }
@@ -387,8 +472,15 @@ extension VoiceConversationSheet {
                 } else {
                     v2Stage
                 }
+                if !approvals.isEmpty {
+                    approvalPanel
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
+                }
                 v2Controls
             }
+            // A wide window keeps the call to a readable column.
+            .readableContentWidth(ReadableWidth.call)
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: showsTranscript)
         // VoiceOver hears the conversation change state, not every word.
@@ -434,7 +526,10 @@ extension VoiceConversationSheet {
     }
 
     private func v2Subtitle(at now: Date) -> String {
-        [profileDisplayName, AppLocalization.string("Classic voice"), V2CallHeaderTitle.clock(max(0, now.timeIntervalSince(openedAt)))]
+        // The mode menu under the title names the mode.
+        let mode = modeSwitch == nil ? AppLocalization.string("Classic voice") : nil
+        return [profileDisplayName, mode, V2CallHeaderTitle.clock(max(0, now.timeIntervalSince(openedAt)))]
+            .compactMap { $0 }
             .joined(separator: " · ")
     }
 
@@ -442,7 +537,7 @@ extension VoiceConversationSheet {
         HStack(spacing: 12) {
             Button(action: close) {
                 Image(systemName: "xmark")
-                    .font(.body.weight(.semibold))
+                    .scaledFont(.body.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .frame(width: 44, height: 44)
                     .contentShape(Circle())
@@ -453,23 +548,29 @@ extension VoiceConversationSheet {
             // Unlike a live call's chevron, this ends the conversation.
             .accessibilityHint(Text("Your conversation also continues in chat. Close ends this voice session."))
 
-            VStack(spacing: 2) {
-                Text(verbatim: v2Title)
-                    .font(.headline)
-                    .lineLimit(1)
-                    // VoiceOver hears the profile and mode, not the clock.
-                    .accessibilityValue(Text(verbatim: "\(profileDisplayName), \(AppLocalization.string("Classic voice"))"))
-                TimelineView(.animation(minimumInterval: 1)) { context in
-                    Text(verbatim: v2Subtitle(at: context.date))
-                        .font(.footnote.monospacedDigit())
-                        .foregroundStyle(.secondary)
+            VStack(spacing: 6) {
+                VStack(spacing: 2) {
+                    Text(verbatim: v2Title)
+                        .scaledFont(.headline)
                         .lineLimit(1)
+                        // VoiceOver hears the profile and mode, not the clock.
+                        .accessibilityValue(Text(verbatim: "\(profileDisplayName), \(modeSwitch?.current.title ?? AppLocalization.string("Classic voice"))"))
+                    TimelineView(.animation(minimumInterval: 1)) { context in
+                        Text(verbatim: v2Subtitle(at: context.date))
+                            .scaledFont(.footnote.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .accessibilityHidden(true)
                 }
-                .accessibilityHidden(true)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.isHeader)
+                // Its own element: a header read as one would swallow it.
+                if let modeSwitch {
+                    VoiceModeCapsule(modeSwitch: modeSwitch)
+                }
             }
             .frame(maxWidth: .infinity)
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(.isHeader)
 
             // Balances the close button so the title stays centred.
             Color.clear
@@ -480,14 +581,9 @@ extension VoiceConversationSheet {
         .padding(.top, 14)
     }
 
-    /// Hermes' `@session:<id>` chat links read as the chat's name, as in
-    /// the transcript bubbles.
+    /// The last two lines said, as the live calls caption them.
     private var v2CaptionLines: [VoiceConversationTranscriptEntry] {
-        controller.conversationTranscript.suffix(2).map { entry in
-            entry.speaker == .user
-                ? entry
-                : VoiceConversationTranscriptEntry(id: entry.id, speaker: entry.speaker, text: HermesSessionReference.plain(entry.text))
-        }
+        LiveVoiceCallSheet.captionLines(from: controller.conversationTranscript)
     }
 
     private func v2Label(for entry: VoiceConversationTranscriptEntry) -> String {
@@ -515,10 +611,10 @@ extension VoiceConversationSheet {
             .accessibilityHidden(true)
             VStack(spacing: 6) {
                 Text(statusTitle)
-                    .font(.headline)
+                    .scaledFont(.headline)
                     .foregroundStyle(.secondary)
                 Text(statusDetail)
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
             }
             .multilineTextAlignment(.center)
@@ -542,7 +638,7 @@ extension VoiceConversationSheet {
                 LiveVoiceJobCard(job: latest) { selectJob(latest.id) }
                 if jobs.count > 1 {
                     Text("\(jobs.count - 1) more in the transcript")
-                        .font(.caption)
+                        .scaledFont(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -565,7 +661,7 @@ extension VoiceConversationSheet {
             LazyVStack(spacing: 10) {
                 if controller.conversationTranscript.isEmpty, controller.liveTranscript.isEmpty {
                     Text("What you and the assistant say will appear here.")
-                        .font(.footnote)
+                        .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity)
@@ -594,16 +690,29 @@ extension VoiceConversationSheet {
 
     private var v2Controls: some View {
         HStack(alignment: .top, spacing: 0) {
+            if controller.isPushToTalkActive {
+                VoicePushToTalkControl(controller: controller) { cancelling in
+                    LiveVoiceCallButtonFace(
+                        symbol: pushToTalkSymbol(cancelling: cancelling),
+                        title: pushToTalkTitle(cancelling: cancelling),
+                        style: controller.isPushToTalkHeld ? (cancelling ? .destructive : .selected) : .normal
+                    )
+                }
+            } else {
+                LiveVoiceCallButton(
+                    symbol: microphoneSymbol,
+                    title: microphoneLabel,
+                    style: controller.isMicrophonePaused ? .selected : .normal,
+                    voiceOverHint: microphoneHint,
+                    action: microphoneTapped
+                )
+                .disabled(controller.state == .transcribing)
+            }
+            if callSpeaker.isShown {
+                NativeCallSpeakerButton(speaker: callSpeaker)
+            }
             LiveVoiceCallButton(
-                symbol: microphoneSymbol,
-                title: microphoneLabel,
-                style: controller.isMicrophonePaused ? .selected : .normal,
-                voiceOverHint: microphoneHint,
-                action: microphoneTapped
-            )
-            .disabled(controller.state == .transcribing)
-            LiveVoiceCallButton(
-                symbol: controller.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                symbol: controller.isOutputMuted ? LiveVoiceCallButton.silencedSymbol : LiveVoiceCallButton.silenceSymbol,
                 title: controller.isOutputMuted ? AppLocalization.string("Sound on") : AppLocalization.string("Silence"),
                 style: controller.isOutputMuted ? .selected : .normal,
                 voiceOverLabel: controller.isOutputMuted
@@ -628,9 +737,135 @@ extension VoiceConversationSheet {
             )
         }
         .frame(maxWidth: .infinity)
+        // Microphone, Silence, Transcript, End, and Speaker in a call.
+        .modifier(LiveVoiceCallButtonRowFit(slots: callSpeaker.isShown ? 5 : 4))
         .padding(.horizontal, 12)
         .padding(.top, 14)
         .padding(.bottom, 12)
+    }
+}
+
+/// Classic voice's push-to-talk button (#886): press and hold to listen,
+/// let go to send, slide away before letting go to cancel. VoiceOver
+/// double-taps once to start talking and again to send.
+struct VoicePushToTalkControl<Face: View>: View {
+    @ObservedObject var controller: VoiceConversationController
+    /// Draws the button; true while a slide away would cancel.
+    @ViewBuilder let face: (_ cancelling: Bool) -> Face
+
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var isPressed = false
+    @State private var isCancelling = false
+    /// This touch already started a turn: a turn the controller ends under
+    /// the finger (a failed listen, teardown) isn't restarted by it.
+    @State private var claimedThisTouch = false
+    /// Where the finger was when the press was taken, for the cancel slide.
+    @State private var pressOrigin = CGSize.zero
+
+    /// How far a finger slides off the button before letting go cancels.
+    static var cancelDistance: CGFloat { 72 }
+
+    var body: some View {
+        // Never disabled while transcribing: that would cancel a finger
+        // still down after the length cap sent, and its release with it.
+        // A press then is refused by the controller instead.
+        face(isCancelling)
+            .opacity(controller.state == .transcribing ? 0.4 : 1)
+            .scaleEffect(isPressed ? 0.94 : 1)
+            .animation(.easeOut(duration: 0.12), value: isPressed)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        // A press that can't start yet (Hermes is answering)
+                        // is retried as the finger moves, without feedback.
+                        if !isPressed, !claimedThisTouch, controller.pressPushToTalk() {
+                            isPressed = true
+                            claimedThisTouch = true
+                            pressOrigin = value.translation
+                            Haptics.medium()
+                            announceListening()
+                        }
+                        // Once sent (the length cap), letting go can't cancel.
+                        guard isPressed, controller.state == .listening else { return }
+                        let slide = CGSize(
+                            width: value.translation.width - pressOrigin.width,
+                            height: value.translation.height - pressOrigin.height
+                        )
+                        let cancelling = hypot(slide.width, slide.height) > Self.cancelDistance
+                        if cancelling != isCancelling {
+                            isCancelling = cancelling
+                            Haptics.selection()
+                            AccessibilityNotification.Announcement(cancelling
+                                ? AppLocalization.string("Let go to cancel")
+                                : AppLocalization.string("Let go to send")).post()
+                        }
+                    }
+                    .onEnded { _ in
+                        claimedThisTouch = false
+                        guard isPressed else { return }
+                        let send = !isCancelling
+                        isPressed = false
+                        isCancelling = false
+                        // Feedback only when the release ends a hold.
+                        guard controller.isPushToTalkHeld else { return }
+                        controller.endPushToTalk(send: send)
+                        if send { Haptics.light() } else { Haptics.warning() }
+                    }
+            )
+            // The controller ended the turn under the finger: the button
+            // stops looking pressed.
+            .onChange(of: controller.isPushToTalkHeld) { _, held in
+                if !held, isPressed {
+                    isPressed = false
+                    isCancelling = false
+                }
+            }
+            // A sheet closing under a held finger, or a touch the system
+            // takes away (a call, the app switcher), never sends.
+            .onDisappear { cancelHeldPress() }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { cancelHeldPress() }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel(Text(verbatim: accessibilityTitle))
+            .accessibilityHint(Text(verbatim: controller.isPushToTalkHeld
+                ? AppLocalization.string("Sends what you said to Hermes")
+                : AppLocalization.string("Listens until you double-tap again to send")))
+            .accessibilityAction {
+                if controller.isPushToTalkHeld {
+                    controller.endPushToTalk(send: true, minimumHold: false)
+                } else if controller.pressPushToTalk() {
+                    announceListening()
+                }
+            }
+            .accessibilityActions {
+                if controller.isPushToTalkHeld {
+                    Button(AppLocalization.string("Cancel")) {
+                        controller.endPushToTalk(send: false)
+                    }
+                }
+            }
+    }
+
+    private var accessibilityTitle: String {
+        if controller.state == .transcribing { return AppLocalization.string("Transcribing") }
+        guard controller.isPushToTalkHeld else { return AppLocalization.string("Start talking") }
+        return isCancelling ? AppLocalization.string("Let go to cancel") : AppLocalization.string("Send")
+    }
+
+    private func announceListening() {
+        AccessibilityNotification.Announcement(AppLocalization.string("Listening")).post()
+    }
+
+    private func cancelHeldPress() {
+        // The touch is gone: the next one may start a turn.
+        claimedThisTouch = false
+        guard isPressed else { return }
+        isPressed = false
+        isCancelling = false
+        controller.endPushToTalk(send: false)
     }
 }
 
@@ -645,10 +880,10 @@ private struct VoiceConversationTranscriptBubble: View {
     var body: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
             Text(isUser ? AppLocalization.string("You") : AppLocalization.string("Hermes"))
-                .font(.caption.weight(.semibold))
+                .scaledFont(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(shownText)
-                .font(.body)
+                .scaledFont(.body)
                 .foregroundStyle(.primary)
                 .textSelection(.enabled)
                 .multilineTextAlignment(isUser ? .trailing : .leading)
@@ -659,5 +894,38 @@ private struct VoiceConversationTranscriptBubble: View {
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(isUser ? AppLocalization.string("You") : AppLocalization.string("Hermes")): \(shownText)")
+    }
+}
+
+/// An approval, question or input request Hermes' turn waits on, on the
+/// Classic voice screen: its card is in the chat behind it, and the
+/// conversation sits on Thinking until it is answered. The same card as the
+/// chat's, so a tap here answers it the same way; a spoken yes or no, or the
+/// answer, also does for an approval or question, never for an input
+/// request.
+struct VoiceApprovalPanel: View {
+    @EnvironmentObject private var appState: AppState
+    let approvals: [ChatMessage]
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            // The oldest first: Hermes asks one at a time.
+            if let message = approvals.first {
+                Group {
+                    if message.clarify != nil {
+                        ClarifyCard(message: message)
+                    } else if message.inputPrompt != nil {
+                        InputPromptCard(message: message)
+                    } else {
+                        ApprovalCard(message: message)
+                    }
+                }
+                .chatRows()
+                .id(message.id)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(ConduitMotion.ease(reduceMotion: reduceMotion), value: approvals.first?.id)
     }
 }

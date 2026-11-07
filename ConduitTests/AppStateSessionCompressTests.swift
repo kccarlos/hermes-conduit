@@ -48,6 +48,33 @@ final class AppStateSessionCompressTests: XCTestCase {
         XCTAssertTrue(harness.appState.compressingSessionIDs.isEmpty)
     }
 
+    /// The compressed transcript holds only Hermes' rows. The chat's own
+    /// notes, which Hermes never stores, stay: here the row they followed
+    /// was compressed away, so they land after the new tail.
+    func testCompressionKeepsTheChatsLocalNotes() async throws {
+        let harness = makeHarness(lifecycleOperations: ChatResumeLifecycleOperations(
+            compressSession: { _, _, _ in Self.compressedResult() }
+        ))
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+        harness.appState.messages = [
+            ChatMessage(id: "m1", role: .user, content: "Old question", timestamp: "2026-09-13T07:00:00Z")
+        ]
+        harness.appState.handleStreamEvent(.sideAgentComplete(
+            sessionId: origin.id, kind: .btw, taskId: "btw_1", text: "Ship on Friday.", question: "what did we decide?"))
+
+        _ = await harness.appState.submitComposer(text: "/compress")
+
+        XCTAssertEqual(harness.appState.messages.map(\.content), [
+            "Summary carrier",
+            "Tail answer",
+            "[btw \"what did we decide?\"]\nShip on Friday.",
+            "Compressed 13 → 4 messages"
+        ])
+    }
+
     func testCompactAliasRoutesIdentically() async throws {
         let recorder = SlashCallRecorder()
         let harness = makeHarness(lifecycleOperations: ChatResumeLifecycleOperations(
@@ -71,6 +98,110 @@ final class AppStateSessionCompressTests: XCTestCase {
         XCTAssertEqual(recorder.slashExecCount, 0)
         // No transcript payload: the count-based confirmation renders instead.
         XCTAssertEqual(harness.appState.messages.last?.content, "Compressed 2 messages.")
+    }
+
+    /// A reopened Bot Chat runs under the runtime id its resume minted,
+    /// which the roster's canonical id never names. `/new` there (with or
+    /// without a title) still compacts the bot's one chat instead of
+    /// starting a workspace chat in Chats (#1307).
+    func testNewInAReopenedBotChatCompactsInsteadOfStartingAChat() async throws {
+        let recorder = SlashCallRecorder()
+        var createdChats = 0
+        var operations = ChatResumeLifecycleOperations(
+            compressSession: { _, sessionID, focusTopic in
+                recorder.recordCompress(sessionID: sessionID, focusTopic: focusTopic)
+                return SessionCompressResult(from: .object(["status": .string("compressed"), "removed": .number(2)]))
+            }
+        )
+        operations.createSession = { _, _ in
+            createdChats += 1
+            return (sessionId: "new-chat", storedSessionId: nil, profile: "default")
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        harness.appState.isConnected = true
+        // Only the durable id is registered; the chat is open by the
+        // runtime id its row pairs with it.
+        harness.appState.noteBotChatSessionForTesting("bot-stored", profile: "default")
+        harness.appState.sessions = [session("bot-runtime-2", storedID: "bot-stored")]
+        harness.appState.activeSessionId = "bot-runtime-2"
+
+        for command in ["/new", "/new Fresh start", "/reset", "/clear"] {
+            let submitted = await harness.appState.submitComposer(text: command)
+            XCTAssertTrue(submitted, command)
+        }
+
+        XCTAssertEqual(createdChats, 0, "a Bot Chat never forks into a new chat")
+        XCTAssertEqual(recorder.compressCalls.map(\.sessionID), Array(repeating: "bot-runtime-2", count: 4))
+        XCTAssertEqual(harness.appState.activeSessionId, "bot-runtime-2", "the user stays in the Bot Chat")
+    }
+
+    /// A compaction carries no attachments, so `/new` with one in a Bot
+    /// Chat is refused and the draft kept, title or not; it is never sent
+    /// to the bot as a message.
+    func testNewWithAttachmentsInABotChatIsRefused() async throws {
+        let recorder = SlashCallRecorder()
+        var prompts: [String] = []
+        var operations = ChatResumeLifecycleOperations(
+            compressSession: { _, sessionID, focusTopic in
+                recorder.recordCompress(sessionID: sessionID, focusTopic: focusTopic)
+                return SessionCompressResult(from: .object(["status": .string("compressed")]))
+            }
+        )
+        operations.sendPrompt = { _, _, text in
+            prompts.append(text)
+            return .accepted
+        }
+        operations.uploadAttachment = { _, _, _ in nil }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        harness.appState.isConnected = true
+        harness.appState.noteBotChatSessionForTesting("bot-runtime-2", profile: "default")
+        harness.appState.activeSessionId = "bot-runtime-2"
+        let attachment = Attachment(
+            id: "notes",
+            name: "notes.txt",
+            uri: "file:///tmp/notes.txt",
+            mimeType: "text/plain",
+            kind: .document
+        )
+
+        for command in ["/new", "/new Fresh start"] {
+            harness.appState.errorMessage = nil
+            let submitted = await harness.appState.submitComposer(text: command, attachments: [attachment])
+            XCTAssertFalse(submitted, command)
+            XCTAssertNotNil(harness.appState.errorMessage, command)
+        }
+
+        XCTAssertTrue(prompts.isEmpty, "nothing reaches the bot")
+        XCTAssertTrue(recorder.compressCalls.isEmpty)
+    }
+
+    /// An ordinary chat keeps `/new`: it starts a new chat and compacts nothing.
+    func testNewInAnOrdinaryChatStartsANewChat() async throws {
+        let recorder = SlashCallRecorder()
+        var createdChats = 0
+        var operations = ChatResumeLifecycleOperations(
+            compressSession: { _, sessionID, focusTopic in
+                recorder.recordCompress(sessionID: sessionID, focusTopic: focusTopic)
+                return SessionCompressResult(from: .object(["status": .string("compressed")]))
+            }
+        )
+        operations.createSession = { _, _ in
+            createdChats += 1
+            return (sessionId: "new-chat", storedSessionId: nil, profile: "default")
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        harness.appState.isConnected = true
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/new")
+
+        XCTAssertEqual(createdChats, 1)
+        XCTAssertTrue(recorder.compressCalls.isEmpty)
     }
 
     func testCompressPassesArgumentAsFocusTopic() async throws {
@@ -968,6 +1099,7 @@ final class AppStateSessionCompressTests: XCTestCase {
         let events: [StreamEvent] = [
             .messageStart(sessionId: origin.id),
             .messageDelta(sessionId: origin.id, text: "Hi"),
+            .messageInterim(sessionId: origin.id, text: "Looking", alreadyStreamed: false),
             .toolStart(sessionId: origin.id, toolName: "terminal", toolInput: nil),
             .messageComplete(sessionId: origin.id, messageId: nil, content: "Hi", reasoning: nil)
         ]
@@ -1539,9 +1671,474 @@ final class AppStateSessionCompressTests: XCTestCase {
         XCTAssertEqual(harness.appState.messages.last?.content, "⚠️ Command failed: Hermes didn't answer in time. Check that your Hermes server is running, then try again.")
     }
 
+    // MARK: - Side agents (/background, /btw)
+
+    /// A gateway frame as HermesClient hands it to AppState.
+    private func frame(_ json: String) throws -> StreamEvent {
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return try XCTUnwrap(StreamEventParser.parse(params: AnyCodable.from(object)))
+    }
+
+    /// `/btw` and `/background` start Hermes' side agents with their own
+    /// RPCs: through `slash.exec` the slash worker prints the answer after
+    /// the call has returned, so it never reached the chat.
+    func testSideAgentCommandsUseTheirOwnRPCs() async throws {
+        let recorder = SlashCallRecorder()
+        let started = SideAgentRecorder()
+        var operations = ChatResumeLifecycleOperations(
+            executeSlash: { _, _, command in
+                recorder.recordSlashExec(command: command)
+                return .object(["type": .string("exec"), "output": .string("")])
+            }
+        )
+        operations.startSideAgent = { _, kind, sessionID, text in
+            started.calls.append((kind, sessionID, text))
+            return kind == .btw ? "btw_1" : "bg_1"
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/btw what did we decide?")
+        _ = await harness.appState.submitComposer(text: "/bg summarize the logs")
+        _ = await harness.appState.submitComposer(text: "/background check the build")
+
+        XCTAssertEqual(recorder.slashExecCount, 0)
+        XCTAssertEqual(started.calls.map(\.kind), [.btw, .background, .background])
+        XCTAssertEqual(started.calls.map(\.text), ["what did we decide?", "summarize the logs", "check the build"])
+        XCTAssertEqual(Set(started.calls.map(\.sessionID)), ["composer-origin"])
+        XCTAssertEqual(harness.appState.messages.filter { $0.role == .system }.count, 3, "each start says where the answer will land")
+    }
+
+    /// A gateway without the side-agent RPCs keeps the old slash path, and
+    /// a command without text goes there too for its usage line.
+    func testSideAgentCommandFallsBackToSlashExec() async throws {
+        let recorder = SlashCallRecorder()
+        let started = SideAgentRecorder()
+        var operations = ChatResumeLifecycleOperations(
+            executeSlash: { _, _, command in
+                recorder.recordSlashExec(command: command)
+                return .object(["type": .string("exec"), "output": .string("legacy output")])
+            }
+        )
+        operations.startSideAgent = { _, kind, sessionID, text in
+            started.calls.append((kind, sessionID, text))
+            throw RpcError(code: -32601, message: "unknown method: prompt.btw")
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/btw what did we decide?")
+        _ = await harness.appState.submitComposer(text: "/background")
+
+        XCTAssertEqual(started.calls.count, 1, "no text: nothing to start")
+        XCTAssertEqual(recorder.slashExecCommands, ["btw what did we decide?", "background"])
+        XCTAssertEqual(harness.appState.messages.last?.content, "legacy output")
+    }
+
+    /// The answers arrive later as `btw.complete` / `background.complete`
+    /// and land in the chat as a note, without touching the running turn.
+    func testSideAgentAnswersLandInTheChat() throws {
+        let harness = makeHarness()
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+        harness.appState.handleStreamEvent(.messageStart(sessionId: "composer-origin"))
+        XCTAssertTrue(harness.appState.isBusy)
+
+        harness.appState.handleStreamEvent(try frame(#"""
+        {"type": "btw.complete", "session_id": "composer-origin", "payload": {"task_id": "btw_1a2b3c", "question": "what did we decide?", "text": "Ship on Friday."}}
+        """#))
+        harness.appState.handleStreamEvent(try frame(#"""
+        {"type": "background.complete", "session_id": "composer-origin", "payload": {"task_id": "bg_4d5e6f", "text": "Logs are clean."}}
+        """#))
+
+        let notes = harness.appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertEqual(notes, ["[btw \"what did we decide?\"]\nShip on Friday.", "[bg bg_4d5e6f]\nLogs are clean."])
+        XCTAssertTrue(harness.appState.isBusy, "a side agent finishing doesn't end the main turn")
+    }
+
+    /// Hermes keeps no copy of a side agent's answer, so one that lands
+    /// while a reconcile is open must still show when that reconcile is
+    /// dropped instead of committed (here: a compaction under a live turn).
+    func testSideAgentAnswerDuringADroppedReconcileStillLands() throws {
+        let harness = makeHarness()
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+        harness.appState.handleStreamEvent(.messageStart(sessionId: origin.id))
+        _ = harness.appState.beginReconciliation()
+
+        harness.appState.handleStreamEvent(try frame(#"""
+        {"type": "btw.complete", "session_id": "composer-origin", "payload": {"task_id": "btw_1a2b3c", "question": "what did we decide?", "text": "Ship on Friday."}}
+        """#))
+        harness.appState.handleStreamEvent(.statusUpdate(sessionId: origin.id, kind: .compacted, text: nil))
+
+        let notes = harness.appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertEqual(notes, ["[btw \"what did we decide?\"]\nShip on Friday."])
+    }
+
+    /// A reconcile that settles shows the answer after it, once.
+    func testSideAgentAnswerDuringASettledReconcileLandsOnce() throws {
+        let harness = makeHarness()
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+        let token = harness.appState.beginReconciliation()
+
+        harness.appState.handleStreamEvent(try frame(#"""
+        {"type": "background.complete", "session_id": "composer-origin", "payload": {"task_id": "bg_4d5e6f", "text": "Logs are clean."}}
+        """#))
+        XCTAssertTrue(harness.appState.messages.isEmpty, "held while the reconcile is open")
+        _ = harness.appState.settleReconciliationAndPublish(token)
+
+        let notes = harness.appState.messages.filter { $0.role == .system }.map(\.content)
+        XCTAssertEqual(notes, ["[bg bg_4d5e6f]\nLogs are clean."])
+    }
+
+    // MARK: - Commands slash.exec refuses for Conduit (#1078 parity)
+
+    func testSteerWhileIdleSendsTheMessageAsATurn() async throws {
+        let recorder = SlashCallRecorder()
+        var sent: [String] = []
+        var operations = ChatResumeLifecycleOperations()
+        operations.executeSlash = { _, _, command in
+            recorder.recordSlashExec(command: command)
+            return .object([:])
+        }
+        operations.refreshContext = { _, _ in }
+        operations.sendPrompt = { _, _, text in
+            sent.append(text)
+            return .accepted
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/steer check the logs")
+
+        XCTAssertEqual(recorder.slashExecCount, 0, "Hermes refuses /steer through slash.exec")
+        XCTAssertEqual(sent, ["check the logs"])
+    }
+
+    func testRefusedSteerKeepsTheDraft() async throws {
+        let defaults = UserDefaults.standard
+        let savedAutomatic = defaults.object(forKey: ChatTakeoverPreference.automaticKey)
+        defaults.set(false, forKey: ChatTakeoverPreference.automaticKey)
+        defer { defaults.set(savedAutomatic, forKey: ChatTakeoverPreference.automaticKey) }
+        var sends = 0
+        var operations = ChatResumeLifecycleOperations()
+        operations.refreshContext = { _, _ in }
+        operations.sendPrompt = { _, _, _ in
+            sends += 1
+            throw RpcError(
+                code: 4090,
+                message: "This chat is open in another Hermes window/terminal.",
+                reason: "SESSION_NOT_OWNED"
+            )
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        let submitted = await harness.appState.submitComposer(text: "/steer check the logs")
+
+        XCTAssertEqual(sends, 1)
+        XCTAssertFalse(submitted, "A refused /steer send goes back to the composer like any other send")
+    }
+
+    private static let rewindTurns = SessionRewindSnapshot(
+        turns: [
+            .init(rowID: 11, text: "first ask"),
+            .init(rowID: 14, text: nil),
+            .init(rowID: 17, text: "latest ask")
+        ],
+        revision: 5,
+        generation: 2
+    )
+
+    private static let dashboard = SavedDashboard(
+        id: UUID(uuidString: "00000000-0000-0000-0000-000000001420")!,
+        label: "Home",
+        normalizedURL: "https://one.example"
+    )
+
+    private func rewindHarness(
+        savedDashboard: Bool = false,
+        rewoundText: String = "first ask",
+        rewound: @escaping (Int, SessionRewindSnapshot) -> Void
+    ) -> (appState: AppState, defaults: UserDefaults, suite: String) {
+        var operations = ChatResumeLifecycleOperations(
+            openSession: { _, _, _ in throw URLError(.networkConnectionLost) }
+        )
+        operations.rewindSnapshot = { _, _ in Self.rewindTurns }
+        operations.rewindSession = { _, _, target, snapshot in
+            rewound(target, snapshot)
+            return SessionRewindReceipt(rewoundCount: 4, text: target == 11 ? rewoundText : nil)
+        }
+        let harness = makeHarness(
+            lifecycleOperations: operations,
+            dashboardRegistry: savedDashboard
+                ? SavedDashboardRegistry(activeDashboardID: Self.dashboard.id, dashboards: [Self.dashboard])
+                : nil
+        )
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+        return harness
+    }
+
+    func testUndoRewindsToTheNthNewestTurnAndPutsItBack() async throws {
+        var rewinds: [(Int, Int?, Int?)] = []
+        let harness = rewindHarness { target, snapshot in rewinds.append((target, snapshot.revision, snapshot.generation)) }
+
+        _ = await harness.appState.submitComposer(text: "/undo 3")
+
+        XCTAssertEqual(rewinds.map { $0.0 }, [11], "/undo 3 takes back the third newest user turn and everything after it")
+        XCTAssertEqual(rewinds.first?.1, 5)
+        XCTAssertEqual(rewinds.first?.2, 2)
+        XCTAssertEqual(harness.appState.composerPrefillText, "first ask")
+        XCTAssertEqual(
+            harness.appState.messages.last?.content,
+            "Took the message back, but the chat couldn't reload. Open it again to see the change. The message is in the composer.",
+            "the harness's reopen fails, so the note says the chat on screen is stale"
+        )
+    }
+
+    func testEditAndResendRewindsToThatMessageAndPutsItBack() async throws {
+        var rewinds: [Int] = []
+        let harness = rewindHarness { target, _ in rewinds.append(target) }
+        let earlier = ChatMessage(id: "u1", role: .user, content: "first ask", timestamp: "", rowId: 11)
+        harness.appState.messages = [
+            earlier,
+            ChatMessage(id: "a1", role: .assistant, content: "answer", timestamp: ""),
+            ChatMessage(id: "u3", role: .user, content: "latest ask", timestamp: "", rowId: 17)
+        ]
+
+        await harness.appState.editAndResend(earlier, confirmedLaterTurns: true)
+
+        XCTAssertEqual(rewinds, [11], "Edit and resend takes back that message and everything after it")
+        XCTAssertEqual(harness.appState.composerPrefillText, "first ask")
+    }
+
+    func testEditAndResendPutsTheWordsBackIntoTheirChatsDraftWithTheQuoteAsItsChip() async throws {
+        var rewinds: [Int] = []
+        let sent = ReplyQuoteEnvelope.outboundText(quoting: "Earlier answer", message: "first ask")
+        let harness = rewindHarness(savedDashboard: true, rewoundText: sent) { target, _ in rewinds.append(target) }
+        let earlier = ChatMessage(id: "u1", role: .user, content: sent, timestamp: "", rowId: 11)
+        harness.appState.messages = [earlier]
+        let key = harness.appState.durableComposerDraftKeyOnScreen
+
+        await harness.appState.editAndResend(earlier, confirmedLaterTurns: true)
+
+        XCTAssertEqual(rewinds, [11])
+        let request = try XCTUnwrap(harness.appState.composerRestoreRequests.last)
+        XCTAssertEqual(request.key, key, "Into the draft of the chat it was tapped in")
+        XCTAssertEqual(request.dashboardID, Self.dashboard.id)
+        XCTAssertEqual(request.draft.text, "first ask")
+        XCTAssertEqual(request.draft.replyReference?.text, "Earlier answer")
+        XCTAssertEqual(harness.appState.composerPrefillText, "", "Not as a prefill, which would replace what's typed")
+    }
+
+    func testEditAndResendTakesNothingBackWhenHermesHasLaterMessagesNobodyConfirmed() async throws {
+        var rewinds: [Int] = []
+        let harness = rewindHarness { target, _ in rewinds.append(target) }
+        // The transcript here ends at this message; Hermes' history has two
+        // more turns, sent from another device.
+        let earlier = ChatMessage(id: "u1", role: .user, content: "first ask", timestamp: "", rowId: 11)
+        harness.appState.messages = [earlier]
+
+        await harness.appState.editAndResend(earlier, confirmedLaterTurns: false)
+
+        XCTAssertEqual(rewinds, [])
+        XCTAssertEqual(
+            harness.appState.messages.last?.content,
+            "This chat has newer messages. Try Edit and resend again to see what it takes back."
+        )
+    }
+
+    func testEditAndResendRefusalNamesNoSlashCommand() {
+        XCTAssertEqual(
+            AppState.editFailureNote(error: RpcError(code: 4001, message: "unsupported_command", reason: "unsupported_command")),
+            "This Hermes can't take a message back. Update Hermes to edit and resend."
+        )
+        XCTAssertEqual(
+            AppState.editFailureNote(error: RpcError(code: 4009, message: "session_busy", reason: "session_busy")),
+            "Wait for the reply to finish, or /stop it, then try again."
+        )
+    }
+
+    func testEditAndResendOfAMessageNotInTheHistoryTakesNothingBack() async throws {
+        var rewinds: [Int] = []
+        let harness = rewindHarness { target, _ in rewinds.append(target) }
+        let unknown = ChatMessage(id: "u9", role: .user, content: "never saved", timestamp: "")
+        harness.appState.messages = [unknown]
+
+        await harness.appState.editAndResend(unknown, confirmedLaterTurns: true)
+
+        XCTAssertEqual(rewinds, [])
+        XCTAssertEqual(
+            harness.appState.messages.last?.content,
+            "Couldn't find that message in the chat's history. Open the chat again, then try once more."
+        )
+    }
+
+    func testUndoBeyondTheTranscriptRewindsNothing() async throws {
+        var rewinds: [Int] = []
+        let harness = rewindHarness { target, _ in rewinds.append(target) }
+
+        _ = await harness.appState.submitComposer(text: "/undo 4")
+
+        XCTAssertEqual(rewinds, [])
+        XCTAssertEqual(harness.appState.messages.last?.content, "There's no message to undo.")
+    }
+
+    func testUndoWithAWordShowsUsage() async throws {
+        var rewinds: [Int] = []
+        let harness = rewindHarness { target, _ in rewinds.append(target) }
+
+        _ = await harness.appState.submitComposer(text: "/undo all")
+
+        XCTAssertEqual(rewinds, [])
+        XCTAssertTrue(harness.appState.messages.last?.content.hasPrefix("Usage: /undo [N].") ?? false)
+    }
+
+    func testRetryOfAPictureTurnTakesNothingBack() async throws {
+        var rewinds: [Int] = []
+        var operations = ChatResumeLifecycleOperations()
+        operations.rewindSnapshot = { _, _ in
+            SessionRewindSnapshot(turns: [.init(rowID: 11, text: "first ask"), .init(rowID: 14, text: nil)], revision: 1, generation: 1)
+        }
+        operations.rewindSession = { _, _, target, _ in
+            rewinds.append(target)
+            return SessionRewindReceipt(rewoundCount: 2, text: nil)
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/retry")
+
+        XCTAssertEqual(rewinds, [], "Refused before anything is archived, as Hermes does")
+        XCTAssertEqual(harness.appState.messages.last?.content, "/retry can only send a text message again.")
+    }
+
+    func testSteerSendsASlashMessageAsTyped() async throws {
+        let recorder = SlashCallRecorder()
+        var sent: [String] = []
+        var operations = ChatResumeLifecycleOperations()
+        operations.executeSlash = { _, _, command in
+            recorder.recordSlashExec(command: command)
+            return .object([:])
+        }
+        operations.refreshContext = { _, _ in }
+        operations.sendPrompt = { _, _, text in
+            sent.append(text)
+            return .accepted
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/s /status is wrong")
+
+        XCTAssertEqual(recorder.slashExecCount, 0, "The message must not run as /status")
+        XCTAssertEqual(sent, ["/status is wrong"])
+    }
+
+    func testBareQueueExplainsItself() async throws {
+        let recorder = SlashCallRecorder()
+        var operations = ChatResumeLifecycleOperations()
+        operations.executeSlash = { _, _, command in
+            recorder.recordSlashExec(command: command)
+            return .object([:])
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/queue")
+
+        XCTAssertEqual(recorder.slashExecCount, 0)
+        XCTAssertEqual(
+            harness.appState.messages.last?.content,
+            "Usage: /queue <message>. Sends the message as the next turn once the running reply finishes."
+        )
+    }
+
+    func testStopEndsThisChatsBackgroundProcesses() async throws {
+        let recorder = SlashCallRecorder()
+        var stopped: [String] = []
+        var operations = ChatResumeLifecycleOperations()
+        operations.executeSlash = { _, _, command in
+            recorder.recordSlashExec(command: command)
+            return .object([:])
+        }
+        operations.stopProcesses = { _, sessionID in
+            stopped.append(sessionID)
+            return 2
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/stop")
+
+        XCTAssertEqual(recorder.slashExecCount, 0)
+        XCTAssertEqual(stopped, ["composer-origin"])
+        XCTAssertEqual(harness.appState.messages.last?.content, "Background processes stopped: 2")
+    }
+
+    func testRefusedCommandShowsHermesHintNotAFailure() async throws {
+        var operations = ChatResumeLifecycleOperations()
+        operations.executeSlash = { _, _, _ in
+            throw RpcError(
+                code: 4001,
+                message: "unsupported_command",
+                reason: "unsupported_command",
+                detail: "Run `hermes backup --quick` in a terminal."
+            )
+        }
+        operations.dispatchCommand = { _, _, name, _ in
+            throw RpcError(code: 4018, message: "not a quick/plugin/skill command: \(name)")
+        }
+        let harness = makeHarness(lifecycleOperations: operations)
+        installComposerClient(in: harness)
+        let origin = session("composer-origin")
+        harness.appState.sessions = [origin]
+        harness.appState.activeSessionId = origin.id
+
+        _ = await harness.appState.submitComposer(text: "/snapshot")
+
+        XCTAssertEqual(
+            harness.appState.messages.last?.content,
+            "Hermes doesn't run /snapshot for Conduit chats.\nRun `hermes backup --quick` in a terminal."
+        )
+    }
+
     private func makeHarness(
         lifecycleOperations: ChatResumeLifecycleOperations = .live,
-        conversationIdentityIndex: ConversationIdentityIndex? = nil
+        conversationIdentityIndex: ConversationIdentityIndex? = nil,
+        dashboardRegistry: SavedDashboardRegistry? = nil
     ) -> (
         appState: AppState,
         defaults: UserDefaults,
@@ -1561,6 +2158,7 @@ final class AppStateSessionCompressTests: XCTestCase {
             chatResumeCoordinator: coordinator,
             recoverySequence: ChatResumeRecoverySequence(),
             loadSavedConnection: false,
+            dashboardRegistry: dashboardRegistry,
             clearSessionPresentationCache: {},
             chatResumeLifecycleOperations: lifecycleOperations,
             sessionPresentationCache: SessionPresentationCache(defaults: defaults),
@@ -1604,6 +2202,12 @@ final class AppStateSessionCompressTests: XCTestCase {
             lineageRootId: nil
         )
     }
+}
+
+/// Side-agent starts the `startSideAgent` seam saw.
+@MainActor
+private final class SideAgentRecorder {
+    var calls: [(kind: SideAgentKind, sessionID: String, text: String)] = []
 }
 
 /// Call recorder for the compression lifecycle seams. Everything runs on the

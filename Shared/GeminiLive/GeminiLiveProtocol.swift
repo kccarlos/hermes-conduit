@@ -23,6 +23,12 @@ enum LiveVoiceClientMessage: Equatable {
     case contextNote(String)
     /// The answer to a function call.
     case toolResponse(id: String, name: String, result: [String: String], scheduling: GeminiLiveProtocol.Scheduling?)
+
+    /// Microphone audio, which a backed-up connection may drop.
+    var isAudio: Bool {
+        if case .audio = self { return true }
+        return false
+    }
 }
 
 enum GeminiLiveProtocol {
@@ -209,7 +215,8 @@ enum GeminiLiveProtocol {
     struct FunctionCall: Equatable {
         let id: String
         let name: String
-        /// String-valued arguments only: every Conduit tool takes strings.
+        /// String-valued arguments: numbers as their text, lists and
+        /// objects (show_on_screen's cards) as their JSON.
         let arguments: [String: String]
 
         /// Set (alone) when the call's arguments weren't valid JSON, so
@@ -217,6 +224,21 @@ enum GeminiLiveProtocol {
         static let invalidArgumentsKey = "_conduit_invalid_arguments"
 
         var hasInvalidArguments: Bool { arguments[Self.invalidArgumentsKey] != nil }
+
+        static func stringArguments(_ raw: [String: Any]) -> [String: String] {
+            var arguments: [String: String] = [:]
+            for (key, value) in raw {
+                if let string = value as? String {
+                    arguments[key] = string
+                } else if let number = value as? NSNumber {
+                    arguments[key] = number.stringValue
+                } else if value is [Any] || value is [String: Any],
+                          let data = try? JSONSerialization.data(withJSONObject: value) {
+                    arguments[key] = String(decoding: data, as: UTF8.self)
+                }
+            }
+            return arguments
+        }
     }
 
     enum ServerEvent: Equatable {
@@ -270,15 +292,7 @@ enum GeminiLiveProtocol {
             let parsed = calls.compactMap { call -> FunctionCall? in
                 guard let id = call["id"] as? String, let name = call["name"] as? String else { return nil }
                 let rawArguments = call["args"] as? [String: Any] ?? [:]
-                var arguments: [String: String] = [:]
-                for (key, value) in rawArguments {
-                    if let string = value as? String {
-                        arguments[key] = string
-                    } else if let number = value as? NSNumber {
-                        arguments[key] = number.stringValue
-                    }
-                }
-                return FunctionCall(id: id, name: name, arguments: arguments)
+                return FunctionCall(id: id, name: name, arguments: FunctionCall.stringArguments(rawArguments))
             }
             if !parsed.isEmpty { events.append(.toolCall(parsed)) }
         }

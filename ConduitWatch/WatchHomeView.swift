@@ -2,8 +2,8 @@
 //  WatchHomeView.swift
 //  Conduit Watch
 //
-//  The home screen: one big button to talk to Hermes, the voice it will
-//  use, and settings.
+//  The home screen: the V2 voice button to talk to Hermes, the voice it
+//  will use, and settings.
 //
 
 import SwiftUI
@@ -11,6 +11,7 @@ import SwiftUI
 struct WatchHomeView: View {
     @EnvironmentObject private var call: WatchVoiceCall
     @EnvironmentObject private var link: WatchLink
+    @Environment(\.watchAccent) private var accent
 
     /// The iPhone found this voice can't start for its Hermes profile.
     private var notSetUp: Bool {
@@ -28,7 +29,8 @@ struct WatchHomeView: View {
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: call.engine.symbol)
-                            .foregroundStyle(Color.watchAura)
+                            .foregroundStyle(accent)
+                            .frame(width: 20)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(call.engine.title)
                                 .font(.footnote.weight(.semibold))
@@ -39,12 +41,22 @@ struct WatchHomeView: View {
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background(WatchCard())
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel(Text("Voice: \(call.engine.title)"))
                 .accessibilityValue(notSetUp ? Text("Not set up on your Hermes host") : Text(call.engine.detail))
                 // Calls from Hermes ring the Watch only while its voice can
                 // start (WatchCallVoices).
-                if notSetUp, HermesWatchCalls.ringingBuilt, link.phoneContext?.callsRing == true {
+                if !WatchVoiceCall.callsWork {
+                    // #1346: say so before a call, not after it fails.
+                    oldWatchOSNote
+                        .font(.caption2)
+                        .foregroundStyle(Color.watchAttention)
+                        .multilineTextAlignment(.center)
+                } else if notSetUp, HermesWatchCalls.ringingBuilt, link.phoneContext?.callsRing == true {
                     Text("Calls from Hermes ring only your iPhone until \(call.engine.title) is set up. Voice settings in Conduit on your iPhone show what it needs.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -54,6 +66,7 @@ struct WatchHomeView: View {
             .padding(.horizontal, 4)
         }
         .navigationTitle("Conduit")
+        .watchBackdrop()
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink {
@@ -66,12 +79,20 @@ struct WatchHomeView: View {
         }
     }
 
+    /// The iPhone rings for calls from Hermes only where they ring at all.
+    private var oldWatchOSNote: Text {
+        if HermesWatchCalls.ringingBuilt, link.phoneContext?.callsRing == true {
+            return Text("Calls from the Watch don't work on watchOS 10. Talk to Hermes in Conduit on your iPhone, which rings for calls from Hermes too.")
+        }
+        return Text("Calls from the Watch don't work on watchOS 10. Talk to Hermes in Conduit on your iPhone.")
+    }
+
     @ViewBuilder
     private var startButton: some View {
         let button = Button {
             call.start()
         } label: {
-            WatchVoiceOrb(mood: .ready, size: 84)
+            WatchVoiceButtonFace(size: 80)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(Text("Start a call"))
@@ -108,6 +129,7 @@ struct WatchEnginePicker: View {
     @EnvironmentObject private var call: WatchVoiceCall
     @EnvironmentObject private var link: WatchLink
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.watchAccent) private var accent
 
     var body: some View {
         List {
@@ -118,7 +140,7 @@ struct WatchEnginePicker: View {
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: engine.symbol)
-                            .foregroundStyle(Color.watchAura)
+                            .foregroundStyle(accent)
                             .frame(width: 20)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(engine.title)
@@ -127,7 +149,7 @@ struct WatchEnginePicker: View {
                         Spacer(minLength: 0)
                         if engine == call.engine {
                             Image(systemName: "checkmark")
-                                .foregroundStyle(Color.watchAura)
+                                .foregroundStyle(accent)
                         }
                     }
                 }
@@ -141,6 +163,7 @@ struct WatchEnginePicker: View {
             }
         }
         .navigationTitle("Voice")
+        .watchBackdrop()
     }
 }
 
@@ -148,13 +171,18 @@ struct WatchEnginePicker: View {
 struct WatchSettingsView: View {
     @EnvironmentObject private var link: WatchLink
     @EnvironmentObject private var call: WatchVoiceCall
+    @Environment(\.watchAccent) private var accent
 
     var body: some View {
         List {
-            Section {
-                Toggle("Call on open", isOn: $call.startsOnOpen)
-            } footer: {
-                Text("Opening Conduit starts a call right away. Turn this off to start each call with a tap.")
+            // Watch calls don't work on watchOS 10 (#1346): nothing to start.
+            if WatchVoiceCall.callsWork {
+                Section {
+                    Toggle("Call on open", isOn: $call.startsOnOpen)
+                        .tint(accent)
+                } footer: {
+                    Text("Opening Conduit starts a call right away. Turn this off to start each call with a tap.")
+                }
             }
             Section {
                 NavigationLink {
@@ -179,6 +207,22 @@ struct WatchSettingsView: View {
             } footer: {
                 Text("Calls need Conduit on your iPhone to start. Once a call is on, it carries on with your wrist down and your iPhone locked.")
             }
+            // As the padlock or shield on the iPhone's dashboard row.
+            if let encryption = link.phoneContext?.encryption {
+                Section {
+                    Label {
+                        Text(encryption == .quantumSafe ? String(localized: "Notifications quantum-safe") : String(localized: "Notifications encrypted"))
+                    } icon: {
+                        Image(systemName: encryption == .quantumSafe ? "lock.shield.fill" : "lock.fill")
+                            .foregroundStyle(accent)
+                    }
+                    .font(.footnote)
+                } footer: {
+                    Text(encryption == .quantumSafe
+                        ? String(localized: "Your active dashboard's notifications are end-to-end encrypted and quantum-safe: the relay sees when they arrive, not what they say. Conduit on your iPhone has the details.")
+                        : String(localized: "Your active dashboard's notifications are end-to-end encrypted: the relay sees when they arrive, not what they say. Conduit on your iPhone has the details."))
+                }
+            }
             if let version {
                 Section {
                     Text("Version \(version)")
@@ -189,6 +233,7 @@ struct WatchSettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .watchBackdrop()
     }
 
     private var version: String? {
@@ -230,6 +275,7 @@ struct WatchLogView: View {
             }
         }
         .navigationTitle("Call log")
+        .watchBackdrop()
         .confirmationDialog("Clear the Watch call log?", isPresented: $confirmingClear) {
             Button("Clear", role: .destructive) { log.clear() }
         }

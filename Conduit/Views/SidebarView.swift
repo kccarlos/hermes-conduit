@@ -42,7 +42,7 @@ struct SidebarView: View {
                                 .lineLimit(1)
                         }
                     }
-                    .font(.caption.weight(.semibold))
+                    .scaledFont(.caption.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .frame(minHeight: 40)
                     .foregroundStyle(selectedTab == tab ? .primary : .secondary)
@@ -83,14 +83,14 @@ struct SidebarView: View {
                                     )
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text("Workspace")
-                                            .font(.caption2)
+                                            .scaledFont(.caption2)
                                             .foregroundStyle(.secondary)
                                         Text(appState.profileDisplayName(appState.activeProfile))
-                                            .font(.subheadline.weight(.semibold))
+                                            .scaledFont(.subheadline.weight(.semibold))
                                             .lineLimit(2)
                                     }
                                     Image(systemName: "chevron.up.chevron.down")
-                                        .font(.caption2.weight(.semibold))
+                                        .scaledFont(.caption2.weight(.semibold))
                                         .foregroundStyle(.secondary)
                                 }
                                 .padding(.horizontal, 12)
@@ -158,6 +158,9 @@ struct SidebarView: View {
                 .padding(.horizontal, 14)
                 .padding(.top, 10)
             }
+            // The persistent column sits on the window's leading side: the
+            // trailing safe area isn't its own (#1765).
+            .modifier(PersistentColumnContent(isPersistent: presentation == .persistent))
             .toolbar(.hidden, for: .navigationBar)
         }
         .sheet(isPresented: $showProfilePicker) {
@@ -178,9 +181,16 @@ struct SidebarView: View {
 struct SessionList: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject var appState: AppState
+    @Environment(\.scenePhase) private var scenePhase
     @State private var searchText = ""
     @State private var showFilterOrder = false
+    /// Reorder pinned chats, from a pinned row's menu (issue 1354).
+    @State private var pinnedOrderTarget: PinnedChatsOrderTarget?
     @State private var showArchivedSessions = false
+    /// Every pinned reply of the profile (#918).
+    @State private var showPinnedReplies = false
+    /// Every profile's chats waiting on the user (issue 1705).
+    @State private var showNeedsYou = false
     @State private var showProjectCreator = false
     @State private var sessionPendingDeletion: SessionSummary?
     @State private var sessionPendingRename: SessionSummary?
@@ -240,7 +250,7 @@ struct SessionList: View {
                         Image(systemName: "plus.circle.fill")
                             .font(.system(size: 16, weight: .semibold))
                         Text("New Chat")
-                            .font(.subheadline.weight(.semibold))
+                            .scaledFont(.subheadline.weight(.semibold))
                             .lineLimit(2)
                     }
                     .foregroundStyle(Color.conduitBackgroundColor)
@@ -265,7 +275,7 @@ struct SessionList: View {
                         }
                     } label: {
                         Image(systemName: "waveform")
-                            .font(.title3.weight(.semibold))
+                            .scaledFont(.title3.weight(.semibold))
                             .conduitFixedGlyph()
                             .frame(width: 44, height: 44)
                     }
@@ -280,6 +290,14 @@ struct SessionList: View {
                 }
 
                 Menu {
+                    if appState.servesNeedsYou {
+                        Button {
+                            Haptics.selection()
+                            showNeedsYou = true
+                        } label: {
+                            Label(AppLocalization.string("Needs you"), systemImage: "exclamationmark.bubble")
+                        }
+                    }
                     Button {
                         Haptics.selection()
                         showFilterOrder = true
@@ -292,6 +310,12 @@ struct SessionList: View {
                         showArchivedSessions = true
                     } label: {
                         Label(AppLocalization.string("Archived conversations"), systemImage: "archivebox")
+                    }
+                    Button {
+                        Haptics.selection()
+                        showPinnedReplies = true
+                    } label: {
+                        Label(AppLocalization.string("Pinned replies"), systemImage: "pin")
                     }
 
                     Button {
@@ -368,37 +392,51 @@ struct SessionList: View {
                     // without leaving the folder view (#338).
                     let pinned = projectsViewPinnedSessions
                     if !pinned.isEmpty {
-                        Section("Pinned") {
+                        Section {
                             ForEach(pinned) { session in
                                 sessionRow(session)
                             }
+                        } header: {
+                            pinnedHeader(count: pinned.count)
                         }
                     }
                     projectContent(hasPinnedSessions: !pinned.isEmpty)
                 }
                 if layout.loadingState {
-                    ProgressView("Loading chats…")
+                    ProgressView(AppLocalization.string("Loading chats…"))
                         .frame(maxWidth: .infinity, minHeight: 140)
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
                 }
                 if layout.emptyState {
-                    ContentUnavailableView(
-                        statusFilter?.emptyTitle
+                    SessionListPlaceholderView(
+                        placeholder: SessionListPlaceholder.resolve(
+                            hasRows: false,
+                            hasOfflineCopy: false,
+                            catalogPhase: appState.sessionCatalogPhase,
+                            isRefreshing: appState.isRefreshingSessionCatalog,
+                            filteredOutRows: !appState.listedSessions.isEmpty || !appState.listedCronSessions.isEmpty
+                        ),
+                        emptyTitle: statusFilter?.emptyTitle
                             ?? (selectedSource == nil ? AppLocalization.string("No Sessions") : AppLocalization.string("No \(selectedSource!.label) Sessions")),
-                        systemImage: statusFilter?.emptySystemImage ?? "tray",
-                        description: Text(searchText.isEmpty
+                        emptyDescription: searchText.isEmpty
                             ? statusFilter?.emptyDescription ?? AppLocalization.string("Sessions will appear here once created.")
-                            : AppLocalization.string("Try a different search."))
+                            : AppLocalization.string("Try a different search."),
+                        emptySystemImage: statusFilter?.emptySystemImage ?? "tray",
+                        retry: { Task { await appState.refreshSessionCatalog() } }
                     )
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
                 }
 
                 let sections = nestedSessionSections
                 if layout.liveSections && !sections.pinned.isEmpty {
-                    Section("Pinned") {
+                    Section {
                         ForEach(sections.pinned) { node in
                             sessionNestRow(node, depth: 0)
                         }
+                    } header: {
+                        pinnedHeader(count: sections.pinned.count)
                     }
                 }
 
@@ -441,8 +479,22 @@ struct SessionList: View {
                 .presentationDragIndicator(.visible)
                 .environmentObject(appState)
         }
+        .sheet(item: $pinnedOrderTarget) { target in
+            PinnedChatsOrderSheet(profile: target.profile)
+                .environmentObject(appState)
+        }
         .sheet(isPresented: $showArchivedSessions) {
             ArchivedSessionsSheet()
+                .environmentObject(appState)
+        }
+        .sheet(isPresented: $showPinnedReplies) {
+            PinnedRepliesSheet()
+                .environmentObject(appState)
+        }
+        .sheet(isPresented: $showNeedsYou) {
+            NeedsYouSheet(store: appState.needsYou)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
                 .environmentObject(appState)
         }
         .sheet(item: $selectedProject) { project in
@@ -458,13 +510,21 @@ struct SessionList: View {
         .task(id: appState.activeProfile) {
             await appState.refreshProjects()
         }
+        // The list's first read once the connection is up, when the
+        // connect's own catalog sync settled without publishing one.
+        .task(id: "\(appState.activeProfile)|\(appState.isConnected)|\(appState.turnState == .synchronizing)") {
+            await appState.loadSessionCatalogIfNeeded()
+        }
         // Working / Needs input (#454) follow the gateway's live registry
-        // while the list is on screen.
-        .task(id: appState.activeProfile) {
-            while !Task.isCancelled {
-                await appState.refreshLiveSessionStatuses()
-                try? await Task.sleep(for: .seconds(4))
-            }
+        // while the list is on screen, and only while the app is: the loop
+        // ends in the background instead of ticking to no effect.
+        .task(id: "\(appState.activeProfile)|\(scenePhase == .background)") {
+            guard scenePhase != .background else { return }
+            await appState.runChatListPolling()
+        }
+        // Back in the app over the list: an old read is read again.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { appState.chatListBecameActive() }
         }
         .sheet(item: $projectPendingRename) { project in
             RenameSheet(
@@ -540,7 +600,8 @@ struct SessionList: View {
             cronSessions: appState.listedCronSessions,
             source: source,
             category: appState.sessionCategory,
-            isPinned: appState.isSessionPinned
+            isPinned: appState.isSessionPinned,
+            hasVoiceCalls: appState.voiceCallChatFilter()
         )
     }
 
@@ -558,22 +619,32 @@ struct SessionList: View {
     /// The Projects view hides the source filters, so its Pinned section
     /// ignores them and lists pinned chats from every project.
     private var projectsViewPinnedSessions: [SessionSummary] {
-        SidebarPinnedSessions.forProjectsView(
+        appState.arrangePinned(SidebarPinnedSessions.forProjectsView(
             sourceRows(nil),
             query: searchText,
             isPinned: appState.isSessionPinned,
             matches: sessionMatches
-        )
+        ), session: { $0 })
     }
 
     private var isSearching: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// The Pinned header, whose touch-and-hold menu reorders the profile in
+    /// use's pinned chats (issue 1354).
+    private func pinnedHeader(count: Int) -> some View {
+        Text(AppLocalization.string("Pinned"))
+            .reorderPinnedChatsMenu(isOn: count > 1) {
+                pinnedOrderTarget = PinnedChatsOrderTarget(profile: appState.activeProfile)
+            }
+    }
+
     /// A search that only matches pinned chats shows them without a "No
     /// Matching Projects" state under them.
     @ViewBuilder
     private func projectContent(hasPinnedSessions: Bool) -> some View {
+        let unreadProjects = appState.projectsWithUnread()
         if appState.projectsLoading && displayedProjects.isEmpty {
             ProgressView("Loading projects…")
                 .frame(maxWidth: .infinity, minHeight: 140)
@@ -586,7 +657,7 @@ struct SessionList: View {
                 isSearching ? AppLocalization.string("No Matching Projects") : AppLocalization.string("No Projects"),
                 systemImage: "folder",
                 description: Text(!isSearching
-                    ? AppLocalization.string("Projects created in Hermes Desktop will appear here.")
+                    ? AppLocalization.string("Projects you make here or in Hermes Desktop show here.")
                     : AppLocalization.string("Try a different search."))
             )
         } else {
@@ -596,10 +667,11 @@ struct SessionList: View {
                         Haptics.light()
                         selectedProject = project
                     } label: {
-                        ProjectRow(project: project)
+                        ProjectRow(project: project, isUnread: unreadProjects.contains(project.id))
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityValue(unreadProjects.contains(project.id) ? AppLocalization.string("Unread") : "")
                     .accessibilityHint(appState.isProjectEditable(project)
                         ? AppLocalization.string("Opens the conversations in this project. Swipe or touch and hold to rename or delete it.")
                         : AppLocalization.string("Opens the conversations in this project."))
@@ -621,12 +693,15 @@ struct SessionList: View {
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if appState.isProjectEditable(project) {
-                            Button(role: .destructive) {
+                            // Not a destructive role: that removes the row before the
+                            // confirmation is answered, and on a Mac it can blank the list (#1364).
+                            Button {
                                 Haptics.warning()
                                 projectPendingDeletion = project
                             } label: {
                                 Label(AppLocalization.string("Delete"), systemImage: "trash")
                             }
+                            .tint(.red)
                             .disabled(appState.isProjectMutationInFlight)
                             Button {
                                 Haptics.selection()
@@ -664,13 +739,14 @@ struct SessionList: View {
     /// A search or a status filter is a lookup, not a browse: it flattens
     /// the list to the matching rows.
     private var nestedSessionSections: (pinned: [SessionNesting.Node], recent: [SessionNesting.Node]) {
-        SessionNesting.sections(
+        let sections = SessionNesting.sections(
             displayedSessions,
             query: searchText,
             statusFilterActive: statusFilter != nil,
             isPinned: appState.isSessionPinned,
             parentKeyOf: appState.sessionNestingParentKey
         )
+        return (appState.arrangePinnedNodes(sections.pinned), sections.recent)
     }
 
     private var sourceFilters: some View {
@@ -729,9 +805,9 @@ struct SessionList: View {
                     Text(AppLocalization.string("Status"))
                 }
                 Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.bold))
+                    .scaledFont(.caption2.weight(.bold))
             }
-            .font(.caption.weight(.semibold))
+            .scaledFont(.caption.weight(.semibold))
             .foregroundStyle(selected == nil ? Color.secondary : Color.conduitBackgroundColor)
             .padding(.horizontal, 11).padding(.vertical, 7)
             .background(selected?.color ?? Color.primary.opacity(0.07), in: Capsule())
@@ -749,7 +825,7 @@ struct SessionList: View {
         Button { withAnimation(ConduitMotion.response) { Haptics.selection()
                 setSelectedSource(source) } } label: {
             Text("\(title) \(String(count))")
-                .font(.caption.weight(.semibold))
+                .scaledFont(.caption.weight(.semibold))
                 .foregroundStyle(selectedSource == source ? Color.conduitBackgroundColor : .secondary)
                 .padding(.horizontal, 11).padding(.vertical, 7)
                 .background(selectedSource == source ? Color.conduitAccent : Color.primary.opacity(0.07), in: Capsule())
@@ -803,7 +879,7 @@ struct SessionList: View {
         } label: {
             SessionRow(
                 session: session,
-                isSelected: session.id == appState.activeSessionId,
+                isSelected: appState.isOpenChatRow(session),
                 isPinned: appState.isSessionPinned(session),
                 isUnread: nest?.isUnread ?? appState.isSessionUnread(session),
                 liveStatus: nest?.liveStatus ?? appState.sessionLiveStatus(session),
@@ -839,7 +915,8 @@ struct SessionList: View {
                         session: session,
                         nest: nest,
                         onRename: { sessionPendingRename = session },
-                        onDelete: { sessionPendingDeletion = session }
+                        onDelete: { sessionPendingDeletion = session },
+                        onReorderPinned: { pinnedOrderTarget = PinnedChatsOrderTarget(profile: appState.rowProfile(session)) }
                     )
                 }
             }
@@ -869,12 +946,15 @@ struct SessionList: View {
                     .tint(.orange)
                     .disabled(appState.isSessionMutationInFlight(session))
 
-                    Button(role: .destructive) {
+                    // Not a destructive role: that removes the row before the
+                    // confirmation is answered, and on a Mac it can blank the list (#1364).
+                    Button {
                         Haptics.warning()
                         sessionPendingDeletion = session
                     } label: {
                         Label(AppLocalization.string("Delete"), systemImage: "trash")
                     }
+                    .tint(.red)
                     .disabled(appState.isSessionMutationInFlight(session))
                 }
             }
@@ -988,7 +1068,7 @@ struct SessionList: View {
                 // The count keeps its slot while expanded, so the chevron
                 // doesn't jump sideways on the toggle.
                 Text(String(node.descendantCount))
-                    .font(.caption2.weight(.semibold))
+                    .scaledFont(.caption2.weight(.semibold))
                     .dynamicTypeSize(...DynamicTypeSize.listRowCap)
                     .foregroundStyle(Color.conduitAccent)
                     .padding(.horizontal, 6)
@@ -996,7 +1076,7 @@ struct SessionList: View {
                     .background(Color.conduitAccent.opacity(0.15), in: Capsule())
                     .opacity(isExpanded ? 0 : 1)
                 Image(systemName: "chevron.right")
-                    .font(.caption.weight(.bold))
+                    .scaledFont(.caption.weight(.bold))
                     .conduitFixedGlyph()
                     .foregroundStyle(Color.secondary.opacity(0.6))
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
@@ -1021,7 +1101,7 @@ private struct SessionFilterOrderSheet: View {
 
     var body: some View {
         NavigationStack {
-            List {
+            ConduitList {
                 Section {
                     ForEach(appState.sessionFilterOrder, id: \.self) { source in
                         Label(source.label, systemImage: source.iconName)
@@ -1090,7 +1170,7 @@ struct ArchivedSessionsSheet: View {
                                         }
                                     } label: {
                                         Image(systemName: "arrow.uturn.backward")
-                                            .font(.caption.weight(.bold))
+                                            .scaledFont(.caption.weight(.bold))
                                             .frame(width: 34, height: 34)
                                     }
                                     .buttonStyle(.plain)
@@ -1102,7 +1182,7 @@ struct ArchivedSessionsSheet: View {
                                         sessionPendingDeletion = session
                                     } label: {
                                         Image(systemName: "trash")
-                                            .font(.caption.weight(.bold))
+                                            .scaledFont(.caption.weight(.bold))
                                             .frame(width: 34, height: 34)
                                     }
                                     .buttonStyle(.plain)
@@ -1183,7 +1263,7 @@ struct SessionRow: View {
     var body: some View {
         HStack(spacing: 11) {
             Image(systemName: icon.iconName)
-                .font(.caption.weight(.semibold))
+                .scaledFont(.caption.weight(.semibold))
                 .conduitFixedGlyph()
                 .foregroundStyle(icon.color)
                 .frame(width: 30, height: 30)
@@ -1191,7 +1271,7 @@ struct SessionRow: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(session.title)
-                    .font(.subheadline.weight(isUnread ? .semibold : .medium))
+                    .scaledFont(.subheadline.weight(isUnread ? .semibold : .medium))
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
                 // Stacked at large text so the model doesn't truncate the time.
                 Group {
@@ -1207,7 +1287,7 @@ struct SessionRow: View {
                         }
                     }
                 }
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(.secondary)
             }
 
@@ -1215,7 +1295,7 @@ struct SessionRow: View {
             switch liveStatus {
             case .needsInput?:
                 Image(systemName: "exclamationmark.bubble.fill")
-                    .font(.caption.weight(.bold))
+                    .scaledFont(.caption.weight(.bold))
                     .foregroundStyle(SessionStatusFilter.needsInput.color)
                     .accessibilityLabel(SessionStatusFilter.needsInput.title)
             case .working?:
@@ -1234,18 +1314,18 @@ struct SessionRow: View {
             }
             if isVoiceJob, icon != .voiceJob {
                 Image(systemName: "waveform")
-                    .font(.caption2.weight(.bold))
+                    .scaledFont(.caption2.weight(.bold))
                     .foregroundStyle(Color.conduitAura)
                     .accessibilityLabel("Started from voice")
             }
             if isPinned {
                 Image(systemName: "pin.fill")
-                    .font(.caption2.weight(.bold))
+                    .scaledFont(.caption2.weight(.bold))
                     .foregroundStyle(.conduitAccent)
             }
             if showsDisclosureIndicator {
                 Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.bold))
+                    .scaledFont(.caption2.weight(.bold))
                     .foregroundStyle(isSelected ? Color.conduitAccent : Color.secondary.opacity(0.45))
             }
         }
@@ -1298,6 +1378,9 @@ struct SessionActionMenuItems: View {
     let onDelete: () -> Void
     /// Runs after a mutation that changes which list the row belongs in.
     var onChanged: () -> Void = {}
+    /// Opens Reorder pinned chats for a pinned row (issue 1354); nil where
+    /// the row isn't in a Pinned section (a chat's title, a project page).
+    var onReorderPinned: (() -> Void)? = nil
 
     var body: some View {
         Button {
@@ -1317,10 +1400,31 @@ struct SessionActionMenuItems: View {
             Label(appState.isSessionPinned(session) ? AppLocalization.string("Unpin") : AppLocalization.string("Pin"), systemImage: appState.isSessionPinned(session) ? "pin.slash" : "pin")
         }
 
+        if let onReorderPinned, appState.isSessionPinned(session) {
+            Button {
+                Haptics.selection()
+                // Next turn, as Rename: the sheet waits for the menu to close.
+                DispatchQueue.main.async { onReorderPinned() }
+            } label: {
+                Label(AppLocalization.string("Reorder pinned chats"), systemImage: "arrow.up.arrow.down")
+            }
+        }
+
+        // Only V2's Chats list has the Starred filter that lists them (#757).
+        if V2ShellPreference.isOn {
+            Button {
+                Haptics.light()
+                appState.toggleSessionStarred(session)
+            } label: {
+                Label(appState.isSessionStarred(session) ? AppLocalization.string("Unstar") : AppLocalization.string("Star"), systemImage: appState.isSessionStarred(session) ? "star.slash" : "star")
+            }
+        }
+
         ReadStateToggleButton(session: session, nest: nest)
 
-        // A cron run keeps the job's workspace (#485).
-        if session.source != .cron {
+        // A cron run keeps the job's workspace (#485). Another profile's
+        // chat in All would land in this profile's projects.
+        if session.source != .cron && !appState.isOtherProfileRow(session) {
             MoveToProjectMenu(session: session, excludingProjectID: excludingProjectID, onMoved: onChanged)
         }
 
@@ -1482,28 +1586,38 @@ struct MoveToProjectMenu: View {
 
 private struct ProjectRow: View {
     let project: ProjectSummary
+    /// A chat in the project has a reply the user hasn't seen (issue 1496).
+    var isUnread = false
 
     var body: some View {
         HStack(spacing: 11) {
             Image(systemName: project.isHome ? "house.fill" : "folder.fill")
-                .font(.caption.weight(.semibold))
+                .scaledFont(.caption.weight(.semibold))
                 .conduitFixedGlyph()
                 .foregroundStyle(project.isHome ? Color.conduitAccent : .orange)
                 .frame(width: 30, height: 30)
                 .background((project.isHome ? Color.conduitAccent : .orange).opacity(0.13), in: Circle())
+                .overlay(alignment: .topTrailing) {
+                    if isUnread {
+                        Circle()
+                            .fill(Color.conduitAccent)
+                            .frame(width: 9, height: 9)
+                            .offset(x: 1, y: -1)
+                    }
+                }
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(project.title)
-                    .font(.subheadline.weight(.medium))
+                    .scaledFont(.subheadline.weight(.medium))
                     .lineLimit(1)
                 Text("\(project.sessionCount) conversations")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             }
 
             Spacer(minLength: 0)
             Image(systemName: "chevron.right")
-                .font(.caption2.weight(.bold))
+                .scaledFont(.caption2.weight(.bold))
                 .foregroundStyle(Color.secondary.opacity(0.45))
         }
         .padding(.horizontal, 12)
@@ -1523,6 +1637,9 @@ private struct ProjectSessionsSheet: View {
     @Environment(\.dismiss) private var dismiss
     let project: ProjectSummary
     @State private var detail: ProjectSessionDetail?
+    /// The profile the chats shown were read through: a switch while the
+    /// sheet is open (CarPlay, a widget) doesn't rename them.
+    @State private var detailProfile: String?
     @State private var isLoading = true
     @State private var sessionPendingDeletion: SessionSummary?
     @State private var sessionPendingRename: SessionSummary?
@@ -1532,6 +1649,16 @@ private struct ProjectSessionsSheet: View {
             ZStack {
                 ConduitBackdrop()
                 List {
+                    // Whose chats these are: the sheet lists one profile's
+                    // (issue 1761), once a read has listed them.
+                    if detail != nil, ProjectProfileLabel.shows(in: appState) {
+                        ProjectProfileLabel(profile: detailProfile)
+                            .scaledFont(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .accessibilityElement(children: .combine)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                    }
                     if isLoading {
                         ProgressView(AppLocalization.string("Loading conversations…"))
                             .frame(maxWidth: .infinity, minHeight: 140)
@@ -1561,7 +1688,7 @@ private struct ProjectSessionsSheet: View {
                                     } label: {
                                         SessionRow(
                                             session: session,
-                                            isSelected: session.id == appState.activeSessionId,
+                                            isSelected: appState.isOpenChatRow(session),
                                             isPinned: appState.isSessionPinned(session),
                                             isUnread: appState.isSessionUnread(session),
                                             liveStatus: appState.sessionLiveStatus(session),
@@ -1604,12 +1731,15 @@ private struct ProjectSessionsSheet: View {
                                         .tint(.orange)
                                         .disabled(appState.isSessionMutationInFlight(session))
 
-                                        Button(role: .destructive) {
+                                        // Not a destructive role: that removes the row before the
+                                        // confirmation is answered, and on a Mac it can blank the list (#1364).
+                                        Button {
                                             Haptics.warning()
                                             sessionPendingDeletion = session
                                         } label: {
                                             Label(AppLocalization.string("Delete"), systemImage: "trash")
                                         }
+                                        .tint(.red)
                                         .disabled(appState.isSessionMutationInFlight(session))
                                     }
                                     .listRowBackground(Color.clear)
@@ -1673,12 +1803,22 @@ private struct ProjectSessionsSheet: View {
     private func load() async {
         guard appState.isConnected else { return }
         isLoading = true
-        detail = await appState.loadProjectSessions(project)
+        await loadDetail()
         isLoading = false
     }
 
     private func reloadDetail() {
-        Task { detail = await appState.loadProjectSessions(project) }
+        Task { await loadDetail() }
+    }
+
+    /// Read through the profile in use, and named by it.
+    private func loadDetail() async {
+        let profile = appState.activeProfile
+        // A failed re-read (the profile changed under the sheet) keeps
+        // what it listed rather than blanking it.
+        guard let read = await appState.loadProjectSessions(project) else { return }
+        detail = read
+        detailProfile = profile
     }
 
     private var newConversationPath: String? {
@@ -1705,66 +1845,107 @@ struct ProjectCreateSheet: View {
     @State private var showFolderPicker = false
     @State private var isCreating = false
     @State private var validationMessage: String?
+    /// The project this sheet made when its idea couldn't be saved: the
+    /// sheet then only saves the idea, and the project is no clash.
+    @State private var madeProjectID: String?
+    /// The first folder that project was made with: Save Idea writes there.
+    @State private var madeProjectFolder: String?
+    /// The profile it was made in: Save Idea writes through that one.
+    @State private var madeProjectProfile: String?
+    /// And the Hermes it was made on, which Save Idea writes to or not at all.
+    @State private var madeProjectDashboard: UUID?
+
+    /// A name or folder another project already has (issue 1661).
+    private var clash: String? {
+        madeProjectID == nil ? appState.projectCreationProblem(name: name, folders: folders) : nil
+    }
 
     private var canCreate: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !folders.isEmpty && !isCreating
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !folders.isEmpty && !isCreating && clash == nil
     }
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                ConduitBackdrop()
-                Form {
-                    Section {
-                        TextField("e.g. Skunkworks", text: $name)
-                            .textInputAutocapitalization(.words)
-                    } header: {
-                        Text("Name")
-                    } footer: {
-                        Text("Name a workspace and add one or more folders.")
-                    }
+            // Settings' own page, as Edit Bot (Eric 2026-11-05).
+            SettingsDetailContainer {
+                ConduitSettingsSection(title: AppLocalization.string("Name"), symbol: "folder.badge.plus", tint: .conduitAccent) {
+                    TextField("e.g. Skunkworks", text: $name)
+                        .textFieldStyle(.roundedBorder)
+                        .textInputAutocapitalization(.words)
+                        .disabled(madeProjectID != nil || isCreating)
+                    Text("Name a workspace and add one or more folders.")
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                    // Projects belong to a profile: the new one goes to the
+                    // profile whose projects the list shows, so it shows
+                    // there at once (issue 1661).
+                    LabeledContent(AppLocalization.string("Profile"), value: appState.profileDisplayName(madeProjectProfile ?? appState.activeProfile))
+                    Text(AppLocalization.string("New projects go to the profile in use. To make one in another profile, switch to it first."))
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                }
 
-                    Section("Folders") {
-                        if folders.isEmpty {
-                            Text("No folders added yet.")
-                                .foregroundStyle(.secondary)
-                        }
-                        ForEach(folders, id: \.self) { folder in
+                ConduitSettingsSection(title: AppLocalization.string("Folders"), symbol: "folder", tint: .blue) {
+                    if folders.isEmpty {
+                        Text("No folders added yet.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(folders, id: \.self) { folder in
+                        HStack {
                             Label(folder, systemImage: "folder.fill")
                                 .lineLimit(1)
-                        }
-                        .onDelete { folders.remove(atOffsets: $0) }
-
-                        Button {
-                            validationMessage = nil
-                            guard !appState.projectFolderPickerRoot.isEmpty else {
-                                validationMessage = AppLocalization.string("Open a chat with a workspace before choosing a project folder.")
-                                return
+                            Spacer(minLength: 8)
+                            // Once the project is made, Save Idea writes to
+                            // the folder it was made with.
+                            if madeProjectID == nil {
+                                Button {
+                                    folders.removeAll { $0 == folder }
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                        .frame(minWidth: 44, minHeight: 44)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isCreating)
+                                .accessibilityLabel(Text(AppLocalization.string("Remove \(folder)")))
                             }
-                            showFolderPicker = true
-                        } label: {
-                            Label(AppLocalization.string("Add folder"), systemImage: "plus")
                         }
                     }
-
-                    Section {
-                        TextEditor(text: $idea)
-                            .frame(minHeight: 120)
-                    } header: {
-                        Text("Idea (optional)")
-                    } footer: {
-                        Text("Saved as IDEA.md in the first folder, just like Hermes Desktop.")
-                    }
-
-                    if let validationMessage {
-                        Section {
-                            Label(validationMessage, systemImage: "exclamationmark.triangle")
-                                .foregroundStyle(.orange)
+                    Button {
+                        validationMessage = nil
+                        guard !appState.projectFolderPickerRoot.isEmpty else {
+                            validationMessage = AppLocalization.string("Open a chat with a workspace before choosing a project folder.")
+                            return
                         }
+                        showFolderPicker = true
+                    } label: {
+                        Label(AppLocalization.string("Add folder"), systemImage: "plus")
                     }
+                    .buttonStyle(.settings)
+                    .disabled(madeProjectID != nil || isCreating)
                 }
-                .scrollContentBackground(.hidden)
+
+                ConduitSettingsSection(title: AppLocalization.string("Idea (optional)"), symbol: "lightbulb", tint: .yellow) {
+                    TextField("", text: $idea, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(5...12)
+                        .accessibilityLabel(Text(AppLocalization.string("Idea (optional)")))
+                    Text(AppLocalization.string("Saved as IDEA.md in the first folder, as in Hermes Desktop, unless the folder already has one."))
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let message = clash ?? validationMessage {
+                    Label(message, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 16)
+                }
             }
+            // A failed create's message goes once the name or folders
+            // change, so it never stands in for the current problem.
+            .onChange(of: name) { _, _ in clearStaleMessage() }
+            .onChange(of: folders) { _, _ in clearStaleMessage() }
             .navigationTitle("New Project")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1775,7 +1956,13 @@ struct ProjectCreateSheet: View {
                     Button {
                         Task { await createProject() }
                     } label: {
-                        if isCreating { ProgressView() } else { Text("Create") }
+                        if isCreating {
+                            ProgressView()
+                        } else if madeProjectID != nil {
+                            Text(AppLocalization.string("Save Idea"))
+                        } else {
+                            Text("Create")
+                        }
                     }
                     .disabled(!canCreate)
                 }
@@ -1791,19 +1978,47 @@ struct ProjectCreateSheet: View {
         }
     }
 
+    private func clearStaleMessage() {
+        if madeProjectID == nil { validationMessage = nil }
+    }
+
+    /// The sheet closes only when the project was made with all it was
+    /// given: a message stays on screen with the idea still in its field.
     private func createProject() async {
         isCreating = true
+        if madeProjectID != nil, let folder = madeProjectFolder {
+            let saved = await appState.saveProjectIdea(idea, in: folder,
+                                                       profile: madeProjectProfile ?? appState.activeProfile,
+                                                       dashboard: madeProjectDashboard)
+            isCreating = false
+            if saved { dismiss() }
+            return
+        }
         validationMessage = nil
-        let created = await appState.createProject(name: name, folders: folders, idea: idea)
+        let firstFolder = folders.first
+        let profile = appState.activeProfile
+        let dashboard = appState.activeDashboardID
+        let outcome = await appState.createProject(name: name, folders: folders, idea: idea)
         isCreating = false
-        if created {
+        switch outcome {
+        case .created:
             dismiss()
-        } else if validationMessage == nil {
-            validationMessage = AppLocalization.string("Hermes could not create this project.")
+        case .ideaUnsaved(let projectID, let message):
+            madeProjectID = projectID
+            madeProjectFolder = firstFolder
+            madeProjectProfile = profile
+            madeProjectDashboard = dashboard
+            validationMessage = message
+        case .failed(let message):
+            validationMessage = message ?? AppLocalization.string("Hermes could not create this project.")
         }
     }
 }
 
+/// Hermes' folders, from where the chat works (or Home's): into a folder,
+/// out to the one holding it, and a new folder with the plugin (issue 1661).
+/// The folders are the Hermes host's, so it browses them rather than the
+/// device's own.
 private struct ProjectFolderPickerSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -1813,6 +2028,12 @@ private struct ProjectFolderPickerSheet: View {
     @State private var entries: [WorkspaceEntry] = []
     @State private var isLoading = true
     @State private var errorMessage: String?
+    @State private var asksFolderName = false
+    @State private var newFolderName = ""
+
+    private var parentPath: String? {
+        currentPath.isEmpty ? nil : AppState.parentWorkspacePath(currentPath)
+    }
 
     var body: some View {
         NavigationStack {
@@ -1821,20 +2042,37 @@ private struct ProjectFolderPickerSheet: View {
                 List {
                     Section {
                         Text(currentPath)
-                            .font(.caption)
+                            .scaledFont(.caption)
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
                     if isLoading {
                         ProgressView("Loading folders…")
                             .frame(maxWidth: .infinity, minHeight: 120)
-                    } else if let errorMessage {
-                        ContentUnavailableView(
-                            "Folder unavailable",
-                            systemImage: "folder.badge.questionmark",
-                            description: Text(errorMessage)
-                        )
                     } else {
+                        if let errorMessage {
+                            if currentPath.isEmpty {
+                                ContentUnavailableView(
+                                    "Folder unavailable",
+                                    systemImage: "folder.badge.questionmark",
+                                    description: Text(errorMessage)
+                                )
+                            } else {
+                                // A folder that couldn't open (outside what
+                                // Hermes shows, or not writable) leaves the
+                                // picker where it was.
+                                Label(errorMessage, systemImage: "exclamationmark.triangle")
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        if let parentPath {
+                            Button {
+                                Task { await open(parentPath) }
+                            } label: {
+                                Label(AppLocalization.string("Enclosing Folder"), systemImage: "arrow.turn.left.up")
+                            }
+                            .foregroundStyle(.primary)
+                        }
                         ForEach(entries.filter(\.isDirectory)) { entry in
                             Button {
                                 Task { await open(entry.path) }
@@ -1842,6 +2080,14 @@ private struct ProjectFolderPickerSheet: View {
                                 Label(entry.name, systemImage: "folder.fill")
                             }
                             .foregroundStyle(.primary)
+                        }
+                        if appState.supportsWorkspaceFiles, !currentPath.isEmpty {
+                            Button {
+                                newFolderName = ""
+                                asksFolderName = true
+                            } label: {
+                                Label(AppLocalization.string("New Folder"), systemImage: "folder.badge.plus")
+                            }
                         }
                     }
                 }
@@ -1861,23 +2107,47 @@ private struct ProjectFolderPickerSheet: View {
                     .disabled(currentPath.isEmpty || isLoading)
                 }
             }
+            .alert(AppLocalization.string("New Folder"), isPresented: $asksFolderName) {
+                TextField(AppLocalization.string("Name"), text: $newFolderName)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button(AppLocalization.string("Create")) {
+                    Task { await makeFolder(newFolderName) }
+                }
+                .disabled(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button(AppLocalization.string("Cancel"), role: .cancel) {}
+            }
         }
         .task {
             await open(rootPath)
         }
     }
 
+    /// On a failure the picker stays on the folder it showed.
     private func open(_ path: String) async {
         isLoading = true
         errorMessage = nil
-        currentPath = path
         do {
-            entries = try await appState.workspaceDirectoryEntries(at: path)
+            let listed = try await appState.workspaceDirectoryEntries(at: path)
+            currentPath = path
+            entries = listed
         } catch {
-            entries = []
+            if currentPath.isEmpty { entries = [] }
             errorMessage = UserFacingError.message(for: error)
         }
         isLoading = false
+    }
+
+    /// Made inside the folder shown, then opened, ready to choose.
+    private func makeFolder(_ name: String) async {
+        let folder = currentPath
+        do {
+            if let made = try await appState.makeProjectFolder(named: name, in: folder) {
+                await open(made)
+            }
+        } catch {
+            errorMessage = UserFacingError.message(for: error)
+        }
     }
 }
 
@@ -1905,13 +2175,13 @@ struct CronList: View {
         List {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Scheduled jobs").font(.headline)
+                    Text("Scheduled jobs").scaledFont(.headline)
                     if appState.cronJobs.isEmpty {
-                        Text("\(appState.cronJobs.count) configured").font(.caption).foregroundStyle(.secondary)
+                        Text("\(appState.cronJobs.count) configured").scaledFont(.caption).foregroundStyle(.secondary)
                     } else {
                         // Two counts, so two plurals: each agrees with its own number.
                         Text(verbatim: AppLocalization.string("\(activeJobCount) active") + " · " + AppLocalization.string("\(inactiveJobCount) inactive"))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .scaledFont(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Spacer()
@@ -1944,17 +2214,18 @@ struct CronList: View {
 
             if !jobs.isEmpty {
                 let shown = CronJobFilter.shownJobs(jobs, showAll: showAllJobs, isSearching: isSearching)
+                let zoneLabel = ProfileTimeZone.scheduleZoneLabel(profileSetting: appState.activeProfileTimeZoneSetting)
                 HStack {
-                    Text("Jobs").font(.headline)
+                    Text("Jobs").scaledFont(.headline)
                     Spacer()
                     Text("\(jobs.count)")
-                        .font(.subheadline.weight(.medium))
+                        .scaledFont(.subheadline.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 ForEach(shown) { job in
-                    Button { selectedJob = job } label: { CronJobRow(job: job, notifies: appState.cronJobNotifies(job)) }
+                    Button { selectedJob = job } label: { CronJobRow(job: job, notifies: appState.cronJobNotifies(job), zoneLabel: zoneLabel) }
                         .buttonStyle(.plain)
                         .listRowBackground(Color.clear).listRowSeparator(.hidden)
                 }
@@ -1969,7 +2240,7 @@ struct CronList: View {
                                 : AppLocalization.string("Show \(jobs.count - shown.count) more"),
                             systemImage: showAllJobs ? "chevron.up" : "chevron.down"
                         )
-                        .font(.subheadline.weight(.medium))
+                        .scaledFont(.subheadline.weight(.medium))
                         .foregroundStyle(Color.conduitAccent)
                     }
                     .buttonStyle(.plain)
@@ -1986,7 +2257,7 @@ struct CronList: View {
                             appState.dismissSidebarDrawer()
                             appState.requestOpenSession(session.id)
                         } label: {
-                            SessionRow(session: session, isSelected: session.id == appState.activeSessionId, isPinned: isPinned).contentShape(Rectangle())
+                            SessionRow(session: session, isSelected: appState.isOpenChatRow(session), isPinned: isPinned).contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .accessibilityHint("Swipe or touch and hold for conversation actions.")
@@ -2089,7 +2360,7 @@ enum CronJobFilter: String, CaseIterable, Identifiable {
     }
 
     static func matches(_ job: CronJob, query: String) -> Bool {
-        [job.displayName, job.prompt ?? "", job.scheduleDisplay ?? job.schedule?.display ?? "", job.deliver ?? ""]
+        [job.displayName, job.prompt ?? "", job.scheduleDisplay ?? job.schedule?.display ?? "", CronScheduleText.describe(job, zoneLabel: nil) ?? "", job.deliver ?? ""]
             .contains { $0.localizedCaseInsensitiveContains(query) }
     }
 
@@ -2128,6 +2399,8 @@ private struct CronJobRow: View {
     let job: CronJob
     /// Whether the job's runs notify (the host's per-job setting).
     var notifies = true
+    /// The profile zone the schedule's times are in, when not this iPhone's.
+    var zoneLabel: String? = nil
     var body: some View {
         HStack(spacing: 11) {
             Image(systemName: "clock")
@@ -2135,19 +2408,19 @@ private struct CronJobRow: View {
                 .foregroundStyle(job.isActive ? .green : .secondary)
                 .frame(width: 30, height: 30).background((job.isActive ? Color.green : .secondary).opacity(0.13), in: Circle())
             VStack(alignment: .leading, spacing: 3) {
-                Text(job.displayName).font(.subheadline.weight(.medium)).lineLimit(1)
-                Text(job.scheduleDisplay ?? job.schedule?.display ?? job.schedule?.expr ?? AppLocalization.string("No schedule"))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(job.displayName).scaledFont(.subheadline.weight(.medium)).lineLimit(1)
+                Text(CronScheduleText.describe(job, zoneLabel: zoneLabel) ?? AppLocalization.string("No schedule"))
+                    .scaledFont(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
             if !notifies {
                 Image(systemName: "bell.slash")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
                     .accessibilityLabel(AppLocalization.string("Notifications off"))
             }
-            Text(job.statusLabel).font(.caption2.weight(.semibold)).foregroundStyle(job.isActive ? .green : .secondary)
-            Image(systemName: "chevron.right").font(.caption2.weight(.bold)).foregroundStyle(.tertiary)
+            Text(job.statusLabel).scaledFont(.caption2.weight(.semibold)).foregroundStyle(job.isActive ? .green : .secondary)
+            Image(systemName: "chevron.right").scaledFont(.caption2.weight(.bold)).foregroundStyle(.conduitTertiary)
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
         .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -2162,6 +2435,8 @@ struct CronJobDetailSheet: View {
     /// The job as it was tapped; `job` follows the live list so Pause and
     /// Resume flip the sheet as soon as Hermes answers.
     let selectedJob: CronJob
+    @State private var confirmingDelete = false
+    @State private var editing = false
 
     init(job: CronJob) {
         selectedJob = job
@@ -2169,6 +2444,13 @@ struct CronJobDetailSheet: View {
 
     private var job: CronJob {
         appState.cronJobs.first { $0.id == selectedJob.id } ?? selectedJob
+    }
+
+    /// A run time as a date and time on this iPhone's clock; Hermes' raw
+    /// value when it isn't one Conduit can read.
+    private func runTime(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "—" }
+        return CronScheduleText.parseDate(raw).map { CronScheduleText.absoluteDateText($0) } ?? raw
     }
 
     var body: some View {
@@ -2179,9 +2461,9 @@ struct CronJobDetailSheet: View {
                     VStack(alignment: .leading, spacing: 16) {
                         ConduitSettingsSection(title: job.displayName, symbol: "clock.fill", tint: .conduitAccent) {
                             SettingsMetricRow(label: AppLocalization.string("Status"), value: job.statusLabel)
-                            SettingsMetricRow(label: AppLocalization.string("Schedule"), value: job.scheduleDisplay ?? job.schedule?.display ?? job.schedule?.expr ?? "—")
-                            SettingsMetricRow(label: AppLocalization.string("Next run"), value: job.isFinished ? "—" : job.nextRunAt ?? "—")
-                            SettingsMetricRow(label: AppLocalization.string("Last run"), value: job.lastRunAt ?? "—")
+                            SettingsMetricRow(label: AppLocalization.string("Schedule"), value: CronScheduleText.describe(job, zoneLabel: ProfileTimeZone.scheduleZoneLabel(profileSetting: appState.activeProfileTimeZoneSetting)) ?? "—")
+                            SettingsMetricRow(label: AppLocalization.string("Next run"), value: job.isFinished ? "—" : runTime(job.nextRunAt))
+                            SettingsMetricRow(label: AppLocalization.string("Last run"), value: runTime(job.lastRunAt))
                             SettingsMetricRow(label: AppLocalization.string("Delivery"), value: job.deliver ?? AppLocalization.string("Local"))
                         }
                         if appState.supportsCronNotifications {
@@ -2191,8 +2473,8 @@ struct CronJobDetailSheet: View {
                                     set: { notify in Task { await appState.setCronJobNotifies(notify, for: job) } }
                                 )) {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(AppLocalization.string("Notify me when it runs")).font(.subheadline.weight(.medium))
-                                        Text(AppLocalization.string("Runs that answer [SILENT] never notify.")).font(.caption).foregroundStyle(.secondary)
+                                        Text(AppLocalization.string("Notify me when it runs")).scaledFont(.subheadline.weight(.medium))
+                                        Text(AppLocalization.string("Runs that answer [SILENT] never notify.")).scaledFont(.caption).foregroundStyle(.secondary)
                                     }
                                 }
                                 .tint(.conduitAccent)
@@ -2211,7 +2493,11 @@ struct CronJobDetailSheet: View {
                                 .frame(minHeight: 48)
                                 .conduitGlassControl(cornerRadius: 16, tint: .orange.opacity(0.18))
                             }
-                            Button { Task { _ = await appState.performCronAction(.trigger, for: job); await appState.loadCronRuns(for: job) } } label: {
+                            Button { Task {
+                                _ = await appState.performCronAction(.trigger, for: job)
+                                // Not if the sheet closed and another job's opened meanwhile.
+                                if appState.cronRunsJobID == job.id { await appState.loadCronRuns(for: job) }
+                            } } label: {
                                 Label(appState.cronJobActionID == job.id ? AppLocalization.string("Working…") : AppLocalization.string("Run now"), systemImage: "play.fill")
                                     .frame(maxWidth: .infinity)
                                     .foregroundStyle(Color.white)
@@ -2220,15 +2506,37 @@ struct CronJobDetailSheet: View {
                             .frame(minHeight: 48)
                             .conduitGlassControl(cornerRadius: 16, tint: .conduitAccent, prominent: true)
                         }
-                        .font(.subheadline.weight(.semibold))
+                        .scaledFont(.subheadline.weight(.semibold))
+                        Button { editing = true } label: {
+                            Label(AppLocalization.string("Edit job"), systemImage: "pencil").frame(maxWidth: .infinity)
+                        }
+                        .disabled(appState.cronJobActionID != nil || appState.dashboardTicketBridge == nil)
+                        .frame(minHeight: 48)
+                        .conduitGlassControl(cornerRadius: 16)
+                        .scaledFont(.subheadline.weight(.semibold))
+                        Button(role: .destructive) { confirmingDelete = true } label: {
+                            Label(AppLocalization.string("Delete job"), systemImage: "trash").frame(maxWidth: .infinity)
+                        }
+                        .foregroundStyle(.red)
+                        .disabled(appState.cronJobActionID != nil)
+                        .frame(minHeight: 48)
+                        .conduitGlassControl(cornerRadius: 16, tint: .red.opacity(0.14))
+                        .scaledFont(.subheadline.weight(.semibold))
                         if let prompt = job.prompt, !prompt.isEmpty {
-                            ConduitSettingsSection(title: AppLocalization.string("Prompt"), symbol: "text.quote", tint: .conduitAura) { Text(prompt).textSelection(.enabled).font(.callout) }
+                            ConduitSettingsSection(title: AppLocalization.string("Prompt"), symbol: "text.quote", tint: .conduitAura) { Text(prompt).textSelection(.enabled).scaledFont(.callout) }
                         }
                         ConduitSettingsSection(title: AppLocalization.string("Run history"), symbol: "clock.arrow.circlepath", tint: .conduitAura) {
-                            if appState.cronRuns.isEmpty { Text("This job has not run yet.").font(.footnote).foregroundStyle(.secondary) }
-                            ForEach(appState.cronRuns) { run in
+                            if appState.cronRunsJobID == job.id, let failure = appState.cronRunsFailure {
+                                Text(failure).scaledFont(.footnote).foregroundStyle(.secondary)
+                            } else if !appState.cronRunsLoaded || appState.cronRunsJobID != job.id {
+                                ProgressView().frame(maxWidth: .infinity, alignment: .leading)
+                                    .accessibilityLabel(AppLocalization.string("Loading \(AppLocalization.string("Run history"))…"))
+                            } else if appState.cronRuns.isEmpty {
+                                Text("This job has not run yet.").scaledFont(.footnote).foregroundStyle(.secondary)
+                            }
+                            ForEach(appState.cronRunsJobID == job.id ? appState.cronRuns : []) { run in
                                 Button { appState.dismissSidebarDrawer(); dismiss(); appState.requestOpenSession(run.id) } label: {
-                                    HStack { VStack(alignment: .leading) { Text(run.title ?? run.preview ?? run.id).lineLimit(1); Text(run.model ?? "Hermes").font(.caption).foregroundStyle(.secondary) }; Spacer(); Text(run.lastActive.map(String.init) ?? "").font(.caption2).foregroundStyle(.tertiary) }
+                                    HStack { VStack(alignment: .leading) { Text(run.title ?? run.preview ?? run.id).lineLimit(1); Text(run.model ?? "Hermes").scaledFont(.caption).foregroundStyle(.secondary) }; Spacer(); Text(run.lastActive.map(String.init) ?? "").scaledFont(.caption2).foregroundStyle(.conduitTertiary) }
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -2241,6 +2549,22 @@ struct CronJobDetailSheet: View {
             .safeAreaInset(edge: .top, spacing: 0) {
                 ConduitSheetHeader(title: AppLocalization.string("Scheduled job"), close: { dismiss() })
             }
+        }
+        .sheet(isPresented: $editing) {
+            CronJobEditorSheet(target: .edit(job))
+                .environmentObject(appState)
+        }
+        .alert("Delete scheduled job?", isPresented: $confirmingDelete) {
+            Button("Delete", role: .destructive) {
+                Task {
+                    let deleted = await appState.deleteCronJob(job)
+                    Haptics.mutationCompleted(deleted)
+                    if deleted { dismiss() }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(AppLocalization.string("This removes \(job.displayName) from Hermes, so it won't run again. Chats from its past runs are kept."))
         }
         .task {
             async let runs: Void = appState.loadCronRuns(for: job)
@@ -2260,7 +2584,8 @@ enum SidebarSourceRows {
         cronSessions: [SessionSummary],
         source: SessionSource?,
         category: (SessionSummary) -> SessionSource,
-        isPinned: (SessionSummary) -> Bool
+        isPinned: (SessionSummary) -> Bool,
+        hasVoiceCalls: (SessionSummary) -> Bool = { _ in false }
     ) -> [SessionSummary] {
         let chats = sessions.filter { !$0.isArchived }
         let runs = cronSessions.filter { !$0.isArchived }
@@ -2269,6 +2594,10 @@ enum SidebarSourceRows {
             return runs.filter(isPinned) + chats
         case .cron?:
             return runs
+        case .voice?:
+            // A chat a call was kept with, or started from, is under Voice
+            // too, so every call is listed there.
+            return chats.filter { category($0) == .voice || hasVoiceCalls($0) }
         case let source?:
             return chats.filter { category($0) == source }
         }
@@ -2317,6 +2646,41 @@ enum SidebarOfflineLayout {
     }
 }
 
+/// The Chats list without rows: loading until the catalog arrives, the
+/// failure with Try Again when the read failed, and the empty state only once
+/// Hermes answered an empty catalog (SessionListPlaceholder).
+struct SessionListPlaceholderView: View {
+    let placeholder: SessionListPlaceholder
+    let emptyTitle: String
+    let emptyDescription: String
+    var emptySystemImage = "tray"
+    let retry: () -> Void
+
+    var body: some View {
+        switch placeholder {
+        case .none:
+            EmptyView()
+        case .loading:
+            ProgressView(AppLocalization.string("Loading chats…"))
+                .frame(maxWidth: .infinity, minHeight: 140)
+        case .failed(let message):
+            ContentUnavailableView {
+                Label(AppLocalization.string("Couldn’t Load Chats"), systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(message)
+            } actions: {
+                Button(AppLocalization.string("Try Again"), action: retry)
+            }
+        case .empty:
+            ContentUnavailableView(
+                emptyTitle,
+                systemImage: emptySystemImage,
+                description: Text(emptyDescription)
+            )
+        }
+    }
+}
+
 /// Renaming a conversation or project. A sheet rather than an alert with a
 /// text field: an alert presented from a row's touch-and-hold menu inside
 /// the sessions drawer could leave its field unable to take typing, then
@@ -2353,7 +2717,7 @@ struct RenameSheet: View {
 
     static func conversation(_ session: SessionSummary, onRename: @escaping @MainActor (String) -> Void) -> RenameSheet {
         RenameSheet(
-            title: AppLocalization.string("Rename conversation"),
+            title: AppLocalization.string("Rename"),
             placeholder: AppLocalization.string("Conversation title"),
             initialText: session.title,
             normalize: { SessionRenameOperation.normalizedTitle($0, currentTitle: session.title) },
@@ -2363,11 +2727,14 @@ struct RenameSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                TextField(placeholder, text: $draft)
-                    .focused($fieldFocused)
-                    .submitLabel(.done)
-                    .onSubmit(commit)
+            SettingsDetailContainer {
+                SettingsCard {
+                    TextField(placeholder, text: $draft)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($fieldFocused)
+                        .submitLabel(.done)
+                        .onSubmit(commit)
+                }
             }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
@@ -2403,5 +2770,19 @@ struct RenameSheet: View {
         isCommitting = true
         dismiss()
         onRename(name)
+    }
+}
+
+/// The persistent sidebar's screen keeps to its column (`leadingColumnContent`);
+/// the drawer, which can span a phone's width, keeps the window's insets.
+private struct PersistentColumnContent: ViewModifier {
+    let isPersistent: Bool
+
+    func body(content: Content) -> some View {
+        if isPersistent {
+            content.leadingColumnContent()
+        } else {
+            content
+        }
     }
 }

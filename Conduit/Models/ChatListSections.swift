@@ -111,3 +111,74 @@ enum ChatListSection: String, CaseIterable, Hashable {
         }
     }
 }
+
+/// Whether the Chats list also shows the chats that live in a project,
+/// which otherwise appear only on the project's page (and in search). A
+/// listed one names its project under the title, as search does.
+enum ProjectChatsInChats: String, CaseIterable, Identifiable {
+    /// Only on the project's page, unless pinned.
+    case hidden
+    /// The ones active today or yesterday.
+    case recent
+    case all
+
+    static let key = "conduit.v2.projectChatsInChats"
+    /// Recent, on every install that hasn't picked one (issue 1583). An
+    /// install from before #1317 kept Off without picking it, which left
+    /// today's project chats out of Chats with no Today to find them under.
+    static let defaultValue = ProjectChatsInChats.recent
+    /// Where #1317 kept that Off. Read no more; cleared at launch.
+    static let retiredDeviceDefaultKey = "conduit.v2.projectChatsDeviceDefault"
+
+    var id: String { rawValue }
+
+    static func stored(_ raw: String?) -> ProjectChatsInChats {
+        raw.flatMap(ProjectChatsInChats.init(rawValue:)) ?? defaultValue
+    }
+
+    /// The choice, or Recent when none was made.
+    static func stored(in defaults: UserDefaults) -> ProjectChatsInChats {
+        stored(defaults.string(forKey: key))
+    }
+
+    /// Whether a project's chat with this last activity is listed. A chat
+    /// without a time isn't recent.
+    func shows(lastActivity: TimeInterval?, now: Date = Date(), calendar: Calendar = .current) -> Bool {
+        switch self {
+        case .hidden: return false
+        case .all: return true
+        case .recent:
+            guard let lastActivity else { return false }
+            let section = ChatListSection.dateSection(for: lastActivity, now: now, calendar: calendar)
+            return section == .today || section == .yesterday
+        }
+    }
+}
+
+/// The projects whose chats Chats leaves out (Filter ▸ Projects), kept per
+/// profile since each profile has its own projects. Chats in no project
+/// (Home's) are one more choice. Saved as profile → project ids.
+enum HiddenChatProjects {
+    static let key = "conduit.v2.hiddenChatProjects"
+    /// Stands for the chats in no project.
+    static let noProject = "~no-project"
+
+    static func ids(in stored: Any?, profile: String) -> Set<String> {
+        Set((stored as? [String: [String]])?[profile] ?? [])
+    }
+
+    /// `stored` with `profile`'s choice replaced; an empty one is dropped.
+    static func setting(_ ids: Set<String>, profile: String, in stored: Any?) -> [String: [String]] {
+        var all = stored as? [String: [String]] ?? [:]
+        all[profile] = ids.isEmpty ? nil : ids.sorted()
+        return all
+    }
+
+    /// Whether a row in `projectID` (nil: in no project) is left out. A
+    /// pinned one stays, since pinning asks for it in Chats.
+    /// `listedWait` is a wait for approval while Needs approval is on: it
+    /// lists every wait, as the amber dot counts them.
+    static func hides(projectID: String?, pinned: Bool, listedWait: Bool = false, hidden: Set<String>) -> Bool {
+        !pinned && !listedWait && hidden.contains(projectID ?? noProject)
+    }
+}

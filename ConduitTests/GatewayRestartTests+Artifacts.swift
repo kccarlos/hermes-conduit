@@ -15,6 +15,55 @@ extension GatewayRestartTests {
         return row
     }
 
+    /// The list as it opens (every kind, unsearched, its first page) is
+    /// kept as Hermes gave it, per store, so it opens on it next time
+    /// (#1533); a chat's own as one chat's of many. A filtered, searched or
+    /// later page isn't, nor an answer the list can't read.
+    func testArtifactsKeepTheListAsItOpens() async throws {
+        var saved: [String: [String: Any]] = [:]
+        let answers = KeptAnswers(
+            kept: { saved[$0] },
+            keep: { route, _, read in
+                let answer = try await read()
+                saved[route] = answer
+                return answer
+            }
+        )
+        var answer: [String: Any] = ["ok": true, "items": [artifactRow([:])], "next_before": 5]
+        var asked: [String] = []
+        let client = ArtifactsClient { path in
+            asked.append(path)
+            return answer
+        }
+        let profile = ArtifactSource(profile: "work", sessionIDs: [])
+        let chat = ArtifactSource(profile: "work", sessionIDs: ["s1"])
+
+        _ = try await client.page(profile, showMissing: false, keptIn: answers)
+        _ = try await client.page(chat, keptIn: answers)
+        _ = try await client.page(profile, filter: .images, showMissing: false, keptIn: answers)
+        _ = try await client.page(profile, query: "map", showMissing: false, keptIn: answers)
+        _ = try await client.page(profile, showMissing: false, before: 5, keptIn: answers)
+
+        let profileRoute = try XCTUnwrap(ArtifactsClient.keptRoute(profile, filter: .all, query: " ", showMissing: false))
+        XCTAssertEqual(profileRoute, asked[0], "the page as it was asked for")
+        XCTAssertEqual(Set(saved.keys), [profileRoute, OfflineChatCacheStore.lastOpenedRoutePrefix + asked[1]])
+        XCTAssertNil(ArtifactsClient.keptRoute(profile, filter: .images, query: "", showMissing: false))
+        XCTAssertNil(ArtifactsClient.keptRoute(profile, filter: .all, query: "map", showMissing: false))
+        let kept = try XCTUnwrap(ArtifactsClient.keptPage(profile, filter: .all, query: "", showMissing: false, in: answers))
+        XCTAssertEqual(kept.items.map(\.name), ["map.png"])
+        XCTAssertEqual(kept.nextBefore, 5)
+        XCTAssertNil(ArtifactsClient.keptPage(profile, filter: .all, query: "", showMissing: true, in: answers),
+                     "showing missing files is another list")
+
+        answer = ["ok": false]
+        do {
+            _ = try await client.page(profile, showMissing: false, keptIn: answers)
+            XCTFail("a malformed answer is refused")
+        } catch {}
+        XCTAssertEqual(ArtifactsClient.keptPage(profile, filter: .all, query: "", showMissing: false, in: answers), kept,
+                       "and not kept over the last one")
+    }
+
     func testArtifactsAskForOneChatByEachOfItsIDs() async throws {
         var asked: [String] = []
         let client = ArtifactsClient { path in
@@ -30,6 +79,66 @@ extension GatewayRestartTests {
         )
         _ = try await client.page(profile: "default")
         XCTAssertEqual(asked.last, "/api/plugins/conduit_push/artifacts?limit=60")
+    }
+
+    func testArtifactsHideMissingFilesUnlessAsked() async throws {
+        var asked: [String] = []
+        let rows = [
+            artifactRow([:]),
+            artifactRow(["exists": false, "path": "/root/gone.pdf", "kind": "document", "name": "gone.pdf"]),
+            artifactRow(["kind": "link", "source": "link", "path": NSNull(), "url": "https://curate.example/r",
+                         "name": "Curate", "exists": false]),
+        ]
+        // An older plugin lists missing files whatever it was asked.
+        let client = ArtifactsClient { path in
+            asked.append(path)
+            return ["ok": true, "items": rows, "next_before": 5]
+        }
+        let hidden = try await client.page(profile: "default", showMissing: false)
+        XCTAssertEqual(asked.last, "/api/plugins/conduit_push/artifacts?limit=60&missing=hide")
+        XCTAssertEqual(hidden.items.map(\.name), ["map.png", "Curate"], "a link has no file to miss")
+        XCTAssertEqual(hidden.nextBefore, 5, "a page the filter emptied still pages on")
+        XCTAssertTrue(hidden.items[1].exists, "a link is never shown as missing")
+        let emptied = try ArtifactsClient.parse(["ok": true, "items": [rows[1]], "next_before": 3], showMissing: false)
+        XCTAssertTrue(emptied.items.isEmpty)
+        XCTAssertEqual(emptied.nextBefore, 3, "a page the filter emptied still pages on")
+        let shown = try await client.page(profile: "default", showMissing: true)
+        XCTAssertEqual(asked.last, "/api/plugins/conduit_push/artifacts?limit=60")
+        XCTAssertEqual(shown.items.map(\.name), ["map.png", "gone.pdf", "Curate"])
+
+        let key = ArtifactsListKey(dashboard: nil, profile: "default", filter: .all, query: "", showMissing: false)
+        let showing = ArtifactsListKey(dashboard: nil, profile: "default", filter: .all, query: "", showMissing: true)
+        XCTAssertNotEqual(key, showing, "the toggle reads the list again")
+        XCTAssertTrue(showing.showsRows(of: key))
+        XCTAssertTrue(ArtifactsListKey(dashboard: nil, profile: "default", filter: .all, query: "").showMissing,
+                      "a key without the setting lists everything, as the host does")
+    }
+
+    func testArtifactListsBelongToTheirDashboard() {
+        let first = UUID()
+        let second = UUID()
+        let onFirst = ArtifactsListKey(dashboard: first, profile: "default", filter: .all, query: "")
+        let onSecond = ArtifactsListKey(dashboard: second, profile: "default", filter: .all, query: "")
+        let imagesOnFirst = ArtifactsListKey(dashboard: first, profile: "default", filter: .images, query: "")
+
+        // Every server has a "default" profile: switching servers reads the list again...
+        XCTAssertNotEqual(onFirst, onSecond)
+        // ...and doesn't leave the other server's rows up while it does.
+        XCTAssertFalse(onSecond.showsRows(of: onFirst))
+        XCTAssertTrue(imagesOnFirst.showsRows(of: onFirst), "another filter keeps the rows up, dimmed")
+
+        XCTAssertNotEqual(
+            ArtifactsListKey.thumbnailCacheKey(dashboard: first, profile: "default", path: "/root/out/map.png"),
+            ArtifactsListKey.thumbnailCacheKey(dashboard: second, profile: "default", path: "/root/out/map.png")
+        )
+        XCTAssertNotEqual(
+            ArtifactsListKey.thumbnailCacheKey(dashboard: first, profile: "default", path: "/root/out/map.png"),
+            ArtifactsListKey.thumbnailCacheKey(dashboard: first, profile: "work", path: "/root/out/map.png")
+        )
+        XCTAssertEqual(
+            ArtifactsListKey.thumbnailCacheKey(dashboard: first, profile: "default", path: "/root/out/map.png"),
+            ArtifactsListKey.thumbnailCacheKey(dashboard: first, profile: "default", path: "/root/out/map.png")
+        )
     }
 
     func testArtifactsParseFilesAndLinksAndSkipBrokenRows() throws {
@@ -101,5 +210,126 @@ extension GatewayRestartTests {
         // A tool call split off message 12 shows the turn before it.
         XCTAssertEqual(ArtifactReveal.rowID(for: 12, in: messages), "u")
         XCTAssertNil(ArtifactReveal.rowID(for: 5, in: messages))
+    }
+
+    func testArtifactsPageMergesBotChatsNewestFirst() throws {
+        func item(_ path: String, _ time: Double) -> ArtifactItem {
+            ArtifactItem(artifactRow(["path": path, "timestamp": time]))!
+        }
+        let sources = [
+            ArtifactSource(profile: "default", sessionIDs: []),
+            ArtifactSource(profile: "atlas", sessionIDs: ["bot-chat"], label: "Atlas", isBotChat: true),
+        ]
+        var feed = ArtifactFeed(sources: sources, pages: [
+            ArtifactPage(items: [item("/w1", 100), item("/w2", 80)], nextBefore: 7),
+            ArtifactPage(items: [item("/b1", 90), item("/b2", 50), item("/w2", 40)], nextBefore: nil),
+        ])
+        // The workspace may still hold rows between 80 and 50, so the bot's
+        // older rows wait for its next page.
+        XCTAssertEqual(feed.items.map(\.id), ["/w1", "/b1", "/w2"])
+        XCTAssertEqual(feed.items[1].otherProfile, "atlas")
+        XCTAssertEqual(feed.items[1].otherProfileLabel, "Atlas")
+        XCTAssertTrue(feed.items[1].isBotChat)
+        XCTAssertNil(feed.items[0].otherProfile)
+        XCTAssertEqual(feed.nextCursor, ArtifactFeed.Cursor(source: 0, before: 7))
+        feed.append(ArtifactPage(items: [item("/w3", 60)], nextBefore: nil), at: ArtifactFeed.Cursor(source: 0, before: 7))
+        XCTAssertNil(feed.nextCursor)
+        XCTAssertEqual(feed.items.map(\.id), ["/w1", "/b1", "/w2", "/w3", "/b2"],
+                       "a file both stores list shows once, at its newest mention")
+        // A stale page doesn't land twice.
+        let before = feed
+        feed.append(ArtifactPage(items: [item("/w9", 10)], nextBefore: nil), at: ArtifactFeed.Cursor(source: 0, before: 7))
+        XCTAssertEqual(feed, before)
+    }
+
+    func testArtifactsFeedReadsAnEmptyStoreBeforeShowingOlderRows() {
+        let sources = [
+            ArtifactSource(profile: "default", sessionIDs: []),
+            ArtifactSource(profile: "atlas", sessionIDs: ["bot-chat"], label: "Atlas", isBotChat: true),
+        ]
+        let feed = ArtifactFeed(sources: sources, pages: [
+            ArtifactPage(items: [], nextBefore: 30),
+            ArtifactPage(items: [ArtifactItem(artifactRow(["path": "/b1"]))!], nextBefore: 9),
+        ])
+        XCTAssertTrue(feed.items.isEmpty, "a page the filter emptied may still hold newer rows")
+        XCTAssertEqual(feed.nextCursor, ArtifactFeed.Cursor(source: 0, before: 30))
+        // A store that couldn't be read adds nothing and pages no further.
+        let partial = ArtifactFeed(sources: sources, pages: [
+            ArtifactPage(items: [ArtifactItem(artifactRow(["path": "/w1"]))!], nextBefore: nil), nil,
+        ])
+        XCTAssertEqual(partial.items.map(\.id), ["/w1"])
+        XCTAssertNil(partial.nextCursor)
+    }
+
+    func testArtifactsOneStoreKeepsTheHostsOrder() {
+        let rows = ["/c", "/a", "/b"].map { ArtifactItem(artifactRow(["path": $0]))! }
+        let feed = ArtifactFeed(sources: [ArtifactSource(profile: "default", sessionIDs: [])],
+                                pages: [ArtifactPage(items: rows, nextBefore: 4)])
+        XCTAssertEqual(feed.items.map(\.id), ["/c", "/a", "/b"])
+        XCTAssertEqual(feed.nextCursor, ArtifactFeed.Cursor(source: 0, before: 4))
+    }
+
+    func testArtifactsNameABotChatInAProfileReadWhole() {
+        let source = ArtifactSource(profile: "atlas", sessionIDs: [], label: "Atlas Work",
+                                    botChatIDs: ["bot-chat"], botLabel: "Atlas")
+        let rows = [
+            ArtifactItem(artifactRow(["path": "/a", "session_id": "bot-chat"]))!,
+            ArtifactItem(artifactRow(["path": "/b", "session_id": "other"]))!,
+        ]
+        let items = ArtifactFeed(sources: [source], pages: [ArtifactPage(items: rows, nextBefore: nil)]).items
+        XCTAssertEqual(items.map(\.isBotChat), [true, false])
+        XCTAssertEqual(items.map(\.otherProfileLabel), ["Atlas", "Atlas Work"])
+        XCTAssertEqual(items.map(\.otherProfile), ["atlas", "atlas"])
+        // The profile in use keeps its rows unlabelled, but its Bot Chat
+        // still goes by the bot.
+        let own = ArtifactSource(profile: "default", sessionIDs: [], botChatIDs: ["bot-chat"], botLabel: "Hermes")
+        let ownItems = ArtifactFeed(sources: [own], pages: [ArtifactPage(items: rows, nextBefore: nil)]).items
+        XCTAssertEqual(ownItems.map(\.isBotChat), [true, false])
+        XCTAssertEqual(ownItems.map(\.otherProfileLabel), ["Hermes", nil])
+        XCTAssertEqual(ownItems.map(\.otherProfile), [nil, nil])
+    }
+
+    /// A Bot Chat has no row in the chat list: its ⋯ menu still finds the
+    /// chat's ids, so Artifacts isn't greyed out. An unlisted chat that isn't
+    /// a bot's has none.
+    func testABotChatsMenuFindsItsArtifactIDs() throws {
+        let suite = "Artifacts.AppState.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {},
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults)
+        )
+        appState.activeSessionId = "unlisted"
+        XCTAssertEqual(appState.activeChatArtifactSessionIDs, [])
+
+        appState.activeSessionId = "bot-runtime"
+        appState.noteBotChatSessionForTesting("bot-runtime", profile: "atlas")
+        XCTAssertEqual(appState.activeChatArtifactSessionIDs, ["bot-runtime"])
+        XCTAssertEqual(appState.artifactSources(for: .chat(appState.activeChatArtifactSessionIDs)).map(\.profile),
+                       ["atlas"])
+    }
+
+    /// A Bot Overview's Artifacts read the bot's whole profile: labelled
+    /// as another profile's unless it's the one in use.
+    func testABotOverviewReadsItsBotsWholeProfile() throws {
+        let suite = "Artifacts.AppState.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {},
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults)
+        )
+        let other = appState.artifactSources(for: .bot("atlas"))
+        XCTAssertEqual(other.map(\.profile), ["atlas"])
+        XCTAssertEqual(other.map(\.sessionIDs), [[]])
+        XCTAssertNotNil(other.first?.label)
+        let own = appState.artifactSources(for: .bot(appState.activeProfile))
+        XCTAssertEqual(own.map(\.profile), [appState.activeProfile])
+        XCTAssertNil(own.first?.label)
     }
 }

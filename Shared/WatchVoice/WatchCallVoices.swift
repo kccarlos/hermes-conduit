@@ -18,8 +18,13 @@ struct WatchCallVoices: Codable, Equatable {
     /// The Watch's voices (WatchVoiceEngine.callVoice).
     enum Voice: String, CaseIterable {
         case geminiLive
+        case qwenLive
         case gptLive
         case grokLive
+        /// The user's own speech server through the host (plugin 0.48).
+        /// A call from Hermes rings the Watch on it too: the speech server
+        /// says why Hermes called, and the host takes the user's answer.
+        case localLive
     }
 
     /// The dashboard and profile the checks were for.
@@ -32,6 +37,9 @@ struct WatchCallVoices: Codable, Equatable {
     /// checked yet isn't known: both ring, as before.
     func rings(engine: String?) -> Bool {
         guard let engine else { return true }
+        // Local Live too: the call says why Hermes called and the host
+        // takes the user's answer to what the chat waits on. What they say
+        // after goes to the Watch call's own chat (Eric, 2026-10-24, #1194).
         return ready[engine] ?? true
     }
 
@@ -64,6 +72,25 @@ struct WatchPhoneContext: Codable, Equatable {
     /// The iPhone's active dashboard: whose main profile a call names when
     /// its push names no dashboard, as the iPhone does.
     var activeDashboardID: String? = nil
+    /// The accent picked in Settings > Appearance (ConduitAccent raw value:
+    /// a preset's name or a custom "#RRGGBB"), which the Watch app draws in.
+    /// Nil from an older iPhone app.
+    var accent: String? = nil
+    /// Whether the active dashboard's notifications are end-to-end
+    /// encrypted (NotificationsEncryption raw value), as its dashboard row
+    /// on the iPhone shows. Nil when they aren't, or from an older iPhone
+    /// app; a value the Watch doesn't know reads as nil.
+    var notificationsEncryption: String? = nil
+
+    /// What the Watch's Settings show for the notifications it mirrors.
+    enum NotificationsEncryption: String {
+        case encrypted
+        case quantumSafe
+    }
+
+    var encryption: NotificationsEncryption? {
+        notificationsEncryption.flatMap(NotificationsEncryption.init(rawValue:))
+    }
 
     static let key = "phoneContext"
 

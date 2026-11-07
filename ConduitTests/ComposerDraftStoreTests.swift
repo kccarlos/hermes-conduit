@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import Conduit
 
@@ -53,6 +54,40 @@ final class ComposerDraftStoreTests: XCTestCase {
         )
     }
 
+    func testComposerRedrawsOnlyWhenWhatItShowsChanges() {
+        let suite = "ComposerDraftStoreTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { return XCTFail("No test defaults") }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        let updates = ComposerUpdates(appState)
+        var sends = 0
+        let subscription = updates.objectWillChange.sink { sends += 1 }
+        defer { subscription.cancel() }
+        func settle() { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        // Hosted runners can stall the main queue past a fixed settle: wait
+        // for the redraw itself, capped at 10 s, then settle once more so an
+        // extra one would still show.
+        func settle(until done: () -> Bool) {
+            let deadline = Date().addingTimeInterval(10)
+            while !done(), Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+            settle()
+        }
+
+        appState.objectWillChange.send()
+        appState.objectWillChange.send()
+        settle()
+        XCTAssertEqual(sends, 0, "a publish that changes nothing the composer shows")
+
+        appState.composerNotice = "Reconnecting"
+        appState.activeAgents = 2
+        settle(until: { sends >= 1 })
+        XCTAssertEqual(sends, 1, "changes in one turn redraw it once")
+
+        appState.showModelPicker = true
+        settle(until: { sends >= 2 })
+        XCTAssertEqual(sends, 2)
+    }
+
     func testPrefillIsForTheOpenChatUntilTheComposerTakesIt() {
         let suite = "ComposerDraftStoreTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suite) else { return XCTFail("No test defaults") }
@@ -74,25 +109,46 @@ final class ComposerDraftStoreTests: XCTestCase {
         XCTAssertEqual(appState.composerPrefillText, "Set up a scheduled check")
     }
 
-    func testFailedSubmissionDoesNotClobberNewerSavedDraftForOriginalKey() {
+    func testAFailedSubmissionJoinsWhatWasTypedSinceInsteadOfBeingLost() {
         let store = ComposerDraftStore(capacity: 12)
         let key = ComposerBar.composerDraftKey(for: "session-a", profile: "default")
-        let originalSubmittedDraft = ComposerDraft(text: "old submitted draft", attachments: [])
-        let newerDraft = ComposerDraft(text: "newer saved draft", attachments: [
-            Attachment(
-                id: "newer-attachment",
-                name: "newer.png",
-                uri: "file:///tmp/newer.png",
-                mimeType: "image/png",
-                kind: .image
-            )
-        ])
+        let reply = ComposerReplyReference(authorName: "Hermes", text: "Earlier answer")
+        let submittedPhoto = Attachment(
+            id: "submitted-attachment",
+            name: "submitted.png",
+            uri: "file:///tmp/submitted.png",
+            mimeType: "image/png",
+            kind: .image
+        )
+        let newerPhoto = Attachment(
+            id: "newer-attachment",
+            name: "newer.png",
+            uri: "file:///tmp/newer.png",
+            mimeType: "image/png",
+            kind: .image
+        )
+        let failedSubmission = ComposerDraft(text: "old submitted draft", attachments: [submittedPhoto], replyReference: reply)
+        store.save(ComposerDraft(text: "newer saved draft", attachments: [newerPhoto]), for: key)
 
-        store.save(newerDraft, for: key)
+        store.restoreFailedSubmission(failedSubmission, for: key)
 
-        store.saveIfMissing(originalSubmittedDraft, for: key)
+        // Nothing is lost: the failed message first, then what was typed
+        // since, with both photos and the reply it quoted.
+        XCTAssertEqual(store.draft(for: key), ComposerDraft(
+            text: "old submitted draft\n\nnewer saved draft",
+            attachments: [newerPhoto, submittedPhoto],
+            replyReference: reply
+        ))
+    }
 
-        XCTAssertEqual(store.draft(for: key), newerDraft)
+    func testAFailedSubmissionComesBackWhole() {
+        let store = ComposerDraftStore(capacity: 12)
+        let key = ComposerBar.composerDraftKey(for: "session-a", profile: "default")
+        let failedSubmission = ComposerDraft(text: "old submitted draft", attachments: [])
+
+        store.restoreFailedSubmission(failedSubmission, for: key)
+
+        XCTAssertEqual(store.draft(for: key), failedSubmission)
     }
 
     func testSuccessfulSubmissionRemovesOnlyUnchangedSubmittedDraft() {
@@ -405,6 +461,42 @@ final class ComposerDraftStoreTests: XCTestCase {
         store.save(.empty, for: key)
 
         XCTAssertEqual(store.draft(for: key), .empty)
+    }
+
+    func testClosingAChatKeepsTheDraftInTheFieldUnlessTheStoreWasCleared() {
+        let store = ComposerDraftStore()
+        let key = ComposerDraftKey(profile: "default", sessionID: "one")
+        let loadedClearCount = store.clearCount
+
+        // Back from a chat: what's in the field is kept under its draft.
+        XCTAssertEqual(
+            ComposerBar.draftKeyToKeep(
+                loaded: key,
+                loadedClearCount: loadedClearCount,
+                storeClearCount: store.clearCount
+            ),
+            key
+        )
+        XCTAssertNil(
+            ComposerBar.draftKeyToKeep(
+                loaded: nil,
+                loadedClearCount: loadedClearCount,
+                storeClearCount: store.clearCount
+            ),
+            "Nothing loaded yet"
+        )
+
+        // A sign-out or server switch cleared the store: the composer
+        // going away, or handing off to another chat, after it doesn't put
+        // the draft back.
+        store.removeAll()
+        XCTAssertNil(
+            ComposerBar.draftKeyToKeep(
+                loaded: key,
+                loadedClearCount: loadedClearCount,
+                storeClearCount: store.clearCount
+            )
+        )
     }
 
     func testStoreEvictsTheOldestBucketWhenCapacityIsExceeded() {

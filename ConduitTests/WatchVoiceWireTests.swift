@@ -73,6 +73,7 @@ extension HermesVoiceGatewayTimeoutTests {
             .directStart(callID: 7, version: WatchVoiceWire.version),
             .directToken(callID: 7),
             .directTool(callID: 7, call: .init(id: "c1", name: "start_job", arguments: ["instructions": "Check the build"])),
+            .directTool(callID: 7, call: .init(id: "c2", name: "phone_update", arguments: ["id": "e_1"], userWords: "Yes, move it.", userTurn: 4)),
             .directToolCancel(callID: 7, ids: ["c1", "c2"]),
             .directPoll(callID: 7),
             .directEnd(callID: 7, transcript: .init(
@@ -578,8 +579,14 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(WatchJobAnswer.scheduling(name: "start_job", result: ["status": "not_started"]), "WHEN_IDLE")
         XCTAssertNil(WatchJobAnswer.scheduling(name: "list_jobs", result: ["summary": "s"]))
 
-        XCTAssertEqual(WatchJobAnswer.arguments(name: "start_job", ["instructions": "  Check the build "]) as? [String: String],
-                       ["instructions": "Check the build"])
+        let start = WatchJobAnswer.arguments(name: "start_job", ["instructions": "  Check the build "])
+        XCTAssertEqual(start?["instructions"] as? String, "Check the build")
+        // Ordinary work goes to the call's chat; what the user keeps apart doesn't (#1250).
+        XCTAssertEqual(start?["joins_call"] as? Bool, true)
+        XCTAssertEqual(WatchJobAnswer.arguments(name: "start_job", ["instructions": "Quick: check the build"])?["joins_call"] as? Bool, false)
+        XCTAssertEqual(WatchJobAnswer.arguments(name: "start_job", ["instructions": "check the build in the background"])?["joins_call"] as? Bool, false)
+        XCTAssertEqual(WatchJobAnswer.arguments(name: "start_job", ["instructions": "check the lights", "profile": "fam"])?["joins_call"] as? Bool, false)
+        XCTAssertEqual(WatchJobAnswer.arguments(name: "start_job", ["instructions": "Quick question, is the build green?"])?["joins_call"] as? Bool, true)
         XCTAssertNil(WatchJobAnswer.arguments(name: "start_job", ["instructions": " "]))
         XCTAssertEqual(WatchJobAnswer.arguments(name: "cancel_job", ["job_id": "watch-2"]) as? [String: String], ["job_id": "watch-2"])
         XCTAssertEqual(WatchJobAnswer.arguments(name: "cancel_job", [:])?.count, 0)
@@ -633,6 +640,39 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertNil(WatchJobAnswer.news(from: ["ok": false, "status": 403], grantID: "G1"))
         XCTAssertEqual(WatchJobAnswer.news(from: ["ok": true, "news": [] as [Any]], grantID: "G1"),
                        WatchJobAnswer.News(items: [], running: 0, more: false, openApprovals: []))
+    }
+
+    /// hermes-conduit-notifier#232 (N7-3): the card sends back the host's
+    /// fingerprint of what it showed, and an answer the host held back
+    /// because the request changed isn't taken.
+    func testWatchApprovalAnswersNameTheCommandTheCardShowed() throws {
+        let body: [String: Any] = [
+            "ok": true,
+            "news": [["job_id": "watch-1", "title": "Clean", "status": "needs_approval",
+                      "approval": ["request_id": "", "command": "ls build", "description": "List", "fingerprint": "fp-1"]]],
+            "running": 1,
+            "approvals": [["job_id": "watch-1", "request_id": "", "fingerprint": "fp-2"]],
+        ]
+        let news = try XCTUnwrap(WatchJobAnswer.news(from: body, grantID: "G1"))
+        let approval = try XCTUnwrap(news.items.first?.approval)
+        XCTAssertEqual(approval.fingerprint, "fp-1")
+        XCTAssertEqual(news.openApprovals, [.init(jobID: "watch-1", requestID: "", fingerprint: "fp-2")])
+        // A card for a request the host has replaced isn't open any more.
+        XCTAssertNotEqual(WatchJobAnswer.openKey(jobID: approval.jobID, requestID: approval.requestID, fingerprint: approval.fingerprint),
+                          WatchJobAnswer.openKey(jobID: "watch-1", requestID: "", fingerprint: "fp-2"))
+
+        let arguments = WatchJobAnswer.answerArguments(approval, choice: "once")
+        XCTAssertEqual(arguments as? [String: String], ["job_id": "watch-1", "request_id": "", "choice": "once", "fingerprint": "fp-1"])
+        // An older plugin's card has none, and none is sent.
+        var older = approval
+        older.fingerprint = ""
+        XCTAssertNil(WatchJobAnswer.answerArguments(older, choice: "deny")["fingerprint"])
+
+        XCTAssertTrue(WatchJobAnswer.answerTaken(["status": "approved"]))
+        XCTAssertTrue(WatchJobAnswer.answerTaken(["status": "not_pending"]))
+        XCTAssertFalse(WatchJobAnswer.answerTaken(["status": "changed"]))
+        XCTAssertFalse(WatchJobAnswer.answerTaken(["status": "failed"]))
+        XCTAssertFalse(WatchJobAnswer.answerTaken(["error": "Update Conduit"]))
     }
 
     func testWatchVoiceApprovalIsDeclaredAsOnceOrDenyOnly() throws {
@@ -785,6 +825,63 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertTrue(WatchDirectBroker.isRefusedChatTool(DashboardTicketBridgeError.http(status: 400, detail: "The Watch can only be granted web_search, recall_memory, start_job")))
         XCTAssertFalse(WatchDirectBroker.isRefusedChatTool(DashboardTicketBridgeError.http(status: 400, detail: "job_profiles must list at most 32 profiles")))
         XCTAssertFalse(WatchDirectBroker.isRefusedChatTool(DashboardTicketBridgeError.http(status: 400, detail: "The Watch can only be granted web_search, find_chat, read_chat")))
+    }
+
+    /// A Qwen call's grant carries qwen_live_token, which the Watch's
+    /// relay client keeps, so a wrist-down reconnect can mint through the
+    /// relay as a Gemini call does.
+    @MainActor
+    func testWatchRelayClientKeepsTheQwenTokenTool() throws {
+        var grant = Self.watchToolGrant
+        grant.tools = ["web_search", "qwen_live_token"]
+        let client = try XCTUnwrap(WatchToolRelayClient(grant))
+        XCTAssertTrue(client.canRun(WatchLiveToken.qwenTool))
+        XCTAssertFalse(client.canRun(WatchLiveToken.tool))
+        XCTAssertFalse(try XCTUnwrap(WatchToolRelayClient(Self.watchToolGrant)).canRun(WatchLiveToken.qwenTool))
+    }
+
+    /// A token minted while the call ended or the user took back the
+    /// provider's consent never reaches the Watch.
+    @MainActor
+    func testWatchDirectTokenIsDroppedWhenTheCallOrConsentWentDuringTheMint() {
+        XCTAssertNil(WatchDirectBroker.tokenRefusalAfterMint(7, running: 7, ledgerEnded: false, consentMissing: nil))
+        XCTAssertNil(WatchDirectBroker.tokenRefusalAfterMint(7, running: 7, ledgerEnded: nil, consentMissing: nil))
+        XCTAssertEqual(
+            WatchDirectBroker.tokenRefusalAfterMint(7, running: 7, ledgerEnded: false, consentMissing: .qwenLive),
+            VoiceSetupIssue.providerConsentNeeded(.qwenLive).message
+        )
+        XCTAssertEqual(
+            WatchDirectBroker.tokenRefusalAfterMint(7, running: 7, ledgerEnded: false, consentMissing: .geminiLive),
+            VoiceSetupIssue.providerConsentNeeded(.geminiLive).message
+        )
+        XCTAssertEqual(WatchDirectBroker.tokenRefusalAfterMint(7, running: nil, ledgerEnded: true, consentMissing: nil), WatchVoiceStartFailure.ended)
+        XCTAssertEqual(WatchDirectBroker.tokenRefusalAfterMint(7, running: 8, ledgerEnded: false, consentMissing: nil), WatchVoiceStartFailure.ended)
+        XCTAssertEqual(WatchDirectBroker.tokenRefusalAfterMint(7, running: 7, ledgerEnded: true, consentMissing: nil), WatchVoiceStartFailure.ended)
+    }
+
+    /// Each call's live mode survives a restart, so a resumed call's
+    /// token comes from its own provider.
+    @MainActor
+    func testWatchDirectLedgerRestoresQwenAndOtherProviderIdentities() throws {
+        let suite = "WatchDirectLedger.Providers.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let connection = WatchDirectConnection(profile: "work", dashboard: "A")
+        var ledger = WatchDirectCallLedger(defaults: defaults)
+        for (index, mode) in LiveVoiceModeName.all.enumerated() {
+            ledger.begin(UInt32(index), connection: connection, saveCalls: true, mode: mode)
+        }
+        let restarted = WatchDirectCallLedger(defaults: defaults)
+        for (index, mode) in LiveVoiceModeName.all.enumerated() {
+            let call = try XCTUnwrap(restarted.call(UInt32(index)))
+            XCTAssertEqual(call.liveMode, mode)
+            XCTAssertEqual(call.directProvider, mode == .qwenLive ? .qwen : .gemini)
+        }
+        // Old ledgers still decode, retaining the legacy Google token route.
+        ledger.begin(100, connection: connection, saveCalls: true)
+        let legacy = try XCTUnwrap(WatchDirectCallLedger(defaults: defaults).call(100))
+        XCTAssertNil(legacy.liveMode)
+        XCTAssertEqual(legacy.directProvider, .gemini)
     }
 
     /// The phone keeps each Watch call's connection, its end and the
@@ -1003,6 +1100,20 @@ private final class WatchToolRelayStubProtocol: URLProtocol {
 }
 
 extension HermesVoiceGatewayTimeoutTests {
+    /// A change on the iPhone waits for the user's own yes, which a Watch
+    /// call sends with its tool call: one id per turn of one call.
+    func testWatchToolCallsCarryTheUsersWordsForAChangesYes() throws {
+        let older = try JSONSerialization.data(withJSONObject: ["id": "c1", "name": "phone_update", "arguments": ["id": "e_1"]])
+        let decoded = try JSONDecoder().decode(WatchVoiceWire.DirectToolCall.self, from: older)
+        XCTAssertNil(decoded.userWords, "an older Watch app sends none")
+        XCTAssertNil(decoded.userTurn)
+        XCTAssertEqual(WatchDirectBroker.userTurnID(call: 7, turn: 4), WatchDirectBroker.userTurnID(call: 7, turn: 4))
+        XCTAssertNotEqual(WatchDirectBroker.userTurnID(call: 7, turn: 4), WatchDirectBroker.userTurnID(call: 7, turn: 6))
+        XCTAssertNotEqual(WatchDirectBroker.userTurnID(call: 7, turn: 4), WatchDirectBroker.userTurnID(call: 8, turn: 4))
+        XCTAssertEqual(WatchDirectBroker.userTurnID(call: .max, turn: -1), WatchDirectBroker.userTurnID(call: .max, turn: 0))
+        _ = WatchDirectBroker.userTurnID(call: 7, turn: .max)  // a turn too big for the id still makes one
+    }
+
     func testWatchTranscriptCapKeepsTheNewestTurns() {
         let at = Date(timeIntervalSince1970: 0)
         let turns = (0..<5).map {
@@ -1038,6 +1149,142 @@ extension HermesVoiceGatewayTimeoutTests {
             XCTAssertEqual(WatchVoiceWire.decode(WatchVoiceWire.encode(message)), message)
         }
         XCTAssertEqual(VoiceCallEngine.watchBridge(WatchAudioBridgeWire.grok), .grokLive)
+    }
+
+    /// Local Live on the Watch: the start asks for the grant only, the
+    /// answer carries the grant, greeting and end phrases, and the bridge's
+    /// start names a rejoining call's Hermes chat, which "started" gave.
+    func testWatchLocalLiveMessagesAndTheBridgesChat() throws {
+        var grant = Self.watchToolGrant
+        grant.audio = .init(url: "wss://relay.example.test/v1/watch-audio/grant/watch", version: 1, engines: [WatchAudioBridgeWire.localLive])
+        let messages: [WatchVoiceWire.Message] = [
+            .localLiveStart(callID: 4, version: WatchVoiceWire.version),
+            // A call from Hermes the Watch answered on Local Live.
+            .localLiveStart(callID: 4, version: WatchVoiceWire.version, ring: "ring-1"),
+            .localLiveSession(callID: 4, call: .init(grant: grant, greeting: "Hi, I'm listening.", endPhrases: ["bye"])),
+            .localLiveSession(callID: 4, call: .init(grant: grant, greeting: nil)),
+        ]
+        for message in messages {
+            XCTAssertEqual(WatchVoiceWire.decode(WatchVoiceWire.encode(message)), message)
+        }
+        XCTAssertEqual(VoiceCallEngine.watchBridge(WatchAudioBridgeWire.localLive), .localLive)
+
+        let first = try XCTUnwrap(JSONSerialization.jsonObject(with: WatchAudioBridgeWire.start(
+            engine: WatchAudioBridgeWire.localLive, voice: nil, briefing: nil, greeting: nil, history: []
+        )) as? [String: Any])
+        XCTAssertEqual(Set(first.keys), ["type", "engine"])
+        XCTAssertEqual(first["engine"] as? String, "local_live")
+        let rejoin = try XCTUnwrap(JSONSerialization.jsonObject(with: WatchAudioBridgeWire.start(
+            engine: WatchAudioBridgeWire.localLive, voice: nil, briefing: nil, greeting: nil, history: [], resumeSessionID: "chat-1"
+        )) as? [String: Any])
+        XCTAssertEqual(rejoin["resume_session_id"] as? String, "chat-1")
+        XCTAssertEqual(
+            WatchAudioBridgeWire.control(Data(#"{"type":"started","engine":"local_live","voice":null,"input_rate":24000,"output_rate":24000,"session_id":"chat-1","resumed":false}"#.utf8)),
+            .started(.init(engine: "local_live", voice: nil, inputRate: 24_000, outputRate: 24_000, briefingApplied: false, greetingApplied: false, sessionID: "chat-1"))
+        )
+        guard case .started(let grok)? = WatchAudioBridgeWire.control(Data(#"{"type":"started","engine":"grok","input_rate":24000,"output_rate":24000}"#.utf8)) else {
+            return XCTFail("Grok's started")
+        }
+        XCTAssertNil(grok.sessionID)
+    }
+
+    /// A Local Live call that answers Hermes' approvals on the Watch says
+    /// so in its start; the host's request frames read as a card's, Deny
+    /// only unless the host offers once, and the answer names the request.
+    func testWatchLocalLiveApprovalFrames() throws {
+        let start = try XCTUnwrap(JSONSerialization.jsonObject(with: WatchAudioBridgeWire.start(
+            engine: WatchAudioBridgeWire.localLive, voice: nil, briefing: nil, greeting: nil, history: [], approvals: true
+        )) as? [String: Any])
+        XCTAssertEqual(start["approvals"] as? Bool, true)
+
+        let show = Data(#"{"type":"conduit.approval","id":"a1","command":"rm -rf build","description":"Delete the build folder","choices":["once","deny"],"pending":1,"cut":false}"#.utf8)
+        XCTAssertEqual(WatchAudioBridgeWire.approvalFrame(show),
+                       .show(id: "a1", command: "rm -rf build", description: "Delete the build folder", canApproveOnce: true))
+        let denyOnly = Data(#"{"type":"conduit.approval","id":"a2","command":"x","description":"y","choices":["deny"],"pending":2}"#.utf8)
+        XCTAssertEqual(WatchAudioBridgeWire.approvalFrame(denyOnly), .show(id: "a2", command: "x", description: "y", canApproveOnce: false))
+        // Never once for a cut command or with more pending, whatever the choices say.
+        let cut = Data(#"{"type":"conduit.approval","id":"a3","command":"x","description":"y","choices":["once","deny"],"pending":1,"cut":true}"#.utf8)
+        XCTAssertEqual(WatchAudioBridgeWire.approvalFrame(cut), .show(id: "a3", command: "x", description: "y", canApproveOnce: false))
+        let more = Data(#"{"type":"conduit.approval","id":"a4","command":"x","description":"y","choices":["once","deny"],"pending":2}"#.utf8)
+        XCTAssertEqual(WatchAudioBridgeWire.approvalFrame(more), .show(id: "a4", command: "x", description: "y", canApproveOnce: false))
+        XCTAssertEqual(WatchAudioBridgeWire.approvalFrame(Data(#"{"type":"conduit.approval.gone","id":"a1"}"#.utf8)), .gone(id: "a1"))
+        XCTAssertEqual(WatchAudioBridgeWire.approvalFrame(Data(#"{"type":"conduit.approval.done","id":"a1","resolved":true}"#.utf8)),
+                       .done(id: "a1", resolved: true))
+        // The call's own events are none of these.
+        XCTAssertNil(WatchAudioBridgeWire.approvalFrame(Data(#"{"type":"response.done"}"#.utf8)))
+        XCTAssertNil(WatchAudioBridgeWire.approvalFrame(Data(#"{"type":"conduit.approval","command":"no id"}"#.utf8)))
+
+        let answer = try XCTUnwrap(JSONSerialization.jsonObject(with: WatchAudioBridgeWire.approvalAnswer(id: "a1", approve: true)) as? [String: String])
+        XCTAssertEqual(answer, ["type": "conduit.approval.answer", "id": "a1", "choice": "once"])
+        let denied = try XCTUnwrap(JSONSerialization.jsonObject(with: WatchAudioBridgeWire.approvalAnswer(id: "a1", approve: false)) as? [String: String])
+        XCTAssertEqual(denied["choice"], "deny")
+
+        let card = WatchJobAnswer.Approval(grantID: "", jobID: "", title: "Delete the build folder", requestID: "a1",
+                                           command: "rm -rf build", description: "", canApproveOnce: false)
+        XCTAssertTrue(card.isCallRequest)
+        XCTAssertFalse(WatchJobAnswer.Approval(grantID: "G", jobID: "watch-1", title: "t", requestID: "r", command: "c", description: "d").isCallRequest)
+        XCTAssertFalse(WatchJobAnswer.Approval(grantID: "G", jobID: "", title: "t", requestID: "r", command: "c", description: "d").isCallRequest)
+    }
+
+    /// The call's own request on the card: first, ahead of a job's; the
+    /// next one in its place; and a card whose answer couldn't be sent back
+    /// only while the host still holds it.
+    func testWatchCallApprovalsOnTheCard() {
+        let job = WatchJobAnswer.Approval(grantID: "G", jobID: "watch-1", title: "Clean", requestID: "j1", command: "rm x", description: "")
+        var approvals = [job]
+        var calls = WatchCallApprovals()
+        var stream = calls.begin(&approvals)
+
+        XCTAssertTrue(calls.apply(.show(id: "a1", command: "rm -rf build", description: "Delete it", canApproveOnce: true), from: stream, to: &approvals))
+        XCTAssertEqual(approvals.map(\.requestID), ["a1", "j1"], "the call's request comes first")
+        // The same request shown again (its choices changed) is no new tap on the wrist.
+        XCTAssertFalse(calls.apply(.show(id: "a1", command: "rm -rf build", description: "Delete it", canApproveOnce: false), from: stream, to: &approvals))
+        XCTAssertEqual(approvals.first?.canApproveOnce, false)
+        XCTAssertEqual(approvals.count, 2)
+        // The next one takes its place.
+        XCTAssertTrue(calls.apply(.show(id: "a2", command: "ls", description: "List", canApproveOnce: true), from: stream, to: &approvals))
+        XCTAssertEqual(approvals.map(\.requestID), ["a2", "j1"])
+
+        // Tapped (off the screen), then the send failed: back for another try.
+        let tapped = approvals.removeFirst()
+        XCTAssertTrue(calls.restore(tapped, from: stream, to: &approvals))
+        XCTAssertEqual(approvals.map(\.requestID), ["a2", "j1"])
+
+        // Settled by the host while the answer was on its way: stays away.
+        let again = approvals.removeFirst()
+        calls.apply(.done(id: "a2", resolved: true), from: stream, to: &approvals)
+        XCTAssertFalse(calls.restore(again, from: stream, to: &approvals))
+        XCTAssertEqual(approvals.map(\.requestID), ["j1"], "a job's card is next")
+        // Not taken: the host shows it again, so the screen waits for that.
+        calls.apply(.done(id: "a3", resolved: false), from: stream, to: &approvals)
+        XCTAssertEqual(approvals.map(\.requestID), ["j1"])
+        // Withdrawn, then shown again by the host: pending again.
+        calls.apply(.gone(id: "a4"), from: stream, to: &approvals)
+        XCTAssertTrue(calls.settled.contains("a4"))
+        calls.apply(.show(id: "a4", command: "c", description: "d", canApproveOnce: true), from: stream, to: &approvals)
+        XCTAssertFalse(calls.settled.contains("a4"))
+
+        // A newer request on screen keeps a failed send's card away; a job's card is never "restored".
+        XCTAssertFalse(calls.restore(WatchJobAnswer.Approval(grantID: "", jobID: "", title: "t", requestID: "a5", command: "c", description: ""), from: stream, to: &approvals))
+        var fresh = WatchCallApprovals()
+        var other: [WatchJobAnswer.Approval] = []
+        let freshStream = fresh.begin(&other)
+        XCTAssertFalse(fresh.restore(job, from: freshStream, to: &other), "a job's card isn't the call's")
+
+        // A new stream: the host shows it whatever is still pending, and
+        // the replaced stream's late frames count no more.
+        let old = stream
+        stream = calls.begin(&approvals)
+        XCTAssertEqual(approvals.map(\.requestID), ["j1"])
+        XCTAssertTrue(calls.settled.isEmpty)
+        XCTAssertFalse(calls.apply(.show(id: "a6", command: "c", description: "d", canApproveOnce: true), from: old, to: &approvals))
+        XCTAssertEqual(approvals.map(\.requestID), ["j1"], "the old stream's request doesn't claim the card")
+        XCTAssertTrue(calls.apply(.show(id: "a6", command: "c", description: "d", canApproveOnce: true), from: stream, to: &approvals))
+        let shown = approvals.removeFirst()
+        XCTAssertFalse(calls.restore(shown, from: old, to: &approvals), "nor does an answer sent on it")
+        XCTAssertTrue(calls.restore(shown, from: stream, to: &approvals))
+        calls.reset(&approvals)
+        XCTAssertEqual(approvals.map(\.requestID), ["j1"])
     }
 
     /// A Watch call ends on the same spoken goodbye as the phone's call:
@@ -1123,4 +1370,47 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(Int(GrokLiveProtocol.inputSampleRate), 24_000)
         XCTAssertEqual(Int(GrokLiveProtocol.outputSampleRate), 24_000)
     }
+
+    /// #1210: the host counts a job's outcome told once the Watch has it,
+    /// but the Watch says it only at a quiet moment: list_jobs names it
+    /// until then, as the iPhone does.
+    func testWatchListJobsNamesJobsWhoseOutcomeTheWatchHasNotSaid() {
+        let finished = WatchJobAnswer.UnsaidJob(jobID: "b", title: "Check the server", status: "finished")
+        let running = ["ok": "true", "summary": "Book a table is still running.", "job_1": "id=a; title=Book a table; status=running"]
+        let merged = WatchJobAnswer.listing(running, unsaid: [finished])
+        XCTAssertEqual(merged["job_1"], running["job_1"])
+        XCTAssertEqual(merged["job_2"], "id=b; title=Check the server; status=finished")
+        XCTAssertEqual(merged["summary"], "Book a table is still running. Check the server has finished.")
+
+        // The iPhone answers in the app's language.
+        let none = ["summary": "Es laufen keine Hintergrundaufgaben."]
+        let failed = WatchJobAnswer.UnsaidJob(jobID: "c", title: "Send the report", status: "failed")
+        XCTAssertEqual(WatchJobAnswer.listing(none, unsaid: [failed])["summary"], "Send the report failed.")
+
+        // Numbered after the host's highest job, never over one of its own.
+        let gapped = ["summary": "", "job_1": "id=a; title=Book a table; status=running", "job_3": "id=d; title=Tidy up; status=running"]
+        XCTAssertEqual(WatchJobAnswer.listing(gapped, unsaid: [finished])["job_4"], "id=b; title=Check the server; status=finished")
+
+        // Already listed by the host, or an error: left as it is.
+        let listed = ["summary": "Check the server has finished.", "job_1": "id=b; title=Check the server; status=finished"]
+        XCTAssertEqual(WatchJobAnswer.listing(listed, unsaid: [finished]), listed)
+        let error = ["error": "Hermes couldn't run that on the Watch's behalf."]
+        XCTAssertEqual(WatchJobAnswer.listing(error, unsaid: [finished]), error)
+    }
+
+    /// #1210: a job the iPhone runs for a direct Watch call tells the Watch
+    /// which text update carries its outcome, so the Watch keeps it listed
+    /// until said; an older iPhone's answer still decodes.
+    func testDirectToolResultCarriesTheJobsItsTextUpdatesSettle() throws {
+        let news = WatchVoiceWire.DirectNewsJob(text: "[Check the server finished.]", jobID: "b", title: "Check the server", status: "finished")
+        let result = WatchVoiceWire.DirectToolResult(outgoing: [.textWhenIdle(news.text)], runningJobs: 0, newsJobs: [news])
+        let decoded = try JSONDecoder().decode(WatchVoiceWire.DirectToolResult.self, from: JSONEncoder().encode(result))
+        XCTAssertEqual(decoded, result)
+
+        let older = Data(#"{"outgoing":[],"runningJobs":1}"#.utf8)
+        let old = try JSONDecoder().decode(WatchVoiceWire.DirectToolResult.self, from: older)
+        XCTAssertNil(old.newsJobs)
+        XCTAssertEqual(old.runningJobs, 1)
+    }
+
 }

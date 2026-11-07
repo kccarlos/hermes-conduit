@@ -17,6 +17,24 @@ extension GroupChatModelsTests {
         ] as [String: Any]))
     }
 
+    /// Past the room's 50 MB cap a higher Settings limit can't help, so
+    /// the message names the room's cap and doesn't send the user to
+    /// Settings (#935). Under it, the Settings limit is the one that bound.
+    func testRoomTooLargeMessageNamesTheRoomCapWhenItBinds() {
+        let capped = GroupRoomFilesClient.tooLargeMessage(names: ["clip.mov"], preference: 256)
+        XCTAssertTrue(capped.contains("clip.mov") && capped.contains("50"), capped)
+        XCTAssertFalse(capped.contains("Settings"), capped)
+        let cappedMany = GroupRoomFilesClient.tooLargeMessage(names: ["a.mov", "b.mov"], preference: 128)
+        XCTAssertTrue(cappedMany.contains("a.mov") && cappedMany.contains("b.mov") && cappedMany.contains("50"), cappedMany)
+        XCTAssertFalse(cappedMany.contains("Settings"), cappedMany)
+        // A Settings limit equal to the cap: raising it still can't help.
+        let atCap = GroupRoomFilesClient.tooLargeMessage(names: ["clip.mov"], preference: GroupRoomFilesClient.maximumMegabytes)
+        XCTAssertEqual(atCap, capped)
+
+        let preferred = GroupRoomFilesClient.tooLargeMessage(names: ["clip.mov"], preference: 16)
+        XCTAssertEqual(preferred, AttachmentSizeLimit.tooLargeMessage(names: ["clip.mov"], megabytes: 16))
+    }
+
     func testRoomFileReferenceTakesTheHostsRefText() throws {
         let reference = try GroupRoomFilesClient.reference(from: [
             "ok": true, "path": "/h/conduit/room-files/a/photo.jpg", "ref_text": "@file:/h/conduit/room-files/a/photo.jpg",
@@ -138,6 +156,38 @@ extension GroupChatModelsTests {
         XCTAssertNil(GroupRoomPictures.picture(from: ["ok": true, "rev": "2-b", "data_base64": "%%"]))
         XCTAssertEqual(GroupRoomPictures.storedRevision(from: ["ok": true, "rev": "3-c"]), "3-c")
         XCTAssertNil(GroupRoomPictures.storedRevision(from: ["ok": true]))
+    }
+
+    func testARoomPictureChangedDuringARefreshKeepsTheChange() {
+        let old = Data([1]), new = Data([2]), other = Data([3])
+        // The refresh saw r1's old picture and r2 still listed, then the user
+        // set r1's picture and removed r2's before it finished.
+        let merged = GroupRoomPictures.merged(
+            data: ["r1": new, "r3": other, "gone": other],
+            revisions: ["r1": "2-new", "r3": "1-c", "gone": "1-g"],
+            listed: ["r1": "1-old", "r2": "1-b", "r3": "2-c"],
+            fetched: ["r1": (old, "1-old"), "r2": (other, "1-b"), "r3": (new, "2-c")],
+            changed: ["r1", "r2"]
+        )
+        XCTAssertEqual(merged.data["r1"], new, "the picture just set stays")
+        XCTAssertEqual(merged.revisions["r1"], "2-new")
+        XCTAssertNil(merged.data["r2"], "the picture just removed stays removed")
+        XCTAssertNil(merged.revisions["r2"])
+        XCTAssertEqual(merged.data["r3"], new, "an untouched room takes what the refresh fetched")
+        XCTAssertEqual(merged.revisions["r3"], "2-c")
+        XCTAssertNil(merged.data["gone"], "a room the host no longer lists loses its picture")
+    }
+
+    func testARefreshLeavesRoomsWhoseChangeWasStillOnItsWay() {
+        // r1's set was sent before the refresh began and is still on its way;
+        // r2 was set after it began; r3 was changed long before and settled.
+        let changed = GroupRoomPictures.changed(
+            started: ["r1": 1, "r3": 4],
+            generations: ["r1": 1, "r2": 1, "r3": 4],
+            changingAtStart: ["r1"]
+        )
+        XCTAssertEqual(changed, ["r1", "r2"])
+        XCTAssertEqual(GroupRoomPictures.changed(started: ["r3": 4], generations: ["r3": 4], changingAtStart: []), [])
     }
 
     func testDesktopProjectionCarriesTheRoomPictureAndID() {

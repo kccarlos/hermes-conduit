@@ -13,6 +13,7 @@
 //  like a podcast. Only starting a new reply needs the app on screen.
 //
 
+import AVFoundation
 import Combine
 import Foundation
 import UIKit
@@ -31,11 +32,24 @@ final class MessageReadAloudController: ObservableObject {
     /// screen, Control Center, AirPods). The chat button still reads Stop.
     @Published private(set) var isPaused = false
 
+    /// The reply being read, for the floating player (#759). Set from the
+    /// tap until playback settles.
+    struct NowReading: Equatable {
+        let messageID: String
+        let title: String
+    }
+
+    @Published private(set) var nowReading: NowReading?
+    /// The speed the playing reply uses; the player changes it live.
+    @Published private(set) var speed: ReadAloudSpeed = .normal
+
     private let playback: SpeechPlaybackService
     private let reportError: @MainActor (String) -> Void
     /// Read Aloud speed, read when each playback starts so a change in
     /// Settings applies from the next tap.
     private let playbackRate: @MainActor () -> Float
+    /// Saves a speed picked in the player as the Read Aloud setting.
+    private let storeSpeed: @MainActor (ReadAloudSpeed) -> Void
     private var activeGateway: VoiceGatewayService?
     private var speechStream: VoiceSpeechStream?
     private var playbackTask: Task<Void, Never>?
@@ -54,24 +68,54 @@ final class MessageReadAloudController: ObservableObject {
     /// not keep the app running in the background. Internal for tests.
     var pausedStopDelay: Duration = .seconds(10 * 60)
     private var pausedStopTask: Task<Void, Never>?
+    private var routeObserver: NSObjectProtocol?
+    /// Headphones came out while this operation was still opening: its
+    /// first audio starts paused rather than on the speaker.
+    private var pauseWhenAudioStarts: UInt64?
+    /// Dictation, a voice message or a call holds the microphone, or a
+    /// call from Hermes holds the session.
+    private let microphoneIsHeld: @MainActor () -> Bool
 
     init(
         playback: SpeechPlaybackService? = nil,
         gateway: VoiceGatewayService? = nil,
         playbackRate: @escaping @MainActor () -> Float = { ReadAloudSpeed.current().rate },
+        storeSpeed: @escaping @MainActor (ReadAloudSpeed) -> Void = {
+            UserDefaults.standard.set($0.rawValue, forKey: ReadAloudSpeed.preferenceKey)
+        },
         beginBackgroundActivity: (@MainActor (@escaping @MainActor () -> Void) -> @MainActor () -> Void)? = nil,
         nowPlaying: ReadAloudNowPlayingPresenting? = nil,
+        microphoneIsHeld: @escaping @MainActor () -> Bool = {
+            let coordinator = VoiceAudioSessionCoordinator.shared
+            return coordinator.hasCaptureOwner || coordinator.isInNativeCall
+        },
         reportError: @escaping @MainActor (String) -> Void = { _ in }
     ) {
+        self.microphoneIsHeld = microphoneIsHeld
         self.playback = playback ?? AVSpeechPlaybackService()
         self.nowPlaying = nowPlaying ?? SystemReadAloudNowPlaying()
         self.activeGateway = gateway
         self.playbackRate = playbackRate
+        self.storeSpeed = storeSpeed
         self.beginBackgroundActivity = beginBackgroundActivity ?? Self.beginApplicationBackgroundTask
         self.reportError = reportError
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            let reason = raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
+            // Route notifications can arrive off the main thread.
+            Task { @MainActor [weak self] in
+                guard let reason else { return }
+                self?.routeChanged(reason: reason)
+            }
+        }
     }
 
     deinit {
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
         playbackTask?.cancel()
         pausedStopTask?.cancel()
         let end = endBackgroundActivity
@@ -145,8 +189,9 @@ final class MessageReadAloudController: ObservableObject {
             stop()
             return
         }
-        // `MEDIA:` file tags are attachments, not words (#439).
-        let readable = TranscriptDirectives.removingPreviews(from: GatewayMediaTags.removingTags(from: content))
+        // `MEDIA:` file tags are attachments, not words (#439); a Desktop
+        // card is a short note (#1522).
+        let readable = GatewayMediaTags.removingTags(from: TranscriptDirectives.readable(from: content))
         guard !readable.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         // Starting is an on-screen action; a reply already playing is not
         // tied to the foreground and keeps going in the background.
@@ -183,9 +228,10 @@ final class MessageReadAloudController: ObservableObject {
         let generation = operationGeneration
         pausedStopTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
+            // Also when the service settled under the pause (a route change
+            // whose engine wouldn't start): the reply can't sound again.
             guard !Task.isCancelled, let self,
-                  self.isCurrent(generation), self.isPaused,
-                  self.playback.isPaused else { return }
+                  self.isCurrent(generation), self.isPaused else { return }
             self.stop()
         }
         return true
@@ -210,9 +256,33 @@ final class MessageReadAloudController: ObservableObject {
         return true
     }
 
+    /// Headphones taken out (AirPods back in the case, a cable pulled) pause
+    /// the reply rather than carrying on out loud from the speaker, as iOS
+    /// media does; Resume picks it up on the new route. Any other route
+    /// change plays on (#1641). Internal for tests.
+    func routeChanged(reason: AVAudioSession.RouteChangeReason) {
+        guard reason == .oldDeviceUnavailable else { return }
+        if case .preparing = state {
+            pauseWhenAudioStarts = operationGeneration
+            return
+        }
+        pause()
+    }
+
     @discardableResult
     func togglePause() -> Bool {
         isPaused ? resume() : pause()
+    }
+
+    /// The player's speed control (#759): retimes the reply already playing
+    /// and becomes the Read Aloud speed setting for later replies.
+    func setSpeed(_ speed: ReadAloudSpeed) {
+        self.speed = speed
+        storeSpeed(speed)
+        switch state {
+        case .preparing, .playing: playback.changeRate(speed.rate)
+        case .idle, .failed: break
+        }
     }
 
     /// The active stream belongs to the gateway that opened it. A replaced or
@@ -244,6 +314,8 @@ final class MessageReadAloudController: ObservableObject {
         let generation = operationGeneration
         state = .preparing(messageID: messageID)
         nowPlayingTitle = ReadAloudNowPlaying.title(for: content)
+        speed = ReadAloudSpeed.closest(to: playbackRate())
+        nowReading = NowReading(messageID: messageID, title: nowPlayingTitle)
         endBackgroundActivity = beginBackgroundActivity { [weak self] in
             // Time ran out before any audio: the app is about to suspend
             // with the stream still opening. Fail closed rather than leave
@@ -267,20 +339,33 @@ final class MessageReadAloudController: ObservableObject {
             // Pin output-only ownership per operation rather than inheriting
             // whatever intent a shared playback instance last claimed.
             playback.ownershipIntent = .standalonePlayback
-            playback.playbackRate = playbackRate()
+            // Dictation, a voice message or a call taking the microphone
+            // ends the reading, so the microphone never hears it and two
+            // voices never play at once (issue 1770).
+            playback.onTakenOverByCapture = { [weak self] in
+                guard let self, self.isCurrent(generation) else { return }
+                self.stop()
+            }
+            playback.keepsRateAdjustable = true
+            // The player shows one of the Read Aloud speeds, so the reply
+            // plays at exactly that one.
+            playback.playbackRate = ReadAloudSpeed.closest(to: playbackRate()).rate
             let stream = try await gateway.openSpeechStream(
                 onStart: { [weak self] sampleRate in
                     guard let self, self.isCurrent(generation) else { return }
+                    try self.yieldToHeldMicrophone()
                     try self.playback.start(sampleRate: sampleRate)
                     self.transitionToPlaying(messageID: messageID, generation: generation)
                 },
                 onPCM16: { [weak self] data, sampleRate in
                     guard let self, self.isCurrent(generation) else { return }
+                    try self.yieldToHeldMicrophone()
                     _ = try self.playback.enqueuePCM16(data, sampleRate: sampleRate)
                     self.transitionToPlaying(messageID: messageID, generation: generation)
                 },
                 onEncodedAudio: { [weak self] data in
                     guard let self, self.isCurrent(generation) else { return }
+                    try self.yieldToHeldMicrophone()
                     try self.playback.playEncodedAudioData(data)
                     self.transitionToPlaying(messageID: messageID, generation: generation)
                 }
@@ -350,7 +435,21 @@ final class MessageReadAloudController: ObservableObject {
                     return true
                 }
             ))
+            if pauseWhenAudioStarts == generation {
+                pauseWhenAudioStarts = nil
+                pause()
+            }
         }
+    }
+
+    /// Audio that would reach a held microphone ends the reading instead:
+    /// one that opened as dictation started (issue 1770). A cancellation,
+    /// so the gateway never takes it for a Hermes speech failure and falls
+    /// back to the iPhone's voice.
+    private func yieldToHeldMicrophone() throws {
+        guard microphoneIsHeld() else { return }
+        stop()
+        throw CancellationError()
     }
 
     private func fail(messageID: String, message: String, generation: UInt64) {
@@ -364,6 +463,7 @@ final class MessageReadAloudController: ObservableObject {
     private func settle(_ terminal: State) {
         state = terminal
         isPaused = false
+        nowReading = nil
         pausedStopTask?.cancel()
         pausedStopTask = nil
         nowPlaying.end()

@@ -35,6 +35,9 @@ final class ComposerDraftStore {
     private var drafts: [ComposerDraftKey: ComposerDraft] = [:]
     private var order: [ComposerDraftKey] = []
     private var generations: [ComposerDraftKey: UUID] = [:]
+    /// How many times `removeAll` ran: a composer loaded before a clear
+    /// doesn't put its draft back after it.
+    private(set) var clearCount: UInt64 = 0
 
     init(capacity: Int = 12) {
         self.capacity = max(0, capacity)
@@ -72,9 +75,10 @@ final class ComposerDraftStore {
         order.reversed()
     }
 
-    func saveIfMissing(_ draft: ComposerDraft, for key: ComposerDraftKey) {
-        guard drafts[key] == nil else { return }
-        save(draft, for: key)
+    /// A submission that failed goes back into its chat's draft, above
+    /// anything typed there since: neither is lost.
+    func restoreFailedSubmission(_ draft: ComposerDraft, for key: ComposerDraftKey) {
+        save(self.draft(for: key).restoring(draft), for: key)
     }
 
     func migrateDraft(from source: ComposerDraftKey, to destination: ComposerDraftKey) {
@@ -100,6 +104,7 @@ final class ComposerDraftStore {
     }
 
     func removeAll() {
+        clearCount &+= 1
         drafts.removeAll()
         generations.removeAll()
         order.removeAll()

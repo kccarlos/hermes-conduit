@@ -54,6 +54,55 @@ final class AppStateReadAloudTests: XCTestCase {
         harness.readAloudController.stop()
     }
 
+    func testReadAloudIsRefusedDuringACallFromHermes() {
+        let harness = makeHarness(snapshot: ttsOnlySnapshot)
+        let messageA = ChatMessage(id: "msg-a", role: .assistant, content: "Response A", timestamp: "1")
+        XCTAssertNil(harness.appState.readAloudUnavailableReason)
+        let voiceStops = harness.voicePlayback.stopCount
+
+        // Issue 1770: a call's microphone would hear Read Aloud as the user.
+        harness.appState.isNativeHermesCallActive = true
+        harness.appState.toggleReadAloud(message: messageA)
+
+        XCTAssertEqual(harness.appState.readAloudUnavailableReason, "Read aloud can't play during a call.")
+        XCTAssertEqual(harness.appState.errorMessage, "Read aloud can't play during a call.")
+        XCTAssertEqual(harness.readAloudController.state, .idle)
+        XCTAssertEqual(harness.readAloudGateway.openCount, 0)
+        XCTAssertEqual(harness.voicePlayback.stopCount, voiceStops, "the call's voice is left alone")
+        // The gateway stays: the refusal is about the call, not Hermes.
+        harness.appState.refreshReadAloudGateway()
+        XCTAssertNotNil(harness.appState.messageReadAloudController.gateway)
+
+        harness.appState.isNativeHermesCallActive = false
+        XCTAssertNil(harness.appState.readAloudUnavailableReason)
+    }
+
+    func testACallFromHermesStartingEndsAReadingStillOpening() {
+        let harness = makeHarness(snapshot: ttsOnlySnapshot)
+        let messageA = ChatMessage(id: "msg-a", role: .assistant, content: "Response A", timestamp: "1")
+        harness.appState.toggleReadAloud(message: messageA)
+        XCTAssertEqual(harness.readAloudController.state, .preparing(messageID: "msg-a"))
+
+        // Issue 1770: it holds no audio yet, so CallKit wouldn't interrupt it.
+        harness.appState.setNativeHermesCallActive(true)
+
+        XCTAssertEqual(harness.readAloudController.state, .idle)
+        harness.appState.setNativeHermesCallActive(false)
+    }
+
+    func testSpeechTestsRefuseToRunDuringACall() async {
+        let harness = makeHarness(snapshot: ttsOnlySnapshot)
+        harness.appState.isNativeHermesCallActive = true
+
+        let speech = await harness.appState.runVoiceTTSTest()
+        let transcription = await harness.appState.runVoiceASRTest()
+
+        XCTAssertFalse(speech.passed)
+        XCTAssertFalse(transcription.passed)
+        XCTAssertEqual(speech, .failure("End the call to run this test."))
+        harness.appState.isNativeHermesCallActive = false
+    }
+
     func testStoppingActiveReadAloudDoesNotResetVoiceController() async {
         let harness = makeHarness(snapshot: ttsOnlySnapshot)
         let messageA = ChatMessage(id: "msg-a", role: .assistant, content: "Response A", timestamp: "1")
@@ -216,13 +265,7 @@ final class AppStateReadAloudTests: XCTestCase {
         snapshot: VoiceCapabilitySnapshot,
         orderRecorder: CallOrderRecorder? = nil
     ) -> Harness {
-        let suite = "AppStateReadAloudTests.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suite) else {
-            fatalError("Failed to create test UserDefaults suite")
-        }
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suite)
-        }
+        let defaults = makeScratchDefaults("AppStateReadAloudTests")
 
         let appState = AppState(defaults: defaults, loadSavedConnection: false)
         appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
@@ -373,12 +416,15 @@ private final class MockVoiceTranscriber: DeviceSpeechTranscriptionService {
 
 @MainActor
 private final class MockVoiceGateway: VoiceGatewayService {
-    let profile = "default"
+    let profile: String
     private(set) var openCount = 0
     private(set) var streams: [MockVoiceStream] = []
     private let pausesAfterEmission: Bool
 
-    init(pausesAfterEmission: Bool) { self.pausesAfterEmission = pausesAfterEmission }
+    init(pausesAfterEmission: Bool, profile: String = "default") {
+        self.pausesAfterEmission = pausesAfterEmission
+        self.profile = profile
+    }
 
     func transcribe(_ audio: VoiceCapturedAudio) async throws -> String { "transcript" }
 
@@ -428,5 +474,63 @@ private final class MockVoiceStream: VoiceSpeechStream {
         let continuation = appendContinuation
         appendContinuation = nil
         continuation?.resume(throwing: URLError(.cancelled))
+    }
+}
+
+// MARK: - Room bots' own voices
+
+extension AppStateReadAloudTests {
+    func testABotsMessageSpeaksAsItsOwnProfile() {
+        XCTAssertEqual(AppState.readAloudSpeaker(" atlas ", activeProfile: "default"), "atlas")
+        // The active profile, or no profile, keeps the active gateway.
+        XCTAssertNil(AppState.readAloudSpeaker("Default", activeProfile: "default"))
+        XCTAssertNil(AppState.readAloudSpeaker("  ", activeProfile: "default"))
+        XCTAssertNil(AppState.readAloudSpeaker(nil, activeProfile: "default"))
+    }
+
+    func testAKeptBotGatewayLastsOnlyWhileTheSameProfileIsActive() {
+        let speaker = (profile: "atlas", activeProfile: "default")
+        // A capability refresh keeps the bot's gateway mid-message.
+        XCTAssertEqual(AppState.readAloudKeptProfile(speaker: speaker, activeProfile: "default"), "atlas")
+        // After a profile switch it is rebuilt for the new active profile.
+        XCTAssertEqual(AppState.readAloudKeptProfile(speaker: speaker, activeProfile: "work"), "work")
+        XCTAssertEqual(AppState.readAloudKeptProfile(speaker: nil, activeProfile: "default"), "default")
+    }
+
+    func testRoomBotReadSpeaksAsItsProfileUntilAChatReadTakesItBack() async {
+        let harness = makeHarness(snapshot: ttsOnlySnapshot)
+        var built: [String] = []
+        harness.appState.readAloudGatewayFactoryForTesting = { profile in
+            built.append(profile)
+            return MockVoiceGateway(pausesAfterEmission: true, profile: profile)
+        }
+
+        harness.appState.toggleReadAloud(messageID: "room:r:e1", content: "Hello from Atlas", speakingAs: "atlas")
+        XCTAssertEqual(harness.readAloudController.gateway?.profile, "atlas")
+        let botGateway = harness.readAloudController.gateway
+        await awaitUntil("the bot's read to play") {
+            harness.readAloudController.state == .playing(messageID: "room:r:e1")
+        }
+
+        // A capability refresh keeps the bot's gateway, so it isn't cut off.
+        harness.appState.refreshReadAloudGateway()
+        XCTAssertTrue(harness.readAloudController.gateway === botGateway)
+        XCTAssertEqual(harness.readAloudController.state, .playing(messageID: "room:r:e1"))
+
+        // The same bot again reuses it; the active profile's own id doesn't
+        // build a second gateway for itself.
+        harness.appState.toggleReadAloud(messageID: "room:r:e2", content: "More", speakingAs: "atlas")
+        XCTAssertTrue(harness.readAloudController.gateway === botGateway)
+        harness.appState.toggleReadAloud(messageID: "room:r:e3", content: "Me", speakingAs: "Default")
+        XCTAssertEqual(harness.readAloudController.gateway?.profile, "default")
+
+        // A chat read speaks as the active profile.
+        harness.appState.toggleReadAloud(messageID: "room:r:e1", content: "Hello from Atlas", speakingAs: "atlas")
+        let message = ChatMessage(id: "msg-a", role: .assistant, content: "Response A", timestamp: "1")
+        harness.appState.toggleReadAloud(message: message)
+        XCTAssertEqual(harness.readAloudController.gateway?.profile, "default")
+        XCTAssertEqual(built, ["atlas", "default", "atlas", "default"])
+
+        harness.readAloudController.stop()
     }
 }

@@ -305,6 +305,26 @@ final class ChatResumeCoordinatorTests: XCTestCase {
         XCTAssertEqual(ChatResumeStore(defaults: harness.defaults).snapshot(for: key), reading)
     }
 
+    /// Saving writes the defaults, which redraws every `@AppStorage` view,
+    /// so a reading taken mid-scroll waits until the scrolling stops.
+    func testViewportUpdateWaitsForScrollingToStopBeforeSaving() async throws {
+        let harness = makeHarness()
+        let key = ChatScrollSessionKey(profile: "default", sessionID: "stored-a")
+        let reading = ChatScrollSnapshot(anchorMessageID: "anchor-12", followsLatest: false)
+        let scroll = ScrollingFlag()
+
+        harness.coordinator.recordViewport(reading, for: key) { scroll.isScrolling }
+        try await Task.sleep(for: .milliseconds(900))
+        XCTAssertNil(ChatResumeStore(defaults: harness.defaults).snapshot(for: key), "saved mid-scroll")
+
+        scroll.isScrolling = false
+        let deadline = Date().addingTimeInterval(5)
+        while ChatResumeStore(defaults: harness.defaults).snapshot(for: key) == nil, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(ChatResumeStore(defaults: harness.defaults).snapshot(for: key), reading)
+    }
+
     func testPreservingCurrentSessionDoesNotCreateARestorationRequest() {
         let harness = makeHarness()
         let key = ChatScrollSessionKey(profile: "default", sessionID: "stored-a")
@@ -563,6 +583,43 @@ final class ChatResumeCoordinatorTests: XCTestCase {
         return (ChatResumeCoordinator(store: store), store, defaults, suite)
     }
 
+    func testPendingDecisionIncludesAnApprovalWaitingOnTheUser() {
+        func approval(_ id: String, _ status: ApprovalActivity.Status) -> ChatMessage {
+            ChatMessage(
+                id: id, role: .approval, content: "", timestamp: "",
+                approval: ApprovalActivity(sessionId: "default", command: "deploy", description: "Run the deploy?",
+                                           choices: nil, allowPermanent: false, smartDenied: false, status: status)
+            )
+        }
+        XCTAssertEqual(
+            ChatResumeCoordinator.pendingClarifyMessageID(in: [clarifyMessage("question", status: .pending), approval("approval", .pending)]),
+            "approval"
+        )
+        XCTAssertEqual(
+            ChatResumeCoordinator.pendingClarifyMessageID(in: [clarifyMessage("question", status: .pending), approval("approved", .approved)]),
+            "question"
+        )
+    }
+
+    func testPendingDecisionIncludesAnInputCardWaitingOnTheUser() throws {
+        var prompt = try XCTUnwrap(InputPromptActivity.from(
+            requestId: "srq-1", method: "vault.code",
+            params: ["session_id": .string("s1"), "site": .string("example.com")]
+        ))
+        let waiting = ChatMessage(id: "code", role: .inputPrompt, content: "", timestamp: "", inputPrompt: prompt)
+        XCTAssertEqual(
+            ChatResumeCoordinator.pendingClarifyMessageID(in: [clarifyMessage("question", status: .pending), waiting]),
+            "code"
+        )
+        XCTAssertEqual(PendingDecisionKind(message: waiting), .input)
+        prompt.status = .submitted
+        let sent = ChatMessage(id: "sent", role: .inputPrompt, content: "", timestamp: "", inputPrompt: prompt)
+        XCTAssertEqual(
+            ChatResumeCoordinator.pendingClarifyMessageID(in: [clarifyMessage("question", status: .pending), sent]),
+            "question"
+        )
+    }
+
     private func clarifyMessage(
         _ id: String,
         status: ClarifyQuestion.Status
@@ -595,4 +652,9 @@ final class ChatResumeCoordinatorTests: XCTestCase {
             lineageRootId: nil
         )
     }
+}
+
+@MainActor
+private final class ScrollingFlag {
+    var isScrolling = true
 }

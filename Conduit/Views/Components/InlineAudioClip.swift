@@ -159,7 +159,12 @@ final class ChatAudioClipPlayer: NSObject, ObservableObject {
         if lease == nil {
             // Playback still starts if the session can't be claimed: the
             // clip then plays under whatever category is already active.
-            lease = try? coordinator.acquire(.standalonePlayback)
+            // Dictation or a voice message taking the microphone pauses it,
+            // so the recording never hears it (issue 1770).
+            lease = try? coordinator.acquire(.standalonePlayback) { [weak self] in
+                guard self?.clip?.phase == .playing else { return }
+                self?.pause()
+            }
         }
         guard player.play() else {
             releaseLease()
@@ -261,6 +266,9 @@ struct InlineAudioClipView: View {
     var openFailed = false
     let load: () async -> Data?
     let openFull: () -> Void
+    /// The expand button; a voice message still being previewed has no
+    /// full-screen view.
+    var showsOpenButton = true
     @ScaledMetric(relativeTo: .body) private var playSize: CGFloat = 40
     @ScaledMetric(relativeTo: .footnote) private var expandSize: CGFloat = 32
 
@@ -279,7 +287,7 @@ struct InlineAudioClipView: View {
             playButton
             VStack(alignment: .leading, spacing: 3) {
                 Text(verbatim: name)
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                     .foregroundStyle(primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -287,31 +295,37 @@ struct InlineAudioClipView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityElement(children: .combine)
-            Button {
-                // Quick Look has its own player; don't play underneath it.
-                player.stop(id: id)
-                openFull()
-            } label: {
-                Group {
-                    if opening {
-                        ProgressView().tint(secondary)
-                    } else {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.footnote.weight(.semibold))
-                    }
-                }
-                .foregroundStyle(secondary)
-                .frame(width: expandSize, height: expandSize)
-                .contentShape(Rectangle())
+            if showsOpenButton {
+                openButton
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(Text("Open full screen"))
-            .accessibilityHint(Text("Opens full screen with save and share"))
         }
         .padding(10)
         .frame(maxWidth: 360, alignment: .leading)
         .background(background)
         .onDisappear { player.stop(id: id) }
+    }
+
+    private var openButton: some View {
+        Button {
+            // Quick Look has its own player; don't play underneath it.
+            player.stop(id: id)
+            openFull()
+        } label: {
+            Group {
+                if opening {
+                    ProgressView().tint(secondary)
+                } else {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .scaledFont(.footnote.weight(.semibold))
+                }
+            }
+            .foregroundStyle(secondary)
+            .frame(width: expandSize, height: expandSize)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Open full screen"))
+        .accessibilityHint(Text("Opens full screen with save and share"))
     }
 
     @ViewBuilder
@@ -340,7 +354,7 @@ struct InlineAudioClipView: View {
                     ProgressView().tint(tint)
                 } else {
                     Image(systemName: clip?.phase == .playing ? "pause.fill" : "play.fill")
-                        .font(.body.weight(.semibold))
+                        .scaledFont(.body.weight(.semibold))
                         .foregroundStyle(tint)
                 }
             }
@@ -363,7 +377,7 @@ struct InlineAudioClipView: View {
             )
         } else {
             Text(verbatim: detailText)
-                .font(.caption)
+                .scaledFont(.caption)
                 .foregroundStyle(secondary)
                 .lineLimit(2)
         }
@@ -402,7 +416,7 @@ private struct AudioClipScrubber: View {
             .accessibilityLabel(Text("Playback position"))
             .accessibilityValue(Text(verbatim: timeText))
             Text(verbatim: timeText)
-                .font(.caption2.monospacedDigit())
+                .scaledFont(.caption2.monospacedDigit())
                 .foregroundStyle(secondary)
                 .fixedSize()
         }

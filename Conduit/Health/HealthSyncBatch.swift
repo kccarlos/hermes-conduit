@@ -71,6 +71,12 @@ struct HealthEvent: Equatable {
     var unit: String?
     var data: [String: HealthValue] = [:]
     var source: String?
+
+    /// Whether the host keeps this one. A newer plugin leaves the others
+    /// out on its own; an older one refused the whole batch over one.
+    var fitsHost: Bool {
+        end >= start && end.timeIntervalSince(start) <= HealthSyncLimits.longestEvent
+    }
 }
 
 struct HealthBatch {
@@ -95,26 +101,7 @@ struct HealthBatch {
             "device": ["name": deviceName, "time_zone": timeZone.identifier],
             "categories": categories.map(\.rawValue).sorted(),
             "detailed": detailed.map(\.rawValue).sorted(),
-            "windows": windows.map { window -> [String: Any] in
-                [
-                    "metric": window.metric,
-                    "grain": window.grain.rawValue,
-                    "unit": window.unit,
-                    "from": format.string(window.from),
-                    "to": format.string(window.to),
-                    "buckets": window.buckets.map { bucket -> [String: Any] in
-                        var entry: [String: Any] = ["start": format.string(bucket.start), "end": format.string(bucket.end)]
-                        if let sum = bucket.sum { entry["sum"] = sum }
-                        if let min = bucket.min { entry["min"] = min }
-                        if let avg = bucket.avg { entry["avg"] = avg }
-                        if let max = bucket.max { entry["max"] = max }
-                        if let date = bucket.date { entry["date"] = date }
-                        if let source = bucket.source { entry["source"] = String(source.prefix(120)) }
-                        if !bucket.data.isEmpty { entry["data"] = bucket.data.mapValues(\.json) }
-                        return entry
-                    },
-                ]
-            },
+            "windows": windows.map { Self.json($0, format: format) },
             "events": events.map { event -> [String: Any] in
                 var entry: [String: Any] = [
                     "id": event.id, "kind": event.kind.rawValue, "metric": event.metric,
@@ -128,6 +115,46 @@ struct HealthBatch {
             },
             "deleted": deleted,
         ]
+    }
+
+    private static func json(_ window: HealthWindow, format: HealthDateFormat) -> [String: Any] {
+        [
+            "metric": window.metric,
+            "grain": window.grain.rawValue,
+            "unit": window.unit,
+            "from": format.string(window.from),
+            "to": format.string(window.to),
+            "buckets": window.buckets.map { bucket -> [String: Any] in
+                var entry: [String: Any] = ["start": format.string(bucket.start), "end": format.string(bucket.end)]
+                if let sum = bucket.sum { entry["sum"] = sum }
+                if let min = bucket.min { entry["min"] = min }
+                if let avg = bucket.avg { entry["avg"] = avg }
+                if let max = bucket.max { entry["max"] = max }
+                if let date = bucket.date { entry["date"] = date }
+                if let source = bucket.source { entry["source"] = String(source.prefix(120)) }
+                if !bucket.data.isEmpty { entry["data"] = bucket.data.mapValues(\.json) }
+                return entry
+            },
+        ]
+    }
+
+    /// Each window's place on the host (metric, grain and range) and a hash
+    /// of what it carries, in `windows`' order. What the batch says around
+    /// the windows (device, time zone, what's shared) is in every hash, so
+    /// a change there sends every window again. `batch_id` and
+    /// `computed_at` change every time and say nothing new.
+    func windowPrints() -> [(key: String, hash: String)] {
+        let format = HealthDateFormat(timeZone: timeZone)
+        let scope: [String: Any] = [
+            "device": ["name": deviceName, "time_zone": timeZone.identifier],
+            "categories": categories.map(\.rawValue).sorted(),
+            "detailed": detailed.map(\.rawValue).sorted(),
+        ]
+        return windows.map { window in
+            let entry = Self.json(window, format: format)
+            let key = "\(window.metric)|\(window.grain.rawValue)|\(format.string(window.from))|\(format.string(window.to))"
+            return (key, ContextFingerprint.of(["scope": scope, "window": entry]))
+        }
     }
 
     /// Splits into batches the host and the dashboard page take, keeping

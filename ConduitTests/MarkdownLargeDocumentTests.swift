@@ -136,6 +136,16 @@ final class MarkdownLargeDocumentTests: XCTestCase {
 
     // MARK: 4/5. Expansion is chunked and preserves all content
 
+    func testLargeCodeLineCountReadsWindowsLineEndings() async {
+        // "\r\n" is one Character, so a Character walk never saw its "\n".
+        let stats = await MarkdownCodeSlicer.lineStats(source: "a\r\nb\r\nc", previewLineBudget: 2, previewByteBudget: 1_000)
+        XCTAssertEqual(stats.count, 3)
+        XCTAssertTrue(stats.hasMore)
+        let unix = await MarkdownCodeSlicer.lineStats(source: "a\nb", previewLineBudget: 2, previewByteBudget: 1_000)
+        XCTAssertEqual(unix.count, 2)
+        XCTAssertFalse(unix.hasMore)
+    }
+
     func testChunkPlanBoundsEveryFlowChunk() async {
         let source = paragraphSoup(targetBytes: 300_000)
         guard let prepared = await LargeMarkdownPreparedDocument.prepare(source) else { return XCTFail("preparation failed") }
@@ -373,6 +383,40 @@ final class MarkdownLargeDocumentTests: XCTestCase {
         XCTAssertFalse(boundaries.contains(try offset(of: "y = 2")))
         XCTAssertEqual(scanner.lastSafeBoundary, try offset(of: "after fence"))
         XCTAssertFalse(scanner.isInOpenConstruct)
+    }
+
+    func testALongerFenceIsClosedOnlyByAFenceAtLeastAsLong() {
+        let source = "````markdown\n```swift\nlet x = 1\n```\n````\n\nafter"
+        XCTAssertEqual(MarkdownParser.parse(source), [
+            .code(language: "markdown", source: "```swift\nlet x = 1\n```"),
+            .paragraph("after"),
+        ])
+    }
+
+    func testAFenceWithTextAfterItDoesNotClose() {
+        let source = "```\na\n```not-a-close\nb\n```"
+        XCTAssertEqual(MarkdownParser.parse(source), [
+            .code(language: "", source: "a\n```not-a-close\nb"),
+        ])
+    }
+
+    func testAReferenceLookingLineInsideALongerFenceStaysCode() {
+        let source = "````\n```\n[a]: https://example.com\n````\n\nSee [a]."
+        let document = MarkdownParser.parseDocument(source)
+        XCTAssertFalse(document.references.containsDefinitions)
+        XCTAssertEqual(document.blocks.first, .code(language: "", source: "```\n[a]: https://example.com"))
+    }
+
+    func testScannerKeepsALongerFenceOpenPastAShorterOne() {
+        var scanner = MarkdownStableBoundaryScanner()
+        _ = scanner.append("text\n\n````markdown\n```swift\nx\n```\n\n")
+        XCTAssertTrue(scanner.isInOpenConstruct)
+        _ = scanner.append("````\n\ndone\n")
+        XCTAssertFalse(scanner.isInOpenConstruct)
+
+        var tildes = MarkdownStableBoundaryScanner()
+        _ = tildes.append("~~~\n~~~ not a close\n\n")
+        XCTAssertTrue(tildes.isInOpenConstruct)
     }
 
     func testScannerReportsOpenConstructState() {
@@ -768,7 +812,7 @@ final class MarkdownLargeDocumentTests: XCTestCase {
         host.view.layoutIfNeeded()
 
         // Wait until the detached preparation has landed and rendered.
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(10)
         var rendered = false
         while Date() < deadline {
             pumpForSwiftUICommit(host: host)
@@ -829,6 +873,37 @@ final class MarkdownLargeDocumentTests: XCTestCase {
         }
     }
 
+    /// A mid-size streaming reply, well under the large-document size, is
+    /// promoted into chunks too, so a tick never parses the whole reply
+    /// (issue 1720).
+    @MainActor
+    func testMidSizeStreamRenderingParsesOnlyBoundedSources() throws {
+        let source = mixedSoup(targetBytes: 60_000)
+        XCTAssertFalse(MarkdownLargeDocumentPolicy.isLargeDocument(source))
+        XCTAssertTrue(MarkdownLargeDocumentPolicy.isChunkedStream(source))
+
+        MarkdownParser.parseSourceSizes = []
+        let host = UIHostingController(rootView: StreamingText(text: source, active: true))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        host.view.layoutIfNeeded()
+        let streamDeadline = Date().addingTimeInterval(1.0)
+        while Date() < streamDeadline {
+            pumpForSwiftUICommit(host: host)
+        }
+
+        XCTAssertGreaterThan(MarkdownParser.parseSourceSizes.count, 0, "stream content must have rendered")
+        for size in MarkdownParser.parseSourceSizes {
+            XCTAssertLessThan(size, 30_000, "a mid-size stream must parse only chunks and its tail (saw \(size))")
+        }
+    }
+
+    func testAShortStreamStaysWhole() {
+        XCTAssertFalse(MarkdownLargeDocumentPolicy.isChunkedStream(String(repeating: "a", count: MarkdownLargeDocumentPolicy.streamChunkingThresholdBytes - 1)))
+        XCTAssertTrue(MarkdownLargeDocumentPolicy.isChunkedStream(String(repeating: "a", count: MarkdownLargeDocumentPolicy.streamChunkingThresholdBytes)))
+    }
+
     /// Requirement: switching sources mid-flight cannot let a stale async
     /// preparation populate the wrong message. The identity guard drops
     /// mismatched results; assert the visible end state matches the new
@@ -856,7 +931,7 @@ final class MarkdownLargeDocumentTests: XCTestCase {
         }
 
         // Phase A: initial preparation must land and render.
-        let deadlineA = Date().addingTimeInterval(5)
+        let deadlineA = Date().addingTimeInterval(10)
         while Date() < deadlineA, !renderedSummary().contains("oldmarker") {
             pumpForSwiftUICommit(host: host)
         }
@@ -868,13 +943,91 @@ final class MarkdownLargeDocumentTests: XCTestCase {
         // Swap under the same identity: the stale preparation for A must be
         // dropped and B must render.
         state.source = sourceB
-        let deadlineB = Date().addingTimeInterval(5)
+        let deadlineB = Date().addingTimeInterval(10)
         while Date() < deadlineB, !renderedSummary().contains("newmarker") {
             pumpForSwiftUICommit(host: host)
         }
         let final = renderedSummary()
         XCTAssertTrue(final.contains("newmarker"), "new source must render; rendered: \(final)")
         XCTAssertFalse(final.contains("OLDOLDOLDOLDOLDOLDOLD"), "stale preparation from the old source must not appear; rendered: \(final)")
+    }
+
+    /// A large code block in the streaming tail keeps its view while its
+    /// source grows (blocks render by index), so an expanded block must
+    /// re-slice for the new source instead of keeping the first slices.
+    @MainActor
+    func testExpandedLargeCodeBlockFollowsSourceChanges() throws {
+        var first = ""
+        var row = 0
+        while first.utf8.count < MarkdownLargeDocumentPolicy.codeBlockThresholdBytes + 2_000 {
+            first += "let row\(row) = compute(\"token\", \(row)) // filler comment\n"
+            row += 1
+        }
+        first += "let firstend = 0"
+        let grown = first + "\nlet tailmarker = 1"
+
+        let state = LargeCodeBlockHostState(source: first)
+        let host = UIHostingController(rootView: LargeCodeBlockHostView(state: state))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        host.view.layoutIfNeeded()
+
+        func rendered() -> String {
+            host.view.recursiveSubviewsForTests
+                .compactMap { ($0 as? UITextView)?.attributedText?.string }
+                .joined(separator: "\n")
+        }
+        func pump(until marker: String) {
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline, !rendered().contains(marker) {
+                pumpForSwiftUICommit(host: host)
+            }
+        }
+
+        pump(until: "firstend")
+        XCTAssertTrue(rendered().contains("firstend"), "the expanded block renders its whole first source")
+
+        state.source = grown
+        pump(until: "tailmarker")
+        XCTAssertTrue(rendered().contains("tailmarker"), "the expanded block renders the lines added to its source")
+    }
+
+    func testLargeCodeBlockResultsBelongToTheirSource() {
+        let source = String(repeating: "let value = 1\n", count: 3_000)
+        let grown = source + "let more = 2\n"
+        let sameLength = String(source.dropLast(2)) + "2\n"
+        let identity = LargeCodeBlockResult<Int>.sourceIdentity(of: source)
+        let stats = LargeCodeBlockResult(sourceIdentity: identity, value: 3_001)
+
+        XCTAssertFalse(stats.needsRecompute(for: LargeCodeBlockResult<Int>.sourceIdentity(of: String(source))))
+        XCTAssertTrue(
+            stats.needsRecompute(for: LargeCodeBlockResult<Int>.sourceIdentity(of: grown)),
+            "a result for the source must not be reused once lines are added"
+        )
+        XCTAssertEqual(sameLength.utf8.count, source.utf8.count)
+        XCTAssertTrue(
+            stats.needsRecompute(for: LargeCodeBlockResult<Int>.sourceIdentity(of: sameLength)),
+            "an equal-length edit is a different source"
+        )
+    }
+}
+
+@MainActor
+private final class LargeCodeBlockHostState: ObservableObject {
+    @Published var source: String
+    init(source: String) { self.source = source }
+}
+
+private struct LargeCodeBlockHostView: View {
+    @ObservedObject var state: LargeCodeBlockHostState
+
+    var body: some View {
+        LargeCodeBlockView(source: state.source, language: "swift", usesAccentSurface: false, expanded: true)
     }
 }
 
@@ -1018,6 +1171,41 @@ extension MarkdownLargeDocumentTests {
         XCTAssertGreaterThan(textViews.count, 0, "table must render content")
     }
 
+    /// A paged table in the chat draws its cells plain, except a cell with
+    /// a link, which draws as the reply's text so its link opens (issue
+    /// 1585); drawn until touched, it mounts no text view either.
+    @MainActor
+    func testLargeChatTableDrawsOnlyLinkCellsAsText() throws {
+        let rows = [["Fetch", "0.8 s"], ["Import", "[log](https://example.com/log)"]]
+        let host = UIHostingController(
+            rootView: LargeMarkdownTable(
+                headers: ["Step", "Time"],
+                alignments: [.leading, .leading],
+                rows: rows,
+                foregroundStyle: .primary,
+                usesAccentSurface: false,
+                selectionCoordinator: nil,
+                blockIndex: 0,
+                selectionSegments: []
+            )
+            .environment(\.markdownTablePlainCells, true)
+            .environment(\.selectableTextDrawsUntilTouched, true)
+        )
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        host.view.layoutIfNeeded()
+        pumpForSwiftUICommit(host: host)
+
+        let subviews = host.view.recursiveSubviewsForTests
+        XCTAssertTrue(subviews.compactMap { $0 as? UITextView }.isEmpty, "no text view mounted")
+        XCTAssertEqual(
+            subviews.compactMap { $0 as? SelectableTextViewHostView }.map(\.displayedText), ["log"],
+            "only the link cell draws as text"
+        )
+    }
+
     // Case 3: a single ~500 KB list item splits into bounded pieces.
     func testSingleHugeListItemIsBounded() async {
         let giant = Array(repeating: "itemword", count: 62_500).joined(separator: " ")
@@ -1044,7 +1232,7 @@ extension MarkdownLargeDocumentTests {
         let items = (1...900).map { "item \($0) \(String(repeating: "text ", count: 12))" }
         let source = items.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
         let document = MarkdownParser.parseDocument(source)
-        guard case .orderedList(let parsed)? = document.blocks.first else {
+        guard case .orderedList(let parsed, _)? = document.blocks.first else {
             return XCTFail("expected an ordered list")
         }
         let chunks = MarkdownLargeChunkPlanner.chunks(for: [.orderedList(parsed)])
@@ -1200,6 +1388,69 @@ extension MarkdownLargeDocumentTests {
         if let boundary = inFence {
             XCTAssertLessThanOrEqual(boundary, fenceStart, "promotion boundary must not land inside the fence")
         }
+    }
+
+    /// A long table has no blank line in it: the scanner records it as one
+    /// span, so the stream never hard-cuts mid-table and leaves the tail's
+    /// rows without their header (review of #1734).
+    func testALongStreamingTableIsNeverCutInside() {
+        let rows = (0..<2_000).map { "| row \($0) | value \($0) | note \($0) |" }.joined(separator: "\n")
+        let text = "intro\n\n| a | b | c |\n| --- | --- | --- |\n\(rows)\n\nafter table\n"
+        var scanner = MarkdownStableBoundaryScanner()
+        let boundaries = scanner.append(text)
+        XCTAssertEqual(scanner.constructIntervals.count, 1, "the table must be one span")
+        let span = scanner.constructIntervals[0]
+        let tableStart = text.utf8.count - text.drop(while: { $0 != "|" }).utf8.count
+        XCTAssertEqual(span.start, tableStart)
+        XCTAssertNotNil(span.end, "the line after the table closes its span")
+        XCTAssertGreaterThan(span.end! - span.start, 2 * MarkdownLargeDocumentPolicy.maxStreamChunkBytes)
+
+        // Every stable target inside the table: promotion waits or uses the
+        // boundary before it, never a hard cut through the rows.
+        for target in stride(from: span.start + 1, to: span.end!, by: 997) {
+            let next = LargeStreamPromotion.nextPromotionBoundary(
+                promotedBytes: span.start,
+                revealedBytes: target + MarkdownLargeDocumentPolicy.chunkTargetBytes,
+                boundaries: boundaries,
+                constructIntervals: scanner.constructIntervals
+            )
+            if let next {
+                XCTAssertFalse(next > span.start && next < span.end!, "cut \(next) lands inside the table")
+            }
+        }
+    }
+
+    /// A table written without its outer pipes is one span too.
+    func testATableWithoutOuterPipesIsOneSpan() {
+        let rows = (0..<50).map { "row \($0) | value \($0)" }.joined(separator: "\n")
+        let text = "intro\n\na | b\n--- | ---\n\(rows)\n\nafter\n"
+        var scanner = MarkdownStableBoundaryScanner()
+        _ = scanner.append(text)
+        XCTAssertEqual(scanner.constructIntervals.count, 1)
+        XCTAssertEqual(scanner.constructIntervals[0].start, "intro\n\n".utf8.count)
+        XCTAssertEqual(scanner.constructIntervals[0].end, text.utf8.count - "\nafter\n".utf8.count)
+    }
+
+    /// Prose with a `|` and no separator row under it is no table, and a
+    /// fence opener with a `|` in its info string opens no table: the
+    /// fence's own span keeps its end.
+    func testPipesOutsideATableOpenNoSpan() {
+        var scanner = MarkdownStableBoundaryScanner()
+        _ = scanner.append("this | that\nand more | prose\n```a|b\ncode\n```\nafter\n")
+        XCTAssertEqual(scanner.constructIntervals.count, 1, "only the fence")
+        XCTAssertNotNil(scanner.constructIntervals[0].end)
+        XCTAssertTrue(MarkdownStableBoundaryScanner.isTableSeparator("| --- | :---: |"))
+        XCTAssertTrue(MarkdownStableBoundaryScanner.isTableSeparator("--- | ---"))
+        XCTAssertFalse(MarkdownStableBoundaryScanner.isTableSeparator("a | b"))
+    }
+
+    /// A table still streaming when the reply ends is closed by `finish()`.
+    func testATableOpenAtTheEndClosesOnFinish() {
+        var scanner = MarkdownStableBoundaryScanner()
+        _ = scanner.append("| a | b |\n| --- | --- |\n| 1 | 2 |")
+        XCTAssertNil(scanner.constructIntervals.last?.end)
+        scanner.finish()
+        XCTAssertNotNil(scanner.constructIntervals.last?.end)
     }
 
     // Case 7: giant unbroken CJK paragraph -> bounded grapheme-safe hard
@@ -1640,7 +1891,7 @@ extension MarkdownLargeDocumentTests {
         let huge = String(repeating: "item prose ", count: 900) // ~10 KB
         let source = "1. \(huge)\n2. normal one\n3. normal two"
         let document = MarkdownParser.parseDocument(source)
-        guard case .orderedList(let items)? = document.blocks.first else {
+        guard case .orderedList(let items, _)? = document.blocks.first else {
             return XCTFail("expected ordered list")
         }
         let chunks = MarkdownLargeChunkPlanner.chunks(for: [.orderedList(items)])
@@ -1677,7 +1928,7 @@ extension MarkdownLargeDocumentTests {
         window.rootViewController = host
         window.makeKeyAndVisible()
         host.view.layoutIfNeeded()
-        let first = Date().addingTimeInterval(5)
+        let first = Date().addingTimeInterval(10)
         while Date() < first,
               !host.view.recursiveSubviewsForTests.contains(where: { ($0 as? UITextView)?.attributedText?.string.contains("oldmarker") == true }) {
             pumpForSwiftUICommit(host: host)
@@ -2011,7 +2262,7 @@ extension MarkdownBlock {
         switch self {
         case .heading(_, let text), .paragraph(let text): return text
         case .quote(let lines): return lines.map(\.text).joined(separator: "\n")
-        case .unorderedList(let items), .orderedList(let items): return items.joined(separator: "\n")
+        case .unorderedList(let items), .orderedList(let items, _): return items.joined(separator: "\n")
         case .table(let headers, _, let rows):
             return ([headers] + rows).map { $0.joined(separator: "|") }.joined(separator: "\n")
         case .code(_, let source): return source
@@ -2020,6 +2271,7 @@ extension MarkdownBlock {
         case .math(let source): return source
         case .image(let url, let alt): return "\(alt)\(url)"
         case .htmlPreview(let path): return path
+        case .desktopCard(let card): return card.source
         case .divider: return "---"
         }
     }

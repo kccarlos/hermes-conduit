@@ -15,6 +15,9 @@ import Foundation
 struct PendingScreenshot: Equatable {
     let sessionID: String
     let attachment: Attachment
+    /// The dashboard the chat belongs to; a screenshot never joins
+    /// another dashboard's chat, however their session ids line up.
+    let dashboardID: UUID?
 }
 
 /// Asks the composer of one chat to take focus. Another chat's composer
@@ -29,6 +32,8 @@ struct ComposerFocusRequest: Equatable {
 struct ParkedScreenQuestion: Equatable {
     let request: ScreenQuestionRequest
     let profile: String?
+    /// The dashboard the screenshot was taken for: it resumes only there.
+    let dashboardID: UUID?
 }
 
 /// Pure rules for where a screenshot goes.
@@ -99,7 +104,9 @@ extension AppState {
                 )
             }
         }
-        pendingScreenshots.append(PendingScreenshot(sessionID: sessionID, attachment: attachment))
+        pendingScreenshots.append(
+            PendingScreenshot(sessionID: sessionID, attachment: attachment, dashboardID: activeDashboardID)
+        )
         trimPendingScreenshots()
     }
 
@@ -134,16 +141,17 @@ extension AppState {
     }
 
     /// A send that failed puts its screenshot back, unless a newer one
-    /// already landed on the chat meanwhile.
-    func restorePendingScreenshot(_ attachment: Attachment, forSession sessionID: String) {
-        guard pendingScreenshotIndex(forSession: sessionID) == nil else {
+    /// already landed on the chat meanwhile. It goes back under the
+    /// dashboard it was taken from, even when another is active by now.
+    func restorePendingScreenshot(_ entry: PendingScreenshot) {
+        if let index = pendingScreenshotIndex(forSession: entry.sessionID, dashboardID: entry.dashboardID) {
             // It will never be sent now.
-            if pendingScreenshot(forSession: sessionID)?.uri != attachment.uri {
-                Self.deleteStagedScreenshot(attachment)
+            if pendingScreenshots[index].attachment.uri != entry.attachment.uri {
+                Self.deleteStagedScreenshot(entry.attachment)
             }
             return
         }
-        pendingScreenshots.append(PendingScreenshot(sessionID: sessionID, attachment: attachment))
+        pendingScreenshots.append(entry)
         trimPendingScreenshots()
     }
 
@@ -158,15 +166,25 @@ extension AppState {
         }
     }
 
+    /// Only the dashboard the screenshot was staged for can take it: the
+    /// active one unless a caller names the dashboard it belongs to.
     private func pendingScreenshotIndex(forSession sessionID: String?) -> Int? {
+        pendingScreenshotIndex(forSession: sessionID, dashboardID: activeDashboardID)
+    }
+
+    private func pendingScreenshotIndex(forSession sessionID: String?, dashboardID: UUID?) -> Int? {
         guard let sessionID, !sessionID.isEmpty, !pendingScreenshots.isEmpty else { return nil }
-        if let exact = pendingScreenshots.lastIndex(where: { $0.sessionID == sessionID }) {
+        if let exact = pendingScreenshots.lastIndex(where: {
+            $0.sessionID == sessionID && $0.dashboardID == dashboardID
+        }) {
             return exact
         }
         // Reopened, the chat runs under a new runtime id; its own ids
         // still name it.
         let ids = screenshotChatIDs(for: sessionID)
-        return pendingScreenshots.lastIndex { !ids.isDisjoint(with: screenshotChatIDs(for: $0.sessionID)) }
+        return pendingScreenshots.lastIndex {
+            $0.dashboardID == dashboardID && !ids.isDisjoint(with: screenshotChatIDs(for: $0.sessionID))
+        }
     }
 
     static func deleteStagedScreenshot(_ attachment: Attachment) {
@@ -288,11 +306,11 @@ extension AppState {
     /// Starts a chat and moves the screenshot onto it. When none starts,
     /// the screenshot goes back where it was and the user is told.
     private func startChatForScreenshot(_ entry: PendingScreenshot) async -> String? {
-        let previous = activeSessionId
         let earlierError = errorMessage
-        await createNewSession()
-        guard let created = activeSessionId, created != previous else {
-            restorePendingScreenshot(entry.attachment, forSession: entry.sessionID)
+        // Only the chat this creation opened, while it is still open: one
+        // another creation opened meanwhile doesn't take the screenshot.
+        guard let created = await createNewSession(), activeSessionId == created else {
+            restorePendingScreenshot(entry)
             // Where the screenshot is first, then Hermes's own reason when
             // this attempt gave one.
             let reason = errorMessage != earlierError ? errorMessage : nil
@@ -383,7 +401,9 @@ extension AppState {
         if let parked = parkedScreenQuestion, parked.request.attachment.uri != request.attachment.uri {
             Self.deleteStagedScreenshot(parked.request.attachment)
         }
-        parkedScreenQuestion = ParkedScreenQuestion(request: request, profile: profile)
+        parkedScreenQuestion = ParkedScreenQuestion(
+            request: request, profile: profile, dashboardID: activeDashboardID
+        )
         parkedScreenQuestionRevision &+= 1
     }
 
@@ -398,13 +418,17 @@ extension AppState {
     func resumeParkedScreenQuestion(now: Date = Date()) async {
         guard isConnected, !isConnecting, !isProfileSwitching, !isSettlingConnection,
               let parked = parkedScreenQuestion else { return }
+        // A screenshot parked for one dashboard never joins another's
+        // chat: it waits for its own dashboard to connect again.
+        guard parked.dashboardID == activeDashboardID else { return }
         parkedScreenQuestion = nil
         let isLate = now.timeIntervalSince(parked.request.enqueuedAt) >= PendingVoiceLaunchPolicy.externalLaunchBudget
         // Off screen, voice can't start: it waits with the keyboard.
         let isOffScreen = !isSceneActive
         if !(await openScreenQuestion(parked.request, profile: parked.profile, resumingParked: isLate || isOffScreen)) {
-            // The connection dropped again before a chat opened.
-            holdScreenQuestion(parked.request, profile: parked.profile)
+            // The connection dropped again before a chat opened. It still
+            // belongs to its own dashboard, even if another opened meanwhile.
+            holdScreenQuestion(parked.request, profile: parked.profile, dashboardID: parked.dashboardID)
         }
     }
 
@@ -442,7 +466,7 @@ extension AppState {
     /// Keeps a screenshot no chat could take yet, without a revision bump:
     /// it is tried again when the connection changes, never in a loop. A
     /// newer screenshot parked meanwhile wins.
-    private func holdScreenQuestion(_ request: ScreenQuestionRequest, profile: String?) {
+    private func holdScreenQuestion(_ request: ScreenQuestionRequest, profile: String?, dashboardID: UUID?) {
         // A newer screenshot placed while this one waited wins.
         guard !isOutdated(request) else {
             Self.deleteStagedScreenshot(request.attachment)
@@ -454,7 +478,9 @@ extension AppState {
             }
             return
         }
-        parkedScreenQuestion = ParkedScreenQuestion(request: request, profile: profile)
+        parkedScreenQuestion = ParkedScreenQuestion(
+            request: request, profile: profile, dashboardID: dashboardID
+        )
     }
 
     private func openScreenQuestion(
@@ -467,6 +493,9 @@ extension AppState {
             Self.deleteStagedScreenshot(request.attachment)
             return true
         }
+        // The dashboard the screenshot is for: the awaits below can let
+        // another one open.
+        let dashboardID = activeDashboardID
         // A newer press replaces a screenshot kept from an outage.
         if !resumingParked, let parked = parkedScreenQuestion {
             parkedScreenQuestion = nil
@@ -527,13 +556,12 @@ extension AppState {
         if let open = activeSessionId, continuesOpenChat || openChatIsEmpty {
             sessionID = open
         } else {
-            let previous = activeSessionId
-            await createNewSession()
-            guard let created = activeSessionId, created != previous else {
+            // Only the chat this creation opened, while it is still open.
+            guard let created = await createNewSession(), activeSessionId == created else {
                 guard isConnected else { return false }
                 // Kept, not dropped: tried again once the connection settles.
                 // A profile that couldn't open is tried again too.
-                holdScreenQuestion(request, profile: requestedProfile)
+                holdScreenQuestion(request, profile: requestedProfile, dashboardID: dashboardID)
                 errorMessage = AppLocalization.string("Hermes could not start a chat for the screenshot. It's kept and will be attached once Hermes is ready.")
                 return true
             }

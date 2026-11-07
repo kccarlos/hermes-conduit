@@ -2,8 +2,8 @@
 //  VoiceHistory.swift
 //  Conduit
 //
-//  Saved live voice calls. Gemini Live and GPT-Live never run a Hermes
-//  turn, so nothing on the host records them. The conduit_push plugin
+//  Saved live voice calls. Gemini Live, Qwen Live and GPT-Live never run
+//  a Hermes turn, so nothing on the host records them. The conduit_push plugin
 //  writes a call's settled turns straight into the profile's session store
 //  as an ordinary session row (no agent turn), and a resumed call appends
 //  to the same row. A call attached to a chat is part of that chat (#556):
@@ -24,7 +24,7 @@ private let voiceHistoryLogger = Logger(subsystem: "com.milim.relay", category: 
 /// Conduit's label for a session voice started, kept on the Hermes host.
 struct VoiceSessionTag: Equatable, Codable {
     enum Kind: String, Equatable, Codable {
-        /// A saved Gemini Live or GPT-Live call.
+        /// A saved live call (Gemini Live, Qwen Live, GPT-Live, Grok Live).
         case call
         /// A chat classic Voice started fresh.
         case classic
@@ -54,6 +54,7 @@ struct VoiceSessionTag: Equatable, Codable {
 
 enum VoiceCallEngine: String, Equatable, Codable {
     case geminiLive = "gemini-live"
+    case qwenLive = "qwen-live"
     case gptLive = "gpt-live"
     case grokLive = "grok-live"
     case localLive = "local-live"
@@ -63,8 +64,10 @@ extension VoiceCallEngine {
     /// A Watch call's engine as the host's audio bridge names it.
     static func watchBridge(_ engine: String) -> VoiceCallEngine? {
         switch engine {
+        case "qwen-live": return .qwenLive
         case WatchAudioBridgeWire.gptLive: return .gptLive
         case WatchAudioBridgeWire.grok: return .grokLive
+        case WatchAudioBridgeWire.localLive: return .localLive
         default: return nil
         }
     }
@@ -81,9 +84,16 @@ struct VoiceTranscriptTurn: Equatable, Codable {
     let role: Role
     let text: String
     let at: Date
+    /// Normalized cards a live model showed (JSON), kept with the turn so
+    /// the saved call draws them again.
+    var cards: Data? = nil
 
     var payload: [String: Any] {
-        ["index": index, "role": role.rawValue, "text": text, "at": at.timeIntervalSince1970]
+        var payload: [String: Any] = ["index": index, "role": role.rawValue, "text": text, "at": at.timeIntervalSince1970]
+        if let cards, let list = try? JSONSerialization.jsonObject(with: cards) as? [Any], !list.isEmpty {
+            payload["cards"] = list
+        }
+        return payload
     }
 }
 
@@ -101,6 +111,10 @@ struct VoiceTranscriptSaveRequest: Equatable, Codable {
     /// The profile `chatID` lives in when it isn't the call's own: a Bot
     /// Chat's is its bot's. The turns are kept there, with the chat.
     var chatProfile: String? = nil
+    /// The profile `sessionID`'s row is in when it isn't the call's own: a
+    /// plugin that predates chat calls made a Bot Chat's call into a row in
+    /// the bot's profile. The turns append there.
+    var rowProfile: String? = nil
 }
 
 struct VoiceTranscriptSaveResult: Equatable {
@@ -112,6 +126,36 @@ struct VoiceTranscriptSaveResult: Equatable {
     var chatID: String? = nil
 }
 
+/// A call the host keeps with a chat, as its list of every chat's calls
+/// names it: enough to file the chat under Voice and draw its call card on
+/// a device that didn't make the call.
+struct VoiceHostChatCall: Equatable {
+    let callID: String
+    let chatID: String
+    let startedAt: Date
+    let endedAt: Date
+
+    static func parse(_ raw: Any) -> VoiceHostChatCall? {
+        guard let raw = raw as? [String: Any],
+              let callID = raw["call_id"] as? String, !callID.isEmpty,
+              let chatID = raw["chat_id"] as? String, !chatID.isEmpty,
+              let started = (raw["started_at"] as? NSNumber)?.doubleValue else { return nil }
+        let ended = (raw["ended_at"] as? NSNumber)?.doubleValue ?? started
+        return VoiceHostChatCall(
+            callID: callID, chatID: chatID,
+            startedAt: Date(timeIntervalSince1970: started),
+            endedAt: Date(timeIntervalSince1970: max(started, ended))
+        )
+    }
+}
+
+/// The profile's voice tags, and every call the host keeps with a chat
+/// (none from a plugin that predates the list).
+struct VoiceTagsAnswer: Equatable {
+    var tags: [String: VoiceSessionTag]
+    var chatCalls: [VoiceHostChatCall] = []
+}
+
 /// A call kept with its chat, as the chat's call card shows it.
 struct VoiceChatCall: Identifiable, Equatable {
     let callID: String
@@ -120,6 +164,24 @@ struct VoiceChatCall: Identifiable, Equatable {
     var engine: VoiceCallEngine? = nil
 
     var id: String { callID }
+
+    /// Each live card's last turn in the call: a live card shown again
+    /// replaces the earlier one wherever it's shown, as in a typed chat.
+    var latestLiveTurns: [String: String] {
+        var latest: [String: String] = [:]
+        for turn in turns {
+            for name in turn.cards.compactMap(\.live) { latest[name] = turn.id.uuidString }
+        }
+        return latest
+    }
+
+    /// `turn`'s cards less the live ones a later turn brought up to date.
+    func currentCards(
+        for turn: VoiceConversationTranscriptEntry,
+        latestLiveTurns: [String: String]? = nil
+    ) -> [RichCard] {
+        RichCard.current(turn.cards, row: turn.id.uuidString, latestLiveRows: latestLiveTurns ?? self.latestLiveTurns)
+    }
 }
 
 enum VoiceHistoryError: Error, Equatable {
@@ -141,6 +203,7 @@ final class VoiceHistoryClient {
     static let sessionsPath = "/api/plugins/conduit_push/voice/sessions"
     static let tagsPath = "/api/plugins/conduit_push/voice/tags"
     static let summaryPath = "/api/plugins/conduit_push/voice/summary"
+    static let archivePath = "/api/plugins/conduit_push/voice/archive"
     static let chatCallsPath = "/api/plugins/conduit_push/voice/chat-calls"
 
     typealias Request = @MainActor (_ path: String, _ method: String, _ body: [String: Any]?) async throws -> [String: Any]
@@ -151,28 +214,79 @@ final class VoiceHistoryClient {
         self.request = request
     }
 
+    /// What one save may carry: the plugin refuses more turns or a larger
+    /// body (dashboard/api/voice_calls.py VOICE_MAX_TURNS, and
+    /// VOICE_MAX_BODY_BYTES at 1 MiB).
+    static let maxTurnsPerSave = 500
+    static let maxBytesPerSave = 900_000
+
+    /// Saves the turns in order, in parts the plugin takes: the first makes
+    /// the row (or the chat's call) and the rest append to it. A refused
+    /// part fails the save; retried, the plugin skips the turns it has.
     func save(_ save: VoiceTranscriptSaveRequest, profile: String) async throws -> VoiceTranscriptSaveResult {
+        var part = save
+        var result: VoiceTranscriptSaveResult?
+        // Every part goes where the first did: a row the first part makes
+        // with a chat's profile is in that profile, not the call's.
+        var target = profile
+        if save.sessionID == nil, let chatID = save.chatID, !chatID.isEmpty,
+           let chatProfile = save.chatProfile, !chatProfile.isEmpty {
+            target = chatProfile
+        }
+        for turns in Self.parts(save.turns, maxTurns: Self.maxTurnsPerSave, maxBytes: Self.maxBytesPerSave) {
+            part.turns = turns
+            let saved = try await saveOnce(part, target: target)
+            result = saved
+            if let sessionID = saved.sessionID {
+                part.sessionID = sessionID
+                part.title = nil
+            }
+        }
+        // `parts` is never empty.
+        return result ?? VoiceTranscriptSaveResult(sessionID: save.sessionID, written: 0)
+    }
+
+    /// `turns` in order, as runs of at most `maxTurns` and about `maxBytes`
+    /// of JSON (at least one turn each); one run when there are none.
+    static func parts(_ turns: [VoiceTranscriptTurn], maxTurns: Int, maxBytes: Int) -> [[VoiceTranscriptTurn]] {
+        var parts: [[VoiceTranscriptTurn]] = []
+        var current: [VoiceTranscriptTurn] = []
+        var bytes = 0
+        for turn in turns {
+            let size = ((try? JSONSerialization.data(withJSONObject: turn.payload))?.count ?? 0) + 1
+            if !current.isEmpty, current.count >= maxTurns || bytes + size > maxBytes {
+                parts.append(current)
+                current = []
+                bytes = 0
+            }
+            current.append(turn)
+            bytes += size
+        }
+        parts.append(current)
+        return parts
+    }
+
+    private func saveOnce(_ save: VoiceTranscriptSaveRequest, target: String) async throws -> VoiceTranscriptSaveResult {
         var body: [String: Any] = [
             "call_id": save.callID,
             "engine": save.engine.rawValue,
             "turns": save.turns.map(\.payload)
         ]
-        var target = profile
         if let sessionID = save.sessionID {
             body["session_id"] = sessionID
         } else if let chatID = save.chatID, !chatID.isEmpty {
             body["chat_id"] = chatID
-            if let chatProfile = save.chatProfile, !chatProfile.isEmpty { target = chatProfile }
         }
         if let title = save.title, !title.isEmpty { body["title"] = title }
         let response = try await send(Self.sessionsPath, profile: target, method: "POST", body: body)
         return try Self.saveResult(from: response)
     }
 
-    /// Every tag on the profile, keyed by session id.
-    func tags(profile: String) async throws -> [String: VoiceSessionTag] {
+    /// Every tag on the profile, keyed by session id, and the calls kept
+    /// with its chats.
+    func tags(profile: String) async throws -> VoiceTagsAnswer {
         let response = try await send(Self.tagsPath, profile: profile, method: "GET", body: nil)
-        return try Self.tags(from: response)
+        return VoiceTagsAnswer(tags: try Self.tags(from: response), chatCalls: Self.hostChatCalls(from: response))
     }
 
     func tag(sessionID: String, kind: VoiceSessionTag.Kind, parentID: String? = nil, parentTitle: String? = nil, profile: String) async throws {
@@ -180,6 +294,13 @@ final class VoiceHistoryClient {
         if let parentID, !parentID.isEmpty { body["parent_id"] = parentID }
         if let parentTitle, !parentTitle.isEmpty { body["parent_title"] = parentTitle }
         _ = try await send(Self.tagsPath, profile: profile, method: "POST", body: body)
+    }
+
+    /// Archives a Classic voice chat its call started, now the call is over
+    /// (#1124). True when the host archived it.
+    func archiveClassicChat(sessionID: String, profile: String) async throws -> Bool {
+        let response = try await send(Self.archivePath, profile: profile, method: "POST", body: ["session_id": sessionID])
+        return response["archived"] as? Bool == true
     }
 
     /// The calls kept with a chat, oldest first.
@@ -218,7 +339,10 @@ final class VoiceHistoryClient {
     // MARK: Parsing (static for tests)
 
     static func mapped(_ error: DashboardTicketBridgeError) -> VoiceHistoryError? {
-        guard case .http(let status, _) = error else { return nil }
+        guard case .http(let status, let detail) = error else { return nil }
+        // A profile that turned the plugin off isn't a host that can't save:
+        // the call waits and says how to turn it on (issue 1671).
+        if status == 404, DashboardTicketBridgeError.isPluginOffDetail(detail) { return nil }
         switch status {
         case 404, 405: return .pluginMissing
         case 501: return .unsupported
@@ -247,7 +371,8 @@ final class VoiceHistoryClient {
                 guard let text = (turn["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
                 switch turn["role"] as? String {
                 case "user": return VoiceConversationTranscriptEntry(speaker: .user, text: text)
-                case "assistant": return VoiceConversationTranscriptEntry(speaker: .assistant, text: text)
+                case "assistant":
+                    return VoiceConversationTranscriptEntry(speaker: .assistant, text: text, cards: RichCard.cards(raw: turn["cards"]))
                 default: return nil
                 }
             }
@@ -260,6 +385,10 @@ final class VoiceHistoryClient {
             throw VoiceHistoryError.malformed
         }
         return raw.compactMapValues { VoiceSessionTag.parse($0) }
+    }
+
+    static func hostChatCalls(from response: [String: Any]) -> [VoiceHostChatCall] {
+        (response["chat_calls"] as? [Any] ?? []).compactMap(VoiceHostChatCall.parse)
     }
 
     static func summary(from response: [String: Any]) -> VoiceResumeSummary? {
@@ -298,6 +427,9 @@ final class VoiceTranscriptRecorder {
     /// The row this call saves into: the resumed row, or the one its first
     /// save created.
     private(set) var sessionID: String?
+    /// The profile `sessionID` is in, when a save with `chatProfile` made
+    /// it there.
+    private(set) var rowProfile: String?
     private(set) var turns: [VoiceTranscriptTurn] = []
     /// Turns the host confirmed (every turn below this index).
     private(set) var written = 0
@@ -306,6 +438,13 @@ final class VoiceTranscriptRecorder {
     private(set) var isDisabled = false
 
     private var recordedEntries: Set<UUID> = []
+    /// How far into the engine's transcript the last capture got, and the
+    /// entry there: the next capture starts after it, so a long call isn't
+    /// rescanned from its first line on every update (#1004). An engine
+    /// that removed or replaced an earlier line moves the entry, and that
+    /// capture scans from the start.
+    private var capturedPrefix = 0
+    private var capturedPrefixEnd: UUID?
     private let save: Save
     /// The title a new row gets, asked for when the first save creates it.
     private let title: @MainActor (_ turns: [VoiceTranscriptTurn]) async -> String
@@ -338,6 +477,7 @@ final class VoiceTranscriptRecorder {
         if let previous {
             callID = previous.callID
             sessionID = previous.sessionID
+            rowProfile = previous.rowProfile
             chatID = previous.chatID
             chatProfile = previous.chatProfile
             savedWithChat = previous.savedWithChat
@@ -363,12 +503,21 @@ final class VoiceTranscriptRecorder {
     /// Takes the settled prefix of the engine's transcript: every entry up
     /// to the first one still streaming.
     func capture(_ entries: [VoiceConversationTranscriptEntry], unsettled: Set<UUID>) {
-        for entry in entries {
+        var index = 0
+        if capturedPrefix > 0, capturedPrefix <= entries.count,
+           entries[capturedPrefix - 1].id == capturedPrefixEnd {
+            index = capturedPrefix
+        }
+        while index < entries.count {
+            let entry = entries[index]
             if unsettled.contains(entry.id) { break }
+            index += 1
             guard !recordedEntries.contains(entry.id) else { continue }
             recordedEntries.insert(entry.id)
             append(entry.speaker == .user ? .user : .assistant, entry.text)
         }
+        capturedPrefix = index
+        capturedPrefixEnd = index > 0 ? entries[index - 1].id : nil
     }
 
     /// A line the call itself adds (a started job, the resume marker).
@@ -376,10 +525,44 @@ final class VoiceTranscriptRecorder {
         append(.assistant, text)
     }
 
-    private func append(_ role: VoiceTranscriptTurn.Role, _ text: String) {
+    /// Rewrites a note not saved yet: a job's line once the call took the
+    /// job's chat as its own (#1250).
+    func replaceNote(_ text: String, with replacement: String) {
+        guard let index = turns.lastIndex(where: { $0.index >= written && $0.role == .assistant && $0.text == Self.clipped(text) }) else { return }
+        let old = turns[index]
+        turns[index] = VoiceTranscriptTurn(index: old.index, role: old.role, text: Self.clipped(replacement), at: old.at, cards: old.cards)
+    }
+
+    /// Something the live model put on screen: its Markdown as the line,
+    /// and its cards kept with it.
+    func screen(_ card: VoiceScreenCard) {
+        let heading = card.title.isEmpty ? AppLocalization.string("On screen") : card.title
+        let text = card.markdown.isEmpty ? heading : "\(heading)\n\n\(card.markdown)"
+        append(.assistant, text, cards: card.cardsJSON)
+    }
+
+    /// The longest turn the plugin keeps whole (dashboard/api/voice_calls.py
+    /// VOICE_MAX_TURN_CHARS, counted in code points); it cuts a longer one.
+    static let maxTurnCharacters = 16_000
+
+    private func append(_ role: VoiceTranscriptTurn.Role, _ text: String, cards: Data? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        turns.append(VoiceTranscriptTurn(index: turns.count, role: role, text: trimmed, at: now()))
+        turns.append(VoiceTranscriptTurn(index: turns.count, role: role, text: Self.clipped(trimmed), at: now(), cards: cards))
+    }
+
+    /// `text` within what the plugin keeps, cut here so a code block the
+    /// cut leaves open is closed (a screen turn can hold 20,000 characters).
+    /// Cut in code points, as the plugin counts.
+    static func clipped(_ text: String) -> String {
+        guard text.unicodeScalars.count > maxTurnCharacters else { return text }
+        // The closing fence's room comes off the cut, so the turn stays
+        // within the limit however long the fence.
+        return VoiceBackgroundJobSupervisor.fenceClosedPrefix(within: maxTurnCharacters, length: \.unicodeScalars.count) {
+            var cut = String.UnicodeScalarView()
+            cut.append(contentsOf: text.unicodeScalars.prefix($0))
+            return String(cut)
+        }
     }
 
     /// Saves whatever the host doesn't have. Saves run one at a time, in
@@ -421,11 +604,16 @@ final class VoiceTranscriptRecorder {
             title: rowTitle,
             turns: pending,
             chatID: withChat ? chatID : nil,
-            chatProfile: withChat ? chatProfile : nil
+            chatProfile: withChat ? chatProfile : nil,
+            rowProfile: rowProfile
         )
         do {
             let result = try await save(request)
-            if let id = result.sessionID { sessionID = id }
+            if let id = result.sessionID {
+                sessionID = id
+                // Made with the chat's profile, the row is there.
+                if withChat { rowProfile = chatProfile }
+            }
             if result.chatID != nil { savedWithChat = true }
             written = max(written, min(result.written, turns.count))
         } catch VoiceHistoryError.rowUnavailable where withChat {
@@ -442,6 +630,7 @@ final class VoiceTranscriptRecorder {
             // new row holding everything it said.
             voiceHistoryLogger.notice("Voice row is gone; saving the call as a new session")
             sessionID = nil
+            rowProfile = nil
             written = 0
             callID = UUID().uuidString
             await performFlush()
@@ -449,8 +638,23 @@ final class VoiceTranscriptRecorder {
             voiceHistoryLogger.notice("This Hermes host can't store voice transcripts; not saving the call")
             isDisabled = true
         } catch {
-            voiceHistoryLogger.error("Saving a voice transcript failed: \(String(describing: error), privacy: .public)")
+            voiceHistoryLogger.error("Saving a voice transcript failed: \(LogRedaction.describing(error), privacy: .public)")
         }
+    }
+
+    /// The saved call again, as its last turn, for the outbox when what
+    /// follows a save (its jobs' tags, its chat link) couldn't run: the host
+    /// skips the turn and answers with the call's row or chat. Nil when the
+    /// call has neither.
+    var savedCallReplay: VoiceTranscriptSaveRequest? {
+        guard sessionID != nil || savedWithChat, let last = turns.last, last.index < written else { return nil }
+        return VoiceTranscriptSaveRequest(
+            callID: callID, engine: engine, sessionID: sessionID,
+            title: nil, turns: [last],
+            chatID: sessionID == nil ? chatID : nil,
+            chatProfile: sessionID == nil ? chatProfile : nil,
+            rowProfile: rowProfile
+        )
     }
 
     /// What is still unsaved, for the outbox to retry after the call. Kept
@@ -464,12 +668,22 @@ final class VoiceTranscriptRecorder {
             callID: callID, engine: engine, sessionID: sessionID,
             title: sessionID == nil ? newRowTitle : nil, turns: pending,
             chatID: sessionID == nil ? chatID : nil,
-            chatProfile: sessionID == nil ? chatProfile : nil
+            chatProfile: sessionID == nil ? chatProfile : nil,
+            rowProfile: rowProfile
         )
     }
 }
 
 // MARK: - Outbox
+
+/// What one pass over the outbox did, for Save Now's result line.
+struct VoiceTranscriptDrainResult {
+    var saved = 0
+    /// The last reason a call didn't save, if one didn't.
+    var failure: Error?
+    /// A live call was running, so saving waited for it to end.
+    var waitedOnCall = false
+}
 
 /// Saves that failed when a call ended, kept on the device until the host
 /// takes them. Keyed by dashboard and profile so a save never lands on
@@ -753,6 +967,16 @@ struct VoiceCallAttachment: Equatable, Codable {
     var endedAt: Date? = nil
 }
 
+/// What a running call's checkpoint puts in the outbox, less the time it
+/// was taken: one equal to the last is nothing new to store.
+struct VoiceCallCheckpoint: Equatable {
+    var request: VoiceTranscriptSaveRequest
+    var dashboard: String
+    var profile: String
+    var jobs: [String]
+    var attachment: VoiceCallAttachment?
+}
+
 struct VoiceCallChatLinks: Codable, Equatable {
     static let storageKey = "conduit.voiceCallChatLinks.v1"
     static let maximumLinks = 300
@@ -763,6 +987,52 @@ struct VoiceCallChatLinks: Codable, Equatable {
         links.removeAll { $0.callID == link.callID }
         links.append(link)
         if links.count > Self.maximumLinks { links.removeFirst(links.count - Self.maximumLinks) }
+    }
+
+    /// Links the calls the host keeps with chats that this device didn't
+    /// make or has forgotten, so their chats show the call cards and are
+    /// listed under Voice here too. `title` names a listed chat. The links
+    /// stay in the order their calls started, so the oldest go first past
+    /// the cap. True when the links changed: a call the cap drops again is
+    /// no change, so a full list doesn't rewrite them on every refresh.
+    mutating func adopt(_ calls: [VoiceHostChatCall], profile: String, title: (String) -> String?) -> Bool {
+        let before = links.map(\.callID)
+        let known = Set(before)
+        let adopted = calls.filter { !known.contains($0.callID) }
+        guard !adopted.isEmpty else { return false }
+        links += adopted.map { call in
+            VoiceCallChatLink(
+                callID: call.callID,
+                callSessionID: "",
+                chatRuntimeSessionID: call.chatID,
+                chatStoredSessionID: call.chatID,
+                chatTitle: title(call.chatID) ?? "",
+                profile: profile,
+                startedAt: call.startedAt,
+                endedAt: call.endedAt,
+                resumed: false
+            )
+        }
+        // Stable, so a resumed call's links keep their order.
+        links = links.enumerated()
+            .sorted { ($0.element.startedAt, $0.offset) < ($1.element.startedAt, $1.offset) }
+            .map(\.element)
+        if links.count > Self.maximumLinks { links.removeFirst(links.count - Self.maximumLinks) }
+        return links.map(\.callID) != before
+    }
+
+    /// The ids of the chats on `profile` with a call kept with them or
+    /// started from them, for the Voice filter. Bot Chats are listed apart.
+    func chatIDs(profile: String) -> Set<String> {
+        var ids = Set<String>()
+        for link in links where link.profile == profile && link.chatProfile == nil {
+            if let stored = link.chatStoredSessionID, !stored.isEmpty {
+                ids.insert(stored)
+            } else if !link.chatRuntimeSessionID.isEmpty {
+                ids.insert(link.chatRuntimeSessionID)
+            }
+        }
+        return ids
     }
 
     /// The chat a saved call was last attached to, for Resume Call.

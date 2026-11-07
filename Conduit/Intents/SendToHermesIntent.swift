@@ -72,6 +72,12 @@ struct ShortcutSendError: LocalizedError, Equatable {
     static var notConnected: ShortcutSendError {
         ShortcutSendError(message: AppLocalization.string("Conduit couldn't reach Hermes. Open Conduit and check the connection."))
     }
+
+    /// The chat's runtime was gone and reopening it failed too: Hermes's
+    /// own error ("session not found") would mean nothing to the listener.
+    static var reopenFailed: ShortcutSendError {
+        ShortcutSendError(message: AppLocalization.string("Conduit couldn't reopen that chat, so nothing was sent. Open it in Conduit and try again."))
+    }
 }
 
 /// Hermes operations a run needs. Closures, so AppState binds them to the
@@ -84,11 +90,44 @@ struct ShortcutSendBackend {
     var createChat: @MainActor (_ profile: String, _ title: String) async throws -> VoiceThreadTarget
     /// The runtime the chat's next turn runs on, resuming it when it isn't live.
     var resumeChat: @MainActor (_ chat: VoiceThreadTarget) async throws -> String
+    /// The chat resumed from its saved history, never from the open chat's
+    /// runtime: for when Hermes no longer has the runtime `resumeChat` gave.
+    var reopenChat: @MainActor (_ chat: VoiceThreadTarget) async throws -> String
     var submit: @MainActor (_ chat: VoiceThreadTarget, _ runtimeID: String, _ text: String) async throws -> PromptSubmissionOutcome
     var liveSessions: @MainActor (_ profile: String) async throws -> [LiveSessionStatus]
-    var latestReply: @MainActor (_ chat: VoiceThreadTarget) async -> String?
+    var latestReply: @MainActor (_ chat: VoiceThreadTarget) async -> ShortcutReply?
+    /// The send after a reopen went in: clears what the failed try left.
+    var retryLanded: @MainActor () -> Void = {}
     var sleep: (_ seconds: Double) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }
     var now: () -> Date = Date.init
+}
+
+/// A chat's newest reply, with what tells it apart from an earlier reply
+/// worded the same ("Done." twice in a row).
+struct ShortcutReply: Equatable {
+    var text: String
+    /// Hermes's saved row id. Nil for a reply that streamed into the open
+    /// chat and hasn't been reloaded.
+    var rowID: Int? = nil
+    /// The message's id when it was read from the open chat.
+    var openChatID: String? = nil
+    /// The user's message it answers, when the read reached it.
+    var prompt: String? = nil
+
+    /// Whether this may be `earlier` read again. The text decides only when
+    /// nothing else can. `sent`: what this run sent.
+    func mayBe(_ earlier: ShortcutReply, sent: String? = nil) -> Bool {
+        if let rowID, let earlierRow = earlier.rowID { return rowID == earlierRow }
+        // Read from the saved history once and the open chat once, the ids
+        // can't be compared: a reply to what this run sent, when the
+        // earlier one answered something else, is a new turn's.
+        if let sent, prompt == sent, let earlierPrompt = earlier.prompt, earlierPrompt != sent { return false }
+        // A streamed reply saved since: the same one or a new one, by its
+        // id alone it can't tell.
+        if earlier.rowID == nil, rowID != nil { return text == earlier.text }
+        if let openChatID, let earlierID = earlier.openChatID { return openChatID == earlierID }
+        return text == earlier.text
+    }
 }
 
 /// The chats runs with a Chat Name went to, so the next run with that name
@@ -179,15 +218,45 @@ struct ShortcutSender {
         guard backend.now() < deadline else { throw ShortcutSendError.outOfTime }
 
         // A reused chat already has replies: only a new one answers this run.
-        var earlier: String?
+        var earlier: ShortcutReply?
         if reused && request.waitsForAnswer { earlier = await backend.latestReply(chat) }
-        switch try await backend.submit(chat, runtimeID, text) {
+        let outcome: PromptSubmissionOutcome
+        do {
+            outcome = try await backend.submit(chat, runtimeID, text)
+        } catch let error where HermesClient.isSessionNotFoundError(error) {
+            // Hermes no longer has that runtime, so nothing was sent, and the
+            // reply read before the first try still marks what came before.
+            // Right after a cold launch the open chat's id is the one from
+            // before, until the chat's own resume: reopen the chat and send
+            // once more.
+            do {
+                runtimeID = try await backend.reopenChat(chat)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch HermesError.notConnected {
+                throw ShortcutSendError.notConnected
+            } catch {
+                throw ShortcutSendError.reopenFailed
+            }
+            try Task.checkCancellation()
+            chat.runtimeSessionID = runtimeID
+            if let name { chats.save(chat, named: name, profile: profile, at: backend.now()) }
+            guard backend.now() < deadline else { throw ShortcutSendError.outOfTime }
+            do {
+                outcome = try await backend.submit(chat, runtimeID, text)
+            } catch let error where HermesClient.isSessionNotFoundError(error) {
+                // The reopened runtime is gone too: nothing was sent.
+                throw ShortcutSendError.reopenFailed
+            }
+            backend.retryLanded()
+        }
+        switch outcome {
         case .accepted: break
         case .queued: return .queued
         case .steered, .redirected: return .joinedRunningReply
         }
         guard request.waitsForAnswer else { return .sent }
-        return try await waitForReply(in: chat, runtimeID: runtimeID, earlier: earlier, deadline: deadline)
+        return try await waitForReply(in: chat, runtimeID: runtimeID, earlier: earlier, sent: text, deadline: deadline)
     }
 
     /// The saved chat's runtime, or nil when Hermes no longer has it (a new
@@ -203,7 +272,7 @@ struct ShortcutSender {
     }
 
     /// Throws only when the run is cancelled.
-    private func waitForReply(in chat: VoiceThreadTarget, runtimeID: String, earlier: String?, deadline: Date) async throws -> ShortcutSendOutcome {
+    private func waitForReply(in chat: VoiceThreadTarget, runtimeID: String, earlier: ShortcutReply?, sent: String, deadline: Date) async throws -> ShortcutSendOutcome {
         var sawRunning = false
         var missed = 0
         while backend.now().addingTimeInterval(Self.pollInterval) < deadline {
@@ -234,36 +303,41 @@ struct ShortcutSender {
                 // does) or it finished between two polls. Only a reply says
                 // which, so keep waiting until one comes.
                 if !sawRunning {
-                    if let reply = await newReply(in: chat, earlier: earlier) { return .answered(reply) }
+                    if let reply = await newReply(in: chat, earlier: earlier, sent: sent) { return .answered(reply) }
                     continue
                 }
             } else {
                 // Absence proves nothing until the turn was seen running (a
                 // new chat can be slow to list): only a reply ends the wait.
                 if !sawRunning {
-                    if let reply = await newReply(in: chat, earlier: earlier) { return .answered(reply) }
+                    if let reply = await newReply(in: chat, earlier: earlier, sent: sent) { return .answered(reply) }
                     continue
                 }
                 // After it ran, absence counts only when it repeats.
                 missed += 1
                 if missed < 2 { continue }
             }
-            if let reply = await newReply(in: chat, earlier: earlier) { return .answered(reply) }
+            if let reply = await newReply(in: chat, earlier: earlier, sent: sent) { return .answered(reply) }
             // The reply can land a moment after the turn ends.
             guard backend.now().addingTimeInterval(1) < deadline else { break }
             try await backend.sleep(1)
-            if let reply = await newReply(in: chat, earlier: earlier) { return .answered(reply) }
+            if let reply = await newReply(in: chat, earlier: earlier, sent: sent) { return .answered(reply) }
             return .stillWorking
         }
         // Out of time: a reply that landed in the last moments still counts.
-        if let reply = await newReply(in: chat, earlier: earlier) { return .answered(reply) }
+        if let reply = await newReply(in: chat, earlier: earlier, sent: sent) { return .answered(reply) }
         return .stillWorking
     }
 
-    private func newReply(in chat: VoiceThreadTarget, earlier: String?) async -> String? {
-        guard let reply = await backend.latestReply(chat)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !reply.isEmpty, reply != earlier?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
-        return reply
+    private func newReply(in chat: VoiceThreadTarget, earlier: ShortcutReply?, sent: String) async -> String? {
+        guard var reply = await backend.latestReply(chat) else { return nil }
+        reply.text = reply.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reply.text.isEmpty else { return nil }
+        if var earlier {
+            earlier.text = earlier.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if reply.mayBe(earlier, sent: sent) { return nil }
+        }
+        return reply.text
     }
 
     /// A new chat's title: the text's first line, shortened.
@@ -283,15 +357,15 @@ struct ShortcutSender {
 /// Background-only: the text goes to Hermes without Conduit opening.
 @available(iOS 16.0, *)
 struct SendToHermesIntent: AppIntent {
-    static var title: LocalizedStringResource = "Send to Hermes"
-    static var description = IntentDescription(
+    static let title: LocalizedStringResource = "Send to Hermes"
+    static let description = IntentDescription(
         "Send text to your Hermes agent as a chat message. With Wait for Answer on, Hermes's reply comes back to the shortcut."
     )
 
     /// iOS 17–25 declaration; see `StartVoiceConversationIntent`. Must stay
     /// a boolean literal for the App Intents metadata processor.
     @available(iOS, deprecated: 26.0, message: "Use supportedModes on iOS 26+; retained for iOS 17–25.")
-    static var openAppWhenRun: Bool = false
+    static let openAppWhenRun: Bool = false
 
     @available(iOS 26.0, *)
     static var supportedModes: IntentModes {

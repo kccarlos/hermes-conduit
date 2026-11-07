@@ -1,5 +1,23 @@
 import Foundation
 
+/// The kind of card waiting on the user that the jump button goes to.
+enum PendingDecisionKind: Equatable {
+    case question
+    case approval
+    /// A password, secret, website login or code (an input card).
+    case input
+
+    init(message: ChatMessage) {
+        if message.approval != nil {
+            self = .approval
+        } else if message.inputPrompt != nil {
+            self = .input
+        } else {
+            self = .question
+        }
+    }
+}
+
 enum ChatResumeRestorationDestination: Equatable {
     case latest
     case snapshot(ChatScrollSnapshot)
@@ -38,10 +56,20 @@ final class ChatResumeCoordinator {
         self.store = store
     }
 
+    /// The newest question, approval or input card still waiting on the user.
     /// A mixed batch may retain an expired sibling while another question
     /// remains answerable; only request-level expiry makes the whole card stale.
     static func pendingClarifyMessageID(in messages: [ChatMessage]) -> String? {
         messages.last { message in
+            if let approval = message.approval {
+                // An answer on its way isn't waiting on the user, as a
+                // question's isn't; the voice panels still show its card.
+                return approval.status == .pending || approval.status == .error
+            }
+            if let prompt = message.inputPrompt {
+                // A password, login or code Hermes is waiting for.
+                return prompt.isAnswerable
+            }
             guard let clarify = message.clarify else { return false }
             return clarify.needsAnswer
         }?.id
@@ -115,7 +143,8 @@ final class ChatResumeCoordinator {
         purpose: ChatResumeSyncPurpose,
         currentSessionID: String?,
         botOwnedSessionIDs: Set<String> = [],
-        savedSelectionIsAuthoritative: Bool = true
+        savedSelectionIsAuthoritative: Bool = true,
+        unlistedSessionIDs: Set<String> = []
     ) -> SessionSummary? {
         let savedSessionID = store.lastSessionID(for: profile)
         let selected = ChatResumeSessionResolver.target(
@@ -126,7 +155,8 @@ final class ChatResumeCoordinator {
             currentSessionID: currentSessionID,
             activeProfile: profile,
             botOwnedSessionIDs: botOwnedSessionIDs,
-            savedSelectionIsAuthoritative: savedSelectionIsAuthoritative
+            savedSelectionIsAuthoritative: savedSelectionIsAuthoritative,
+            unlistedSessionIDs: unlistedSessionIDs
         )
 
         guard purpose == .automaticReturn else { return selected }
@@ -168,14 +198,28 @@ final class ChatResumeCoordinator {
         if pendingSessionKey != nil { viewportIsFrozen = true }
     }
 
-    func recordViewport(_ snapshot: ChatScrollSnapshot, for key: ChatScrollSessionKey) {
+    /// Stages the reading and saves it 300 ms later, or once `holdWhile`
+    /// turns false (5 s at most): a save writes the defaults, and SwiftUI redraws every
+    /// `@AppStorage` view on any write there, which mid-scroll cost frames.
+    /// Leaving the app saves at once (`freezeViewport`).
+    func recordViewport(
+        _ snapshot: ChatScrollSnapshot,
+        for key: ChatScrollSessionKey,
+        holdWhile: (@MainActor @Sendable () -> Bool)? = nil
+    ) {
         guard !viewportIsFrozen, key.isValid else { return }
 
         store.stageSnapshot(snapshot, for: key, at: Date())
         pendingFlushTask?.cancel()
-        pendingFlushTask = Task { [weak self] in
+        pendingFlushTask = Task { @MainActor [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(300))
+                // At most 5 s, so a scroll that never seems to end still saves.
+                var held = 0
+                while holdWhile?() == true, held < 20 {
+                    try await Task.sleep(for: .milliseconds(250))
+                    held += 1
+                }
             } catch {
                 return
             }

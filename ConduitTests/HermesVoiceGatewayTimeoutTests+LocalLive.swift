@@ -60,6 +60,67 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertNil(LocalLiveProtocol.turnFrame(try data(["type": "response.output_audio_transcript.delta", "delta": "\"conduit.turn\""])))
     }
 
+    func testLocalLiveStopsPlaybackWhenTheServerClearsOrCancelsItsAudio() throws {
+        func data(_ object: [String: Any]) throws -> Data { try JSONSerialization.data(withJSONObject: object) }
+        for type in ["output_audio_buffer.clear", "output_audio_buffer.cleared", "response.cancel", "response.cancelled"] {
+            XCTAssertTrue(LocalLiveProtocol.stopsPlayback(try data(["type": type])), type)
+        }
+        XCTAssertTrue(LocalLiveProtocol.stopsPlayback(try data(["type": "response.done", "response": ["status": "cancelled"]])))
+        XCTAssertFalse(LocalLiveProtocol.stopsPlayback(try data(["type": "response.done", "response": ["status": "completed"]])))
+        XCTAssertFalse(LocalLiveProtocol.stopsPlayback(try data(["type": "response.output_audio.delta", "delta": "AAAA"])))
+        // The model saying the words doesn't stop it.
+        XCTAssertFalse(LocalLiveProtocol.stopsPlayback(try data(["type": "response.output_audio_transcript.delta", "delta": "response.cancel \"cancelled\""])))
+    }
+
+    func testLocalLiveSessionStopsTheReplyWhenTheServerCutsItsAudio() async throws {
+        let (session, sockets) = makeLocalLiveSession()
+        var interruptions = 0
+        session.onEvent = { event in
+            if case .interrupted = event { interruptions += 1 }
+        }
+        session.start()
+        await localLiveSettle(until: { sockets().first?.sent.isEmpty == false })
+        let socket = try XCTUnwrap(sockets().first)
+        socket.deliver(["type": "session.updated", "session": [String: Any]()])
+        try await passLocalLiveReadiness(socket, session: session)
+        // The check's own response ends first: its events aren't the call's.
+        socket.deliver(["type": "response.done"])
+        XCTAssertEqual(interruptions, 0)
+
+        socket.deliver(["type": "output_audio_buffer.clear"])
+        await localLiveSettle(until: { interruptions == 1 })
+        socket.deliver(["type": "response.done", "response": ["status": "cancelled"]])
+        await localLiveSettle(until: { interruptions == 2 })
+        XCTAssertEqual(interruptions, 2)
+        session.stop()
+    }
+
+    /// Local Live traces the same turn steps as Grok Live (#1418).
+    func testLocalLiveSessionTracesTurnDetectionAndTheUsersTurns() async throws {
+        let (session, sockets) = makeLocalLiveSession()
+        var trace: [String] = []
+        session.onTrace = { trace.append($0) }
+        session.start()
+        await localLiveSettle(until: { sockets().first?.sent.isEmpty == false })
+        let socket = try XCTUnwrap(sockets().first)
+        socket.deliver(["type": "session.updated", "session": ["turn_detection": ["type": "server_vad", "silence_duration_ms": 500]]])
+        try await passLocalLiveReadiness(socket, session: session)
+        socket.deliver(["type": "response.done"])
+
+        session.send(.audio(Data(count: 3_200)))
+        socket.deliver(["type": "input_audio_buffer.speech_started"])
+        socket.deliver(["type": "input_audio_buffer.speech_stopped"])
+        socket.deliver(["type": "response.created"])
+        await localLiveSettle(until: { trace.contains("Reply started") })
+        XCTAssertEqual(trace, [
+            "Turn detection: server_vad, silence ms 500",
+            "Speech start heard (before it: microphone loudest -96 dBFS, quietest -96 dBFS)",
+            "Speech end heard after 0.0 s (no microphone audio)",
+            "Reply started",
+        ])
+        session.stop()
+    }
+
     func testLocalLiveSplitsLongRepliesIntoFramesThePluginTakes() {
         XCTAssertEqual(LocalLiveProtocol.deltaChunks(""), [])
         XCTAssertEqual(LocalLiveProtocol.deltaChunks("Hello."), ["Hello."])
@@ -109,6 +170,67 @@ extension HermesVoiceGatewayTimeoutTests {
         await localLiveSettle(until: { session.state == .ready })
     }
 
+    func testLocalLiveAgentFramesCarryTheCallsToolsAndAnswers() throws {
+        func data(_ object: [String: Any]) throws -> Data { try JSONSerialization.data(withJSONObject: object) }
+        let declaration = GeminiLiveProtocol.FunctionDeclaration(
+            name: "start_job", description: "Start a job.",
+            parameters: ["type": "OBJECT", "properties": ["instructions": ["type": "STRING"]]], behavior: .nonBlocking)
+        let configure = LocalLiveProtocol.agentConfigure(.init(instructions: "Be brief.", functions: [declaration]))
+        XCTAssertEqual(configure["type"] as? String, "conduit.agent")
+        XCTAssertEqual(configure["instructions"] as? String, "Be brief.")
+        let tool = try XCTUnwrap((configure["tools"] as? [[String: Any]])?.first)
+        XCTAssertEqual(tool["name"] as? String, "start_job")
+        XCTAssertEqual((tool["parameters"] as? [String: Any])?["type"] as? String, "object", "JSON Schema types are lowercase")
+
+        let call = LocalLiveProtocol.agentFrame(try data(["type": "conduit.tool.call", "call_id": "ll1", "name": "start_job",
+                                                           "arguments": "{\"instructions\":\"check mail\"}"]))
+        XCTAssertEqual(call, .toolCall(GeminiLiveProtocol.FunctionCall(id: "ll1", name: "start_job", arguments: ["instructions": "check mail"])))
+        XCTAssertEqual(LocalLiveProtocol.agentFrame(try data(["type": "conduit.tool.late", "call_id": "ll1"])), .late(callID: "ll1"))
+        XCTAssertNil(LocalLiveProtocol.agentFrame(try data(["type": "conduit.agent.ready", "tools": 1])))
+        XCTAssertNil(LocalLiveProtocol.agentFrame(try data(["type": "conduit.turn", "turn_id": "t1", "text": "Hi"])))
+
+        let result = LocalLiveProtocol.toolResult(callID: "ll1", result: ["status": "started"], speak: true)
+        XCTAssertEqual(result["output"] as? String, "{\"status\":\"started\"}")
+        XCTAssertEqual(result["speak"] as? Bool, true)
+    }
+
+    func testLocalLiveAgentModeRunsTheFastModelsToolCallsHere() async throws {
+        let (session, sockets) = makeLocalLiveSession()
+        var events: [GeminiLiveProtocol.ServerEvent] = []
+        session.onEvent = { events.append($0) }
+        session.agentSetup = { .init(instructions: "Be brief.", functions: GeminiLiveToolBridge.declarations(webSearch: false)) }
+        session.start()
+        await localLiveSettle(until: { (sockets().first?.sent.count ?? 0) >= 2 })
+        let socket = try XCTUnwrap(sockets().first)
+        XCTAssertEqual(socket.sent.prefix(2).map { $0["type"] as? String }, ["session.update", "conduit.agent"],
+                       "the plugin has the tools before the readiness check")
+        XCTAssertNil((socket.sent[0]["session"] as? [String: Any])?["tools"], "the speech server never sees a tool")
+        socket.deliver(["type": "session.updated"])
+        try await passLocalLiveReadiness(socket, session: session)
+
+        socket.deliver(["type": "conduit.tool.call", "call_id": "ll1", "name": "list_jobs", "arguments": "{}"])
+        await localLiveSettle(until: { !events.isEmpty })
+        XCTAssertEqual(events, [.toolCall([GeminiLiveProtocol.FunctionCall(id: "ll1", name: "list_jobs", arguments: [:])])])
+
+        let before = socket.sent.count
+        session.send(.toolResponse(id: "ll1", name: "list_jobs", result: ["jobs": "none"], scheduling: nil))
+        session.send(.contextNote("typed in the chat"))
+        await localLiveSettle(until: { socket.sent.count >= before + 2 })
+        XCTAssertEqual(socket.sent[before]["type"] as? String, "conduit.tool.result")
+        XCTAssertEqual(socket.sent[before]["call_id"] as? String, "ll1")
+        XCTAssertEqual(socket.sent[before]["speak"] as? Bool, true)
+        XCTAssertEqual(socket.sent[before + 1]["type"] as? String, "conduit.agent.note")
+
+        // An answer the fast model stopped waiting for is said as an update.
+        socket.deliver(["type": "conduit.tool.late", "call_id": "ll1"])
+        await localLiveSettle(until: { socket.sent.count >= before + 4 })
+        XCTAssertEqual(socket.sent.suffix(2).map { $0["type"] as? String }, ["conversation.item.create", "response.create"])
+        let item = try XCTUnwrap(socket.sent[before + 2]["item"] as? [String: Any])
+        let text = try XCTUnwrap(((item["content"] as? [[String: Any]])?.first)?["text"] as? String)
+        XCTAssertTrue(text.contains("list_jobs") && text.contains("jobs: none"), text)
+        session.stop()
+    }
+
     func testLocalLiveSessionAnswersThePluginsTurnsOnTheSameSocket() async throws {
         let (session, sockets) = makeLocalLiveSession()
         var turns: [String] = []
@@ -154,6 +276,30 @@ extension HermesVoiceGatewayTimeoutTests {
         await localLiveSettle(until: { socket.sent.count >= 5 })
         XCTAssertEqual(socket.sent.dropFirst(3).map { $0["type"] as? String }, ["conversation.item.create", "response.create"])
         session.stop()
+    }
+
+    func testLocalLiveSessionTellsTheServerTheUserStoppedTheReplyAheadOfTheirAudio() async throws {
+        let (session, sockets) = makeLocalLiveSession()
+        session.start()
+        await localLiveSettle(until: { sockets().first?.sent.isEmpty == false })
+        let socket = try XCTUnwrap(sockets().first)
+        session.cancelResponse()
+        socket.deliver(["type": "session.updated"])
+        try await passLocalLiveReadiness(socket, session: session)
+        XCTAssertFalse(socket.sent.contains { $0["type"] as? String == "response.cancel" }, "nothing goes out before the call is ready")
+        // The check's answer is written after the call went ready.
+        await localLiveSettle(until: { socket.sent.contains { $0["type"] as? String == "conduit.turn.done" } })
+
+        // The Interrupt button, then the user speaking again (#1325): a
+        // server that shuts its microphone while it speaks opens it first.
+        let before = socket.sent.count
+        session.cancelResponse()
+        session.send(.audio(Data(repeating: 1, count: 640)))
+        await localLiveSettle(until: { socket.sent.count >= before + 2 })
+        XCTAssertEqual(socket.sent.dropFirst(before).map { $0["type"] as? String }, ["response.cancel", "input_audio_buffer.append"])
+        session.stop()
+        session.cancelResponse()
+        XCTAssertEqual(socket.sent.count, before + 2, "a stopped call sends nothing")
     }
 
     func testLocalLiveSessionDropsOpenTurnsWhenItsConnectionEnds() async throws {
@@ -286,6 +432,30 @@ extension HermesVoiceGatewayTimeoutTests {
         session.stop()
     }
 
+    /// The upsampler is the connection's: a dropped connection's held
+    /// sample never reaches the next connection's first chunk.
+    func testLocalLiveReconnectStartsTheMicrophoneStreamAfresh() async throws {
+        let (session, sockets) = makeLocalLiveSession()
+        session.start()
+        await localLiveSettle(until: { sockets().first?.sent.isEmpty == false })
+        let first = try XCTUnwrap(sockets().first)
+        first.deliver(["type": "session.updated"])
+        try await passLocalLiveReadiness(first, session: session)
+        // 1, 3 go out as 1, 2; the 3 is held for the next chunk.
+        session.send(.audio(Data([1, 0, 3, 0])))
+        await localLiveSettle(until: { first.sent.last?["type"] as? String == "input_audio_buffer.append" })
+
+        first.serverClose(nil)
+        await localLiveSettle(until: { sockets().count == 2 && sockets()[1].sent.isEmpty == false })
+        let second = try XCTUnwrap(sockets().last)
+        second.deliver(["type": "session.updated"])
+        try await passLocalLiveReadiness(second, session: session)
+        session.send(.audio(Data([5, 0])))
+        await localLiveSettle(until: { second.sent.last?["type"] as? String == "input_audio_buffer.append" })
+        XCTAssertEqual(second.sent.last?["audio"] as? String, Data([5, 0]).base64EncodedString(), "Nothing held from the dropped connection")
+        session.stop()
+    }
+
     func testLocalLiveSessionFailsWhenTheServerAnswersWithoutAskingHermes() async throws {
         let (session, sockets) = makeLocalLiveSession()
         session.start()
@@ -336,6 +506,41 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(items.first { $0.name == "mode" }?.value, "speak")
     }
 
+    func testVoiceRoutesNameAnotherProfileAsConduitProfileWhenThePluginTakesIt() throws {
+        // Hermes 0.22.3+ sends ?profile=<another profile> to that profile's
+        // plugin host, which has no sockets (#1336).
+        var plugin = NotifierPluginStatus()
+        XCTAssertEqual(plugin.dashboardProfileParameter, "profile", "not asked yet: as before")
+        plugin.state = .reported(version: "0.89.0", capabilities: ["local-live"])
+        XCTAssertEqual(plugin.dashboardProfileParameter, "profile", "an older plugin keeps ?profile=")
+        plugin.state = .reported(version: "0.90.0", capabilities: ["local-live", DashboardPath.dashboardProfilesCapability])
+        XCTAssertEqual(plugin.dashboardProfileParameter, DashboardPath.conduitProfileParameter)
+
+        XCTAssertEqual(DashboardPath.withProfile(LocalLiveProtocol.statusPath, profile: "work", parameter: "conduit_profile"),
+                       LocalLiveProtocol.statusPath + "?conduit_profile=work")
+        XCTAssertEqual(DashboardPath.withProfile(LocalLiveProtocol.statusPath, profile: "default", parameter: "conduit_profile"),
+                       LocalLiveProtocol.statusPath, "the dashboard's own profile still goes without one")
+        XCTAssertEqual(LocalLiveProtocol.profileQueryItems("work", parameter: "conduit_profile"),
+                       [URLQueryItem(name: "conduit_profile", value: "work")])
+        // Grok's and the listening socket: as before with ?profile=, and
+        // without the dashboard's own profile with ?conduit_profile=.
+        XCTAssertEqual(DashboardPath.socketProfileItems("default", parameter: "profile"),
+                       [URLQueryItem(name: "profile", value: "default")])
+        XCTAssertEqual(DashboardPath.socketProfileItems("default", parameter: "conduit_profile"), [])
+        XCTAssertEqual(DashboardPath.socketProfileItems("work", parameter: "conduit_profile"),
+                       [URLQueryItem(name: "conduit_profile", value: "work")])
+        let speak = try HermesVoiceGateway.speechServerSpeechRequest(
+            baseURL: "https://hermes.example", ticket: "t", profile: "work", profileParameter: "conduit_profile", cloudflareAccess: nil)
+        let speakItems = URLComponents(url: try XCTUnwrap(speak.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(speakItems.first { $0.name == "conduit_profile" }?.value, "work")
+        XCTAssertNil(speakItems.first { $0.name == "profile" })
+        let listen = try HermesVoiceGateway.speechServerRequest(
+            baseURL: "https://hermes.example", ticket: "t", profile: "work", profileParameter: "conduit_profile", cloudflareAccess: nil)
+        let listenItems = URLComponents(url: try XCTUnwrap(listen.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(listenItems.first { $0.name == "conduit_profile" }?.value, "work")
+        XCTAssertNil(listenItems.first { $0.name == "profile" })
+    }
+
     func testLocalLiveSetupCopiesAsOneBlockForAnAgent() throws {
         let status = SpeechServerVoiceStatus(response: [
             "available": true,
@@ -380,6 +585,9 @@ private final class LocalLiveTurnScript {
     private(set) var redirected: [String] = []
     private(set) var spoken: [String] = []
     private(set) var done: [String] = []
+    private(set) var shown: [String] = []
+    private(set) var approvalAnswers: [String] = []
+    var hasScreen = true
 
     func makeRunner() -> LocalLiveTurnRunner {
         let runner = LocalLiveTurnRunner(backend: LocalLiveTurnRunner.Backend(
@@ -396,16 +604,97 @@ private final class LocalLiveTurnScript {
                 self.redirected.append(text)
                 self.duringRedirect?()
                 return self.redirectResult
+            },
+            respondToApproval: { [unowned self] _, choice, _ in
+                self.approvalAnswers.append(choice)
+                return true
             }
         ))
         runner.onDelta = { [unowned self] id, text in self.spoken.append("\(id):\(text)") }
         runner.onDone = { [unowned self] id in self.done.append(id) }
+        runner.onVisual = { [unowned self] markdown in
+            self.shown.append(markdown)
+            return self.hasScreen
+        }
         return runner
     }
 }
 
 @MainActor
 extension VoiceConversationControllerTests {
+    /// Issue 1797: a call whose chat was deleted goes on in a new one, on
+    /// the lost chat's bot, kept for the rest of the call.
+    func testLocalLiveCallGoesOnInANewChatWhenItsChatWasDeleted() async throws {
+        let attached = VoiceThreadTarget(runtimeSessionID: "rt-bot", storedSessionID: "st-bot", title: "Furina", profile: "furina")
+        var made: [String?] = []
+        let create: @MainActor (String?) async throws -> VoiceThreadTarget = { profile in
+            made.append(profile)
+            return VoiceThreadTarget(runtimeSessionID: "rt-new\(made.count)", storedSessionID: "st-new\(made.count)", title: "", profile: profile)
+        }
+
+        // Found: the attached chat, then the call's own.
+        var live = try await LocalLiveTurnRunner.callChat(attached: attached, own: nil, runtime: { _ in "rt-bot-2" }, create: create)
+        XCTAssertEqual(live.chat, LocalLiveTurnRunner.Chat(runtimeID: "rt-bot-2", profile: "furina"))
+        XCTAssertNil(live.own)
+        XCTAssertTrue(made.isEmpty)
+
+        // The attached chat is gone: a new chat on its bot, kept as the call's own.
+        let lost = try await LocalLiveTurnRunner.callChat(attached: attached, own: nil, runtime: { _ in nil }, create: create)
+        XCTAssertEqual(made, ["furina"])
+        XCTAssertEqual(lost.chat, LocalLiveTurnRunner.Chat(runtimeID: "rt-new1", profile: "furina"))
+        XCTAssertEqual(lost.own?.storedSessionID, "st-new1")
+
+        // The next turn runs there.
+        live = try await LocalLiveTurnRunner.callChat(attached: nil, own: lost.own, runtime: { $0.runtimeSessionID }, create: create)
+        XCTAssertEqual(live.chat.runtimeID, "rt-new1")
+        XCTAssertEqual(live.own, lost.own)
+        XCTAssertEqual(made.count, 1)
+
+        // Resumed on another runtime: the own chat follows it (no stored id),
+        // so isDeletedChat matches a delete that names only the new runtime.
+        let legacy = VoiceThreadTarget(runtimeSessionID: "rt-old", storedSessionID: nil, title: "")
+        let resumed = try await LocalLiveTurnRunner.callChat(attached: nil, own: legacy, runtime: { _ in "rt-reopened" }, create: create)
+        XCTAssertEqual(resumed.chat.runtimeID, "rt-reopened")
+        XCTAssertEqual(resumed.own?.runtimeSessionID, "rt-reopened")
+        XCTAssertEqual(made.count, 1)
+
+        // A call from Home whose own chat was deleted makes another.
+        let home = VoiceThreadTarget(runtimeSessionID: "rt-home", storedSessionID: "st-home", title: "")
+        let again = try await LocalLiveTurnRunner.callChat(attached: nil, own: home, runtime: { _ in nil }, create: create)
+        XCTAssertEqual(made, ["furina", nil])
+        XCTAssertEqual(again.chat, LocalLiveTurnRunner.Chat(runtimeID: "rt-new2"))
+        XCTAssertEqual(again.own?.runtimeSessionID, "rt-new2")
+
+        // Any other failure is the turn's: the chat is kept.
+        do {
+            _ = try await LocalLiveTurnRunner.callChat(attached: nil, own: home, runtime: { _ in throw URLError(.timedOut) }, create: create)
+            XCTFail("a failed resume isn't a deleted chat")
+        } catch {}
+        XCTAssertEqual(made.count, 2)
+    }
+
+    func testLocalLiveYesAnswersTheApprovalTheReplyWaitsOn() async {
+        let script = LocalLiveTurnScript()
+        let runner = script.makeRunner()
+        runner.start(turnID: "t1", text: "Clear the old logs")
+        await localLiveSettle(until: { !script.submitted.isEmpty })
+        let approval = ApprovalActivity(sessionId: "rt-1", requestId: "req-1", command: "rm -rf logs/old",
+                                        description: "Delete the old logs", choices: nil, allowPermanent: false,
+                                        smartDenied: false, status: .pending, choice: nil, error: nil)
+        runner.observe(.approval(sessionId: "rt-1", activity: approval))
+        XCTAssertTrue(script.spoken.last?.contains("Delete the old logs") == true, "the call says what it asks")
+
+        // The yes answers it: it isn't put into the paused reply or sent as a turn.
+        runner.start(turnID: "t2", text: "Yes")
+        await localLiveSettle(until: { !script.approvalAnswers.isEmpty })
+        XCTAssertEqual(script.approvalAnswers, ["once"])
+        XCTAssertEqual(script.redirected, [])
+        XCTAssertEqual(script.submitted, ["Clear the old logs"])
+        // The reply goes on and answers the turn that said yes.
+        runner.observe(.messageDelta(sessionId: "rt-1", text: "Done."))
+        XCTAssertEqual(script.spoken.last, "t2:Done.")
+    }
+
     func testLocalLiveTurnStreamsHermesReplyAsItIsWritten() async {
         let script = LocalLiveTurnScript()
         let runner = script.makeRunner()
@@ -425,6 +714,220 @@ extension VoiceConversationControllerTests {
         XCTAssertFalse(runner.isFollowingReply)
     }
 
+    func testLocalLiveTurnLeavesNarratedActionsOutOfSpeech() async {
+        let script = LocalLiveTurnScript()
+        let runner = script.makeRunner()
+        runner.start(turnID: "t1", text: "Is it done?")
+        await localLiveSettle(until: { !script.submitted.isEmpty })
+        let chunks = ["Order! *sets", " down the gav", "el* The heist ", "is done, 5 * 3", " ways."]
+        for chunk in chunks {
+            runner.observe(.messageDelta(sessionId: "rt-1", text: chunk))
+        }
+        runner.observe(.messageComplete(sessionId: "rt-1", messageId: "m1", content: chunks.joined(), reasoning: nil))
+        // A dropped action leaves a space, which can double across deltas.
+        let said = script.spoken.map { $0.replacingOccurrences(of: "t1:", with: "") }.joined()
+            .replacingOccurrences(of: "  ", with: " ")
+        XCTAssertEqual(said, "Order! The heist is done, 5 * 3 ways.", "the action is left out, the spaced * is said")
+        XCTAssertEqual(script.done, ["t1"])
+    }
+
+    func testLocalLiveSaysHeldWordsBeforeTheCallsOwnLine() async {
+        let script = LocalLiveTurnScript()
+        let runner = script.makeRunner()
+        runner.start(turnID: "t1", text: "Clear the old logs")
+        await localLiveSettle(until: { !script.submitted.isEmpty })
+        runner.observe(.messageDelta(sessionId: "rt-1", text: "Let me check *the calendar for"))
+        let approval = ApprovalActivity(sessionId: "rt-1", requestId: "req-1", command: "rm -rf logs/old",
+                                        description: "Delete the old logs", choices: nil, allowPermanent: false,
+                                        smartDenied: false, status: .pending, choice: nil, error: nil)
+        runner.observe(.approval(sessionId: "rt-1", activity: approval))
+        let said = script.spoken.map { $0.replacingOccurrences(of: "t1:", with: "") }.joined()
+        XCTAssertTrue(said.hasPrefix("Let me check *the calendar for\n"), "an unclosed marker's words are said, not dropped")
+        XCTAssertTrue(said.contains("Delete the old logs"))
+    }
+
+    func testLocalLiveTurnShowsWhatsToBeSeenAndSaysTheRest() async {
+        let script = LocalLiveTurnScript()
+        let runner = script.makeRunner()
+        runner.start(turnID: "t1", text: "Weather this week?")
+        await localLiveSettle(until: { !script.submitted.isEmpty })
+        let reply = "Mild all week.\n| Day | High |\n|---|---|\n| Mon | 20 |\nSee [the forecast](https://example.com/f)."
+        for chunk in stride(from: 0, to: reply.count, by: 4) {
+            let start = reply.index(reply.startIndex, offsetBy: chunk)
+            let end = reply.index(start, offsetBy: 4, limitedBy: reply.endIndex) ?? reply.endIndex
+            runner.observe(.messageDelta(sessionId: "rt-1", text: String(reply[start..<end])))
+        }
+        runner.observe(.messageComplete(sessionId: "rt-1", messageId: "m1", content: reply, reasoning: nil))
+        let said = script.spoken.map { $0.replacingOccurrences(of: "t1:", with: "") }.joined()
+        XCTAssertEqual(said, "Mild all week.\nSee the forecast.\n" + LocalLiveTurnRunner.onScreenLine)
+        XCTAssertEqual(script.shown, ["| Day | High |\n|---|---|\n| Mon | 20 |\n\n- [the forecast](https://example.com/f)"])
+        XCTAssertEqual(script.done, ["t1"])
+    }
+
+    func testLocalLiveTurnDoesntShowWhatHermesShowedOrHasNoScreenFor() async {
+        let script = LocalLiveTurnScript()
+        let runner = script.makeRunner()
+        runner.start(turnID: "t1", text: "Show me the table")
+        await localLiveSettle(until: { !script.submitted.isEmpty })
+        runner.observe(.toolStart(sessionId: "rt-1", toolName: PresentedCard.toolName, toolInput: nil))
+        runner.observe(.messageComplete(sessionId: "rt-1", messageId: "m1", content: "It's up.\n| a |", reasoning: nil))
+        XCTAssertEqual(script.shown, [], "conduit_show already put it on screen")
+        XCTAssertEqual(script.spoken, ["t1:It's up.\n"])
+
+        script.hasScreen = false
+        runner.start(turnID: "t2", text: "And the code?")
+        await localLiveSettle(until: { script.submitted.count == 2 })
+        runner.observe(.messageComplete(sessionId: "rt-1", messageId: "m2", content: "Here.\n```\nx = 1\n```", reasoning: nil))
+        XCTAssertEqual(script.shown, ["```\nx = 1\n```"])
+        XCTAssertEqual(script.spoken.last, "t2:Here.\n", "no screen took it: the call doesn't say it's there")
+
+        script.hasScreen = true
+        runner.start(turnID: "t3", text: "And now?")
+        await localLiveSettle(until: { script.submitted.count == 3 })
+        runner.observe(.messageComplete(sessionId: "rt-1", messageId: "m3", content: "Now.\n| b |", reasoning: nil))
+        XCTAssertEqual(Array(script.spoken.suffix(2)), ["t3:Now.\n", "t3:" + LocalLiveTurnRunner.onScreenLine],
+                       "a line already ended: no extra pause")
+
+        // A card stands for the tables, but a file the reply attached still shows.
+        runner.start(turnID: "t4", text: "And the report?")
+        await localLiveSettle(until: { script.submitted.count == 4 })
+        runner.observe(.toolStart(sessionId: "rt-1", toolName: PresentedCard.toolName, toolInput: nil))
+        runner.observe(.messageComplete(sessionId: "rt-1", messageId: "m4", content: "It's up.\nMEDIA:/r.pdf\n| c |", reasoning: nil))
+        XCTAssertEqual(script.shown.last, "MEDIA:/r.pdf")
+        XCTAssertEqual(Array(script.spoken.suffix(2)), ["t4:It's up.\n", "t4:" + LocalLiveTurnRunner.onScreenLine])
+        XCTAssertEqual(script.done, ["t1", "t2", "t3", "t4"])
+    }
+
+    func testSpokenVisualSplitterGivesTheSameResultHoweverTheReplyIsSplit() {
+        let reply = """
+        Here's the plan, or https://example.com/plan.
+        https://example.com/raw
+        ```swift
+        let x = 1
+        ```
+        Inline ![chart](https://example.com/c.png) and [a link](https://example.com/l)!
+        ~~~
+        open fence
+        """
+        func split(every size: Int) -> (String, String) {
+            var splitter = SpokenVisualSplitter()
+            var said = ""
+            var index = reply.startIndex
+            while index < reply.endIndex {
+                let end = reply.index(index, offsetBy: size, limitedBy: reply.endIndex) ?? reply.endIndex
+                said += splitter.feed(String(reply[index..<end]))
+                index = end
+            }
+            said += splitter.finish()
+            return (said, splitter.visualMarkdown)
+        }
+        let whole = split(every: reply.count)
+        XCTAssertEqual(whole.0, "Here's the plan, or .\nInline  and a link!\n")
+        XCTAssertEqual(whole.1, """
+        - https://example.com/plan
+        - https://example.com/raw
+
+        ```swift
+        let x = 1
+        ```
+
+        - ![chart](https://example.com/c.png)
+        - [a link](https://example.com/l)
+
+        ~~~
+        open fence
+        ~~~
+        """)
+        // A word ending in "h" or "ht" is said whole, at once.
+        var words = SpokenVisualSplitter()
+        XCTAssertEqual(words.feed("Go with"), "Go with")
+        XCTAssertEqual(words.feed(" light h"), " light ")
+        XCTAssertEqual(words.feed("ttps://a.b ok"), " ok")
+        XCTAssertEqual(words.visualMarkdown, "- https://a.b")
+        // So is a word ending in "!".
+        var exclaimed = SpokenVisualSplitter()
+        XCTAssertEqual(exclaimed.feed("Hello!"), "Hello!")
+        XCTAssertEqual(exclaimed.feed(" See !"), " See ")
+        // A fence opened with a language inside a block is content, not its end.
+        var nested = SpokenVisualSplitter()
+        XCTAssertEqual(nested.feed("```markdown\n```bash\nls\n"), "", "ls is still inside the block")
+        XCTAssertEqual(nested.feed("```\nAfter.\n"), "After.\n")
+        XCTAssertEqual(nested.visualMarkdown, "```markdown\n```bash\nls\n```")
+
+        for size in 1...9 {
+            let parts = split(every: size)
+            XCTAssertEqual(parts.0, whole.0, "split every \(size)")
+            XCTAssertEqual(parts.1, whole.1, "split every \(size)")
+        }
+    }
+
+    func testSpokenVisualSplitterLeavesFileTagsUnsaid() {
+        // Ernest's Local voice call on the farm (2026-10-28): his reply was
+        // a text_to_speech file tag, which the speech server read out.
+        let reply = "Here's your briefing.\nMEDIA:/opt/data/cache/audio/tts_20261028_111922_603221.mp3\nSocial media: fine, and MEDIA:/tmp/b.pdf too [[audio_as_voice]]"
+        func split(every size: Int) -> String {
+            var splitter = SpokenVisualSplitter()
+            var said = ""
+            var index = reply.startIndex
+            while index < reply.endIndex {
+                let end = reply.index(index, offsetBy: size, limitedBy: reply.endIndex) ?? reply.endIndex
+                said += splitter.feed(String(reply[index..<end]))
+                index = end
+            }
+            return said + splitter.finish()
+        }
+        let whole = split(every: reply.count)
+        XCTAssertFalse(whole.contains("MEDIA"), whole)
+        XCTAssertFalse(whole.contains("/opt/"), whole)
+        XCTAssertFalse(whole.contains("[["), whole)
+        XCTAssertTrue(whole.hasPrefix("Here's your briefing.\nSocial media: fine, and"), whole)
+        for size in 1...9 {
+            XCTAssertEqual(split(every: size), whole, "split every \(size)")
+        }
+        XCTAssertEqual(SpokenMediaTagFilter.filter("MEDIA:/opt/data/cache/audio/tts_1.mp3"), "", "only a tag: nothing said")
+        XCTAssertEqual(SpokenMediaTagFilter.filter("Call me Medina, not media."), "Call me Medina, not media.")
+        // The files go on the call's screen, as the chat shows them.
+        var splitter = SpokenVisualSplitter()
+        _ = splitter.feed(reply) + splitter.finish()
+        XCTAssertEqual(splitter.visualMarkdown, "MEDIA:/opt/data/cache/audio/tts_20261028_111922_603221.mp3\nMEDIA:/tmp/b.pdf")
+        // A tag written as a link is said by its label, and its file goes on
+        // the screen as a file, not as a link.
+        splitter.reset()
+        XCTAssertEqual(splitter.feed("See [the report](MEDIA:/r.pdf) now.\n") + splitter.finish(), "See the report now.\n")
+        XCTAssertEqual(splitter.visualMarkdown, "MEDIA:/r.pdf")
+        splitter.reset()
+        XCTAssertEqual(splitter.feed("See [the report](media:/r.pdf) now.\n") + splitter.finish(), "See the report now.\n")
+        XCTAssertEqual(splitter.visualMarkdown, "MEDIA:/r.pdf")
+        // A reply the call cuts off for its own line keeps its files.
+        splitter.reset()
+        _ = splitter.feed("Here you go.\nMEDIA:/r.pdf\nAnd then")
+        splitter.dropSpeech()
+        XCTAssertEqual(splitter.fileMarkdown, "MEDIA:/r.pdf")
+        XCTAssertEqual(splitter.visualMarkdown, "MEDIA:/r.pdf")
+        // An image of Hermes' own on its line is a file as well.
+        splitter.reset()
+        _ = splitter.feed("![chart](MEDIA:/tmp/a.png)\nDone.") + splitter.finish()
+        XCTAssertEqual(splitter.fileMarkdown, "MEDIA:/tmp/a.png")
+        // One with words after it is said, and its file shown.
+        splitter.reset()
+        XCTAssertEqual(splitter.feed("![chart](MEDIA:/tmp/a.png) Here it is.\n") + splitter.finish(), "chart Here it is.\n")
+        XCTAssertEqual(splitter.fileMarkdown, "MEDIA:/tmp/a.png")
+        // Windows line ends read as lines, however they arrive.
+        let crlf = "Here you go.\r\nMEDIA:/r.pdf\r\nDone."
+        let scalars = Array(crlf.unicodeScalars)
+        for size in [1, 2, scalars.count] {
+            splitter.reset()
+            var said = ""
+            for start in stride(from: 0, to: scalars.count, by: size) {
+                var piece = String.UnicodeScalarView()
+                piece.append(contentsOf: scalars[start..<min(start + size, scalars.count)])
+                said += splitter.feed(String(piece))
+            }
+            XCTAssertEqual(said + splitter.finish(), "Here you go.\nDone.", "split every \(size)")
+            XCTAssertEqual(splitter.fileMarkdown, "MEDIA:/r.pdf")
+        }
+    }
+
     func testLocalLiveTurnSaysAWholeReplyThatCameWithoutDeltas() async {
         let script = LocalLiveTurnScript()
         let runner = script.makeRunner()
@@ -433,6 +936,15 @@ extension VoiceConversationControllerTests {
         runner.observe(.messageComplete(sessionId: "rt-1", messageId: nil, content: "Hello there.", reasoning: nil))
         XCTAssertEqual(script.spoken, ["t1:Hello there."])
         XCTAssertEqual(script.done, ["t1"])
+    }
+
+    func testLocalLiveSaysWhyATurnCouldNotGoToTheChat() {
+        // #1061: the chat is open in Hermes Desktop and couldn't be taken
+        // over. The call says so rather than a bare failure.
+        let reason = AppLocalization.string("This chat is open in Hermes Desktop. Take it over to send from here.")
+        XCTAssertEqual(LocalLiveTurnRunner.spokenFailure(for: VoiceAudioError.unavailable(reason)), reason)
+        XCTAssertEqual(LocalLiveTurnRunner.spokenFailure(for: VoiceThreadBusyError()), LocalLiveTurnRunner.busyLine)
+        XCTAssertEqual(LocalLiveTurnRunner.spokenFailure(for: URLError(.timedOut)), LocalLiveTurnRunner.failureLine)
     }
 
     func testLocalLiveTurnWaitsForNoTypedTurnAndSaysTheChatIsBusy() async {
@@ -533,6 +1045,14 @@ extension VoiceConversationControllerTests {
         runner.observe(.messageError(sessionId: "rt-1", message: "Provider timeout"))
         XCTAssertEqual(script.spoken, ["t1:\(LocalLiveTurnRunner.errorLine)"])
         XCTAssertEqual(script.done, ["t1"])
+
+        runner.start(turnID: "t2", text: "Try again")
+        await localLiveSettle(until: { script.submitted.count == 2 })
+        runner.observe(.messageDelta(sessionId: "rt-1", text: "Here's the table:\n| a |"))
+        runner.observe(.messageError(sessionId: "rt-1", message: "Provider timeout"))
+        XCTAssertEqual(Array(script.spoken.suffix(2)), ["t2:Here's the table:\n", "t2:\(LocalLiveTurnRunner.errorLine)"],
+                       "what the broken reply still held isn't said after the call's line")
+        XCTAssertEqual(script.shown, [])
     }
 }
 
@@ -541,9 +1061,7 @@ extension VoiceConversationControllerTests {
 @MainActor
 extension AppStateVoiceCapabilityTests {
     func testLocalLiveIsOneLiveModeAndOpensItsOwnSheet() async {
-        let suite = "LocalLiveAppState.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let defaults = makeScratchDefaults("LocalLiveAppState")
         let appState = AppState(defaults: defaults, loadSavedConnection: false)
         appState.connection = HermesConnection(baseUrl: "https://example.com", ticket: "test-ticket")
         appState.isConnected = true
@@ -576,9 +1094,81 @@ extension AppStateVoiceCapabilityTests {
         XCTAssertFalse(appState.showLocalLiveSheet, "another live mode closes Local Live")
     }
 
+    func testLocalLiveAgentModeGivesTheFastModelGrokLivesTools() {
+        let defaults = makeScratchDefaults("LocalLiveAgent")
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        appState.setLocalLiveEnabled(true)
+        XCTAssertFalse(appState.isLocalLiveAgent)
+        XCTAssertNil(appState.localLiveAgentSetup(), "Classic's hands-free option: Hermes answers each turn")
+
+        appState.setLocalLiveAgent(true)
+        let setup = appState.localLiveAgentSetup()
+        let names = setup?.functions.map(\.name) ?? []
+        XCTAssertTrue(names.contains("start_job") && names.contains("list_jobs") && names.contains("cancel_job"), "\(names)")
+        XCTAssertTrue(setup?.instructions.contains("call start_job") == true)
+        XCTAssertTrue(setup?.instructions.contains(LocalLiveProtocol.agentInstructions) == true)
+        XCTAssertTrue(setup?.instructions.hasSuffix(LiveVoiceLanguage.rule(language: LiveVoiceLanguage.current)) == true,
+                      "the language goes after the call's own blocks (issue 1868)")
+        XCTAssertEqual(appState.configuredLiveVoiceEngine(profile: appState.activeProfile), .localLive)
+    }
+
+    func testLocalLiveAgentModeTakesThePersonalityAndTheUsersInstructions() {
+        // Issue 583: the fast model can speak as SOUL.md and follow the
+        // user's own instructions, after Conduit's rules.
+        let defaults = makeScratchDefaults("LocalLiveAgentPersona")
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        appState.setLocalLiveEnabled(true)
+        appState.setLocalLiveAgent(true)
+        XCTAssertFalse(appState.localLivePersonalityEnabled, "off until the user turns it on")
+        appState.setLocalLivePersonalityEnabled(true)
+        XCTAssertTrue(appState.localLivePersonalityEnabled)
+        var style = appState.liveVoiceStyle
+        style.extraInstructions = "Answer like a ship's captain."
+        appState.setLiveVoiceStyle(style)
+        XCTAssertEqual(appState.liveVoiceStyle.extraInstructions, "Answer like a ship's captain.")
+
+        let setup = appState.localLiveAgentSetup()
+        XCTAssertTrue(setup?.instructions.contains("<user_instructions>\nAnswer like a ship's captain.") == true)
+        XCTAssertFalse(setup?.instructions.contains("<hermes_persona>") == true, "SOUL.md is read when the call starts")
+        appState.installLocalLivePersonaForTesting()
+        XCTAssertTrue(appState.liveVoiceHostContextForTesting.contains("localPersona"))
+        XCTAssertTrue(appState.localLiveAgentSetup()?.instructions.contains("<hermes_persona>\npersona") == true)
+        appState.closeLocalLiveConversation()
+        XCTAssertFalse(appState.liveVoiceHostContextForTesting.contains("localPersona"), "dropped when the call closes")
+
+        let preview = appState.liveVoiceInstructionsPreview()
+        XCTAssertEqual(preview?.mode, "Local Live")
+        XCTAssertEqual(preview?.instructions.contains("SOUL.md"), true)
+        XCTAssertEqual(preview?.instructions.contains(LocalLiveProtocol.agentInstructions), true)
+        XCTAssertEqual(preview?.instructions.contains("Answer like a ship's captain."), true)
+
+        appState.setLocalLiveAgent(false)
+        XCTAssertNil(appState.liveVoiceInstructionsPreview(), "Hermes answers each turn: nothing is sent")
+    }
+
+    func testHermesSettingLocalVoiceModeMeansAgentModeAndClassicKeepsHandsFree() throws {
+        let defaults = makeScratchDefaults("LocalLiveVoiceMode")
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        let mode = try XCTUnwrap(appState.agentSettingsCatalog.first { $0.key == "voice.mode" })
+
+        appState.setLocalLiveEnabled(true)
+        XCTAssertEqual(mode.read(), .string("classic"), "the hands-free option is part of Classic")
+        mode.write(.string("classic"))
+        XCTAssertTrue(appState.isLocalLiveEnabled, "choosing Classic keeps its hands-free option")
+
+        mode.write(.string("local"))
+        XCTAssertTrue(appState.isLocalLiveAgent)
+        XCTAssertEqual(mode.read(), .string("local"))
+
+        mode.write(.string("classic"))
+        XCTAssertFalse(appState.isLocalLiveEnabled)
+        XCTAssertEqual(mode.read(), .string("classic"))
+    }
+
     func testLocalLivePreferenceDecodesOffFromOlderBlobs() throws {
         let old = try JSONDecoder().decode(VoiceProfilePreferences.self, from: Data("{}".utf8))
         XCTAssertFalse(old.localLiveEnabled)
+        XCTAssertFalse(old.localLiveAgent, "an existing Local Live call stays one Hermes turn per utterance")
         var preferences = VoiceProfilePreferences()
         preferences.localLiveEnabled = true
         let roundTrip = try JSONDecoder().decode(VoiceProfilePreferences.self, from: JSONEncoder().encode(preferences))

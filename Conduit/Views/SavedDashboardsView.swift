@@ -22,13 +22,9 @@ struct SavedDashboardsSettingsDetail: View {
     @State private var isSwitchingTo: UUID?
     @State private var pendingRemoval: SavedDashboardRowModel?
     @State private var showsAddDashboard = false
-
-    struct SavedDashboardRowModel: Identifiable {
-        let dashboard: SavedDashboard
-        let isActive: Bool
-        let hasReusableAuth: Bool
-        var id: UUID { dashboard.id }
-    }
+    /// Ask Which Dashboard at Launch (#1908): AppState reads it as Conduit
+    /// opens.
+    @AppStorage(AppState.asksWhichDashboardAtLaunchKey) private var asksWhichDashboardAtLaunch = false
 
     var body: some View {
         SettingsDetailContainer {
@@ -38,7 +34,7 @@ struct SavedDashboardsSettingsDetail: View {
                 tint: .conduitAura
             ) {
                 Text("Switch between your saved Hermes dashboards. Each dashboard keeps its own sign-in and cookies on this device.")
-                    .font(.footnote)
+                    .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                 ForEach(rows) { row in
                     rowView(row)
@@ -53,6 +49,16 @@ struct SavedDashboardsSettingsDetail: View {
                 }
                 .conduitGlassControl(cornerRadius: 16, tint: .conduitAccent.opacity(0.12))
                 .accessibilityIdentifier("settings.add-dashboard")
+                // Only with a choice to make.
+                if rows.count > 1 {
+                    Toggle(isOn: $asksWhichDashboardAtLaunch) {
+                        Label("Ask Which Dashboard at Launch", systemImage: "list.bullet.rectangle")
+                    }
+                    .accessibilityIdentifier("settings.ask-dashboard-at-launch")
+                    Text("When Conduit opens, your dashboards stay listed until you tap one, instead of signing in to the last one you used. A notification, a link, Siri, CarPlay, the Apple Watch or a call from Hermes still signs in on its own.")
+                        .scaledFont(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .navigationTitle("Saved Dashboards")
@@ -78,7 +84,7 @@ struct SavedDashboardsSettingsDetail: View {
                 pendingRemoval = nil
             }
         } message: {
-            Text("This dashboard's saved sign-in and cookies will be deleted from this device. Other dashboards are not affected.")
+            Text("This dashboard's saved sign-in and cookies will be deleted from this device, and location, health and phone sharing with it stops. Other dashboards are not affected.")
         }
         // Adding a dashboard is a sheet over this page: Cancel leaves the
         // current dashboard and chat as they were.
@@ -97,39 +103,12 @@ struct SavedDashboardsSettingsDetail: View {
                 switchTo(row)
             }
         } label: {
-            HStack(spacing: 12) {
-                Circle()
-                    .fill(statusColor(row))
-                    .frame(width: 9, height: 9)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: row.dashboard.label)
-                        .font(.subheadline.weight(.semibold))
-                    Text(verbatim: row.dashboard.normalizedURL)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Text(statusText(row))
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(statusColor(row))
-                }
-                Spacer(minLength: 8)
-                if row.isActive {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.conduitAccent)
-                        .accessibilityLabel(AppLocalization.string("Active dashboard"))
-                } else if isSwitchingTo == row.dashboard.id {
-                    ProgressView()
-                } else {
-                    Text(actionText(row))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.conduitAccent)
-                }
-            }
-            .padding(.vertical, 5)
+            SavedDashboardRowLabel(row: row, isSwitching: isSwitchingTo == row.dashboard.id)
+                .padding(.vertical, 5)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(row.isActive)
+        .disabled(row.isActive || isSwitchingTo != nil)
         .accessibilityIdentifier("settings.dashboard.row")
         .contextMenu {
             Button {
@@ -146,49 +125,13 @@ struct SavedDashboardsSettingsDetail: View {
         }
     }
 
-    private func statusText(_ row: SavedDashboardRowModel) -> String {
-        if row.isActive {
-            if isSwitchingTo == row.dashboard.id || appState.isConnecting { return AppLocalization.string("Connecting…") }
-            return appState.isConnected
-                ? AppLocalization.string("Connected")
-                : AppLocalization.string("Disconnected")
-        }
-        return row.hasReusableAuth
-            ? AppLocalization.string("Saved")
-            : AppLocalization.string("Sign In required")
-    }
-
-    private func actionText(_ row: SavedDashboardRowModel) -> String {
-        row.hasReusableAuth
-            ? AppLocalization.string("Switch")
-            : AppLocalization.string("Sign In")
-    }
-
-    private func statusColor(_ row: SavedDashboardRowModel) -> Color {
-        if row.isActive {
-            if isSwitchingTo == row.dashboard.id || appState.isConnecting { return .orange }
-            return appState.isConnected ? .green : .red
-        }
-        return row.hasReusableAuth ? .secondary : .orange
-    }
-
     // MARK: - Actions
 
     /// Rebuilds the row models. Keychain reads stay off the render path —
     /// this runs on task and registry/connection changes, mirroring the
     /// SettingsHome seeding pattern.
     private func rebuildRows() {
-        rows = appState.savedDashboardRegistry.dashboards.map { dashboard in
-            let id = dashboard.id
-            let hasAuth = id == appState.activeDashboardID
-                || KeychainHelper.loadCredentials(dashboardID: id) != nil
-                || KeychainHelper.loadConnection(dashboardID: id) != nil
-            return SavedDashboardRowModel(
-                dashboard: dashboard,
-                isActive: id == appState.activeDashboardID,
-                hasReusableAuth: hasAuth
-            )
-        }
+        rows = SavedDashboardRowModel.rows(appState)
     }
 
     private func switchTo(_ row: SavedDashboardRowModel) {
@@ -219,5 +162,117 @@ struct SavedDashboardsSettingsDetail: View {
         appState.removeDashboard(row.dashboard.id)
         rebuildRows()
         if wasActive { close() }
+    }
+}
+
+/// One saved dashboard as the switch lists show it (Settings > Saved
+/// Dashboards and the Profiles sheet, #288 in the notifier repo).
+struct SavedDashboardRowModel: Identifiable {
+    let dashboard: SavedDashboard
+    let isActive: Bool
+    let hasReusableAuth: Bool
+    var id: UUID { dashboard.id }
+
+    /// Reads the Keychain: build these on task and on registry/connection
+    /// changes, not while rendering.
+    @MainActor
+    static func rows(_ appState: AppState) -> [SavedDashboardRowModel] {
+        appState.savedDashboardRegistry.dashboards.map { dashboard in
+            let id = dashboard.id
+            let hasAuth = id == appState.activeDashboardID
+                || KeychainHelper.loadCredentials(dashboardID: id) != nil
+                || KeychainHelper.loadConnection(dashboardID: id) != nil
+                || KeychainHelper.loadNativeOAuthTokens(dashboardID: id) != nil
+            return SavedDashboardRowModel(
+                dashboard: dashboard,
+                isActive: id == appState.activeDashboardID,
+                hasReusableAuth: hasAuth
+            )
+        }
+    }
+}
+
+/// A saved dashboard row's contents: status dot, name, address, status
+/// line, then a checkmark (active), a spinner (switching there) or the
+/// action it takes (Switch / Sign In).
+struct SavedDashboardRowLabel: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    @EnvironmentObject private var appState: AppState
+    @ObservedObject private var notifications = PushNotificationService.shared
+    let row: SavedDashboardRowModel
+    let isSwitching: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 9, height: 9)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text(verbatim: row.dashboard.label)
+                        .scaledFont(.subheadline.weight(.semibold))
+                    if let quantumSafe = notificationsEncryption {
+                        Image(systemName: quantumSafe ? "lock.shield.fill" : "lock.fill")
+                            .scaledFont(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel(quantumSafe
+                                ? AppLocalization.string("Notifications end-to-end encrypted and quantum-safe")
+                                : AppLocalization.string("Notifications end-to-end encrypted"))
+                    }
+                }
+                Text(verbatim: row.dashboard.normalizedURL)
+                    .scaledFont(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(statusText)
+                    .scaledFont(.caption2.weight(.medium))
+                    .foregroundStyle(statusColor)
+            }
+            Spacer(minLength: 8)
+            if row.isActive {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.conduitAccent)
+                    .accessibilityLabel(AppLocalization.string("Active dashboard"))
+            } else if isSwitching {
+                ProgressView()
+            } else {
+                Text(actionText)
+                    .scaledFont(.caption.weight(.semibold))
+                    .foregroundStyle(.conduitAccent)
+            }
+        }
+    }
+
+    private var statusText: String {
+        if row.isActive {
+            if isSwitching || appState.isConnecting { return AppLocalization.string("Connecting…") }
+            return appState.isConnected
+                ? AppLocalization.string("Connected")
+                : AppLocalization.string("Disconnected")
+        }
+        return row.hasReusableAuth
+            ? AppLocalization.string("Saved")
+            : AppLocalization.string("Sign In required")
+    }
+
+    /// Nil unless this dashboard's notifications are end-to-end encrypted;
+    /// true when also quantum-safe (AppState.notificationsEncryption).
+    /// Observing `notifications` redraws it when a key changes.
+    private var notificationsEncryption: Bool? {
+        appState.notificationsEncryption(of: row.dashboard.id)
+    }
+
+    private var actionText: String {
+        row.hasReusableAuth
+            ? AppLocalization.string("Switch")
+            : AppLocalization.string("Sign In")
+    }
+
+    private var statusColor: Color {
+        if row.isActive {
+            if isSwitching || appState.isConnecting { return .orange }
+            return appState.isConnected ? .green : .red
+        }
+        return row.hasReusableAuth ? .secondary : .orange
     }
 }

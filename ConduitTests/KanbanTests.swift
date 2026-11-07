@@ -1,4 +1,3 @@
-import Combine
 import XCTest
 @testable import Conduit
 
@@ -379,15 +378,15 @@ final class KanbanTests: XCTestCase {
         XCTAssertEqual(store.loadedBoardSlug, "alpha")
         let boardBefore = store.board
 
-        var changes = 0
-        let subscription = store.objectWillChange.sink { changes += 1 }
+        let changes = observeAllState(of: store)
+        // Hermes' clock moved on, which nothing shows.
+        requester.responsesByPath["/api/plugins/kanban/board"]?["now"] = 10
         await store.poll()
-        subscription.cancel()
 
         // Loading on, then off. The unchanged boards, board, profiles,
         // projects and orchestration aren't written again: each write would
         // redraw the whole board.
-        XCTAssertEqual(changes, 2)
+        XCTAssertEqual(changes.finish().count, 2)
         XCTAssertEqual(store.board, boardBefore)
         XCTAssertFalse(store.isLoading)
     }
@@ -401,13 +400,11 @@ final class KanbanTests: XCTestCase {
         let message = store.errorMessage
         XCTAssertTrue(message?.contains("dashboard unreachable") == true)
 
-        var changes = 0
-        let subscription = store.objectWillChange.sink { changes += 1 }
+        let changes = observeAllState(of: store)
         await store.poll()
-        subscription.cancel()
 
         // The same failure leaves the message as it is; the board stays.
-        XCTAssertEqual(changes, 2)
+        XCTAssertEqual(changes.finish().count, 2)
         XCTAssertEqual(store.errorMessage, message)
         XCTAssertEqual(store.loadedBoardSlug, "alpha")
     }
@@ -421,13 +418,11 @@ final class KanbanTests: XCTestCase {
         let message = store.errorMessage
         XCTAssertNotNil(message)
 
-        var seen: [String?] = []
-        let subscription = store.$errorMessage.dropFirst().sink { seen.append($0) }
+        let seen = ObservedValues { store.errorMessage }
         await store.selectBoard(slug: "beta")
-        subscription.cancel()
 
         // The switch starts without the old error; its own failure then shows.
-        XCTAssertEqual(seen, [nil, message])
+        XCTAssertEqual(seen.finish(), [nil, message])
     }
 
     // MARK: - Mutation reconciliation vs passive poll ordering
@@ -573,6 +568,53 @@ final class KanbanTests: XCTestCase {
         XCTAssertEqual(Set(column.tasks.map(\.id)).count, column.tasks.count, "no duplicate SwiftUI identities possible")
     }
 
+    /// A non-object element (the case a task's own decoder cannot absorb)
+    /// is skipped, and the rows after it still decode.
+    func testNonObjectTaskElementsAreSkippedNotFatal() throws {
+        let json = #"{"name":"todo","tasks":["junk",{"id":"a","title":"a","status":"todo"},7,null,{"id":"b","title":"b","status":"todo"}]}"#
+        let column = try JSONDecoder().decode(KanbanColumn.self, from: Data(json.utf8))
+        XCTAssertEqual(column.tasks.map(\.id), ["a", "b"])
+    }
+
+    func testOneMalformedBoardCollectionElementKeepsTheRest() throws {
+        let json = #"{"columns":"nope","tenants":[42,null,"alice"],"assignees":["bob",{"x":1}]}"#
+        let board = try JSONDecoder().decode(KanbanBoard.self, from: Data(json.utf8))
+        XCTAssertTrue(board.columns.isEmpty)
+        XCTAssertEqual(board.tenants, ["alice"])
+        XCTAssertEqual(board.assignees, ["bob"])
+    }
+
+    /// A board row without a real slug is dropped, never turned into the
+    /// default board's identity; the valid boards around it stay.
+    func testSlugLessBoardRowsAreDroppedFromTheBoardsResponse() throws {
+        let json = #"{"boards":[{"slug":""},{"slug":"  "},{"name":"x"},"junk",{"slug":"alpha"},{"slug":"beta"}],"current":"alpha"}"#
+        let response = try JSONDecoder().decode(KanbanBoardsResponse.self, from: Data(json.utf8))
+        XCTAssertEqual(response.boards.map(\.slug), ["alpha", "beta"])
+        XCTAssertEqual(response.current, "alpha")
+    }
+
+    /// A boards response without a usable current pointer keeps its
+    /// boards, and takes the board the server marks current.
+    func testABoardsResponseWithoutCurrentKeepsItsBoards() throws {
+        let marked = #"{"boards":[{"slug":"alpha"},{"slug":"beta","is_current":true}]}"#
+        let response = try JSONDecoder().decode(KanbanBoardsResponse.self, from: Data(marked.utf8))
+        XCTAssertEqual(response.boards.map(\.slug), ["alpha", "beta"])
+        XCTAssertEqual(response.current, "beta")
+
+        let unmarked = #"{"boards":[{"slug":"alpha"}],"current":"  "}"#
+        let blank = try JSONDecoder().decode(KanbanBoardsResponse.self, from: Data(unmarked.utf8))
+        XCTAssertEqual(blank.boards.map(\.slug), ["alpha"])
+        XCTAssertEqual(blank.current, "", "no invented board identity: the server resolves its own")
+    }
+
+    func testOneMalformedDiagnosticKeepsTheOthers() throws {
+        let json = #"{"id":"t1","title":"t","status":"todo","diagnostics":["junk",{"kind":"stuck","title":"Stuck"},null]}"#
+        let task = try JSONDecoder().decode(KanbanTask.self, from: Data(json.utf8))
+        XCTAssertEqual(task.diagnostics?.map(\.kind), ["stuck"])
+        let absent = try JSONDecoder().decode(KanbanTask.self, from: Data(#"{"id":"t2","title":"t","status":"todo"}"#.utf8))
+        XCTAssertNil(absent.diagnostics)
+    }
+
     // MARK: - Capabilities request-scoped outcome contract
 
     func testCapabilityOutcomeMappingIsRequestScoped() {
@@ -596,7 +638,7 @@ final class KanbanTests: XCTestCase {
             CapabilitiesView.localError(for: .unavailable(profile: "p"), hasData: false),
             "Connect to a Hermes dashboard to load capabilities."
         )
-        XCTAssertNil(CapabilitiesView.localError(for: .superseded(requestedProfile: "a", activeProfile: "b"), hasData: true))
+        XCTAssertNil(CapabilitiesView.localError(for: .superseded(requested: rows("a"), active: rows("b")), hasData: true))
     }
 
     // MARK: - Concrete slug resolution
@@ -642,6 +684,44 @@ final class KanbanTests: XCTestCase {
         let boardCall = try XCTUnwrap(requester.calls.last(where: { $0.path.contains("/api/plugins/kanban/board") && !$0.path.contains("/boards") }))
         XCTAssertTrue(boardCall.path.hasSuffix("/board?board=alpha"), "server-current must be pinned before GET /board: \(boardCall.path)")
         XCTAssertEqual(store.loadedBoardSlug, "alpha")
+    }
+
+    func testFindTaskLooksOnTheLoadedBoardFirstThenTheOthers() async throws {
+        var responses = standardKanbanResponses()
+        responses["/api/plugins/kanban/tasks/t9?board=beta"] = ["task": ["id": "t9", "title": "On beta", "status": "blocked"]]
+        let notHere = DashboardTicketBridgeError.http(status: 404, detail: "not found")
+        let requester = MockKanbanRequester(responsesByPath: responses, errorsByPath: [
+            "/api/plugins/kanban/tasks/t9?board=default": notHere,
+            "/api/plugins/kanban/tasks/gone?board=default": notHere,
+            "/api/plugins/kanban/tasks/gone?board=beta": notHere,
+            "/api/plugins/kanban/tasks/gone?board=alpha": notHere
+        ])
+        let store = makeStore(requester: requester)
+        await store.refresh()
+        XCTAssertEqual(store.loadedBoardSlug, "default")
+
+        let found = try await store.findTask(id: "t9")
+        XCTAssertEqual(found?.board, "beta")
+        XCTAssertEqual(found?.task.title, "On beta")
+        let asked = requester.calls.map(\.path).filter { $0.hasPrefix("/api/plugins/kanban/tasks/t9") }
+        XCTAssertEqual(asked, ["/api/plugins/kanban/tasks/t9?board=default", "/api/plugins/kanban/tasks/t9?board=beta"])
+
+        let missing = try await store.findTask(id: "gone")
+        XCTAssertNil(missing)
+
+        // One board's failure doesn't hide the task on another board...
+        requester.errorsByPath["/api/plugins/kanban/tasks/t9?board=default"] = DashboardTicketBridgeError.http(status: 503, detail: "down")
+        let pastFailure = try await store.findTask(id: "t9")
+        XCTAssertEqual(pastFailure?.board, "beta")
+
+        // ...but when no board has it, the failure is the answer, not a missing task.
+        requester.errorsByPath["/api/plugins/kanban/tasks/gone?board=default"] = DashboardTicketBridgeError.http(status: 503, detail: "down")
+        do {
+            _ = try await store.findTask(id: "gone")
+            XCTFail("a failed read must throw")
+        } catch DashboardTicketBridgeError.http(let status, _) {
+            XCTAssertEqual(status, 503)
+        }
     }
 
     func testDotSegmentIdentifiersFailBeforeTransport() async throws {
@@ -700,22 +780,40 @@ final class KanbanTests: XCTestCase {
     func testCapabilityCommitPolicyRejectsABAAndForeignProfiles() {
         // A -> B -> A: old A1 finishes after A2 started; latestGeneration moved on.
         XCTAssertFalse(CapabilityLoadPolicy.canCommit(
-            generation: 1, latestGeneration: 3, requestedProfile: "A", activeProfile: "A"
+            generation: 1, latestGeneration: 3, requested: rows("A"), active: rows("A")
         ))
         // Newer request for the same still-active profile commits.
         XCTAssertTrue(CapabilityLoadPolicy.canCommit(
-            generation: 3, latestGeneration: 3, requestedProfile: "A", activeProfile: "A"
+            generation: 3, latestGeneration: 3, requested: rows("A"), active: rows("A")
         ))
         // Profile changed mid-flight.
         XCTAssertFalse(CapabilityLoadPolicy.canCommit(
-            generation: 2, latestGeneration: 2, requestedProfile: "A", activeProfile: "B"
+            generation: 2, latestGeneration: 2, requested: rows("A"), active: rows("B")
         ))
     }
 
+    func testCapabilitiesOfAnotherDashboardWithTheSameProfileNeverCommitOrShow() {
+        // Two dashboards each with a "default" profile: dashboard A's read
+        // finishing after the switch to B commits nothing, and A's rows
+        // never show (or act) under B.
+        let otherDashboard = rows("default", dashboard: Self.capabilityDashboardB)
+        XCTAssertFalse(CapabilityLoadPolicy.canCommit(
+            generation: 2, latestGeneration: 2, requested: rows("default"), active: otherDashboard
+        ))
+        XCTAssertFalse(CapabilityLoadPolicy.shouldPresentRows(snapshot: rows("default"), active: otherDashboard))
+        XCTAssertEqual(
+            CapabilityLoadPolicy.resolvePresentation(snapshot: rows("default"), active: otherDashboard, isLoading: false, loadError: nil, hasRows: true),
+            .loading
+        )
+        // The same dashboard through a new bridge loads again too.
+        let newBridge = CapabilitySnapshotOwner(dashboardID: Self.capabilityDashboardA, bridge: ObjectIdentifier(NSObject.self), profile: "default")
+        XCTAssertFalse(CapabilityLoadPolicy.shouldPresentRows(snapshot: rows("default"), active: newBridge))
+    }
+
     func testCapabilityRowsNeverRenderForForeignSnapshotProfile() {
-        XCTAssertFalse(CapabilityLoadPolicy.shouldPresentRows(snapshotProfile: "A", activeProfile: "B"))
-        XCTAssertFalse(CapabilityLoadPolicy.shouldPresentRows(snapshotProfile: nil, activeProfile: "B"))
-        XCTAssertTrue(CapabilityLoadPolicy.shouldPresentRows(snapshotProfile: "B", activeProfile: "B"))
+        XCTAssertFalse(CapabilityLoadPolicy.shouldPresentRows(snapshot: rows("A"), active: rows("B")))
+        XCTAssertFalse(CapabilityLoadPolicy.shouldPresentRows(snapshot: nil, active: rows("B")))
+        XCTAssertTrue(CapabilityLoadPolicy.shouldPresentRows(snapshot: rows("B"), active: rows("B")))
     }
 
     // MARK: - Capabilities rendering boundary policy
@@ -724,12 +822,12 @@ final class KanbanTests: XCTestCase {
         // A rows under active B while B's request is still in flight (SwiftUI
         // render race): the transition state must stay loading, never rows.
         XCTAssertEqual(
-            CapabilityLoadPolicy.resolvePresentation(snapshotProfile: "A", activeProfile: "B", isLoading: true, loadError: nil, hasRows: true),
+            CapabilityLoadPolicy.resolvePresentation(snapshot: rows("A"), active: rows("B"), isLoading: true, loadError: nil, hasRows: true),
             .loading
         )
         // Foreign snapshot with nothing settled for B yet: still loading.
         XCTAssertEqual(
-            CapabilityLoadPolicy.resolvePresentation(snapshotProfile: "A", activeProfile: "B", isLoading: false, loadError: nil, hasRows: true),
+            CapabilityLoadPolicy.resolvePresentation(snapshot: rows("A"), active: rows("B"), isLoading: false, loadError: nil, hasRows: true),
             .loading
         )
     }
@@ -737,7 +835,7 @@ final class KanbanTests: XCTestCase {
     func testFailedFirstLoadWithoutSnapshotShowsFailure() {
         // First load fails before any snapshot exists (e.g. offline).
         XCTAssertEqual(
-            CapabilityLoadPolicy.resolvePresentation(snapshotProfile: nil, activeProfile: "B", isLoading: false, loadError: "offline", hasRows: false),
+            CapabilityLoadPolicy.resolvePresentation(snapshot: nil, active: rows("B"), isLoading: false, loadError: "offline", hasRows: false),
             .failure("offline")
         )
     }
@@ -745,8 +843,8 @@ final class KanbanTests: XCTestCase {
     func testNoDashboardUnavailableFirstLoadShowsConnectionFailure() {
         XCTAssertEqual(
             CapabilityLoadPolicy.resolvePresentation(
-                snapshotProfile: nil,
-                activeProfile: "B",
+                snapshot: nil,
+                active: rows("B"),
                 isLoading: false,
                 loadError: "Connect to a Hermes dashboard to load capabilities.",
                 hasRows: false
@@ -757,31 +855,243 @@ final class KanbanTests: XCTestCase {
 
     func testCurrentSnapshotEmptySuccessShowsExplicitEmptyState() {
         XCTAssertEqual(
-            CapabilityLoadPolicy.resolvePresentation(snapshotProfile: "B", activeProfile: "B", isLoading: false, loadError: nil, hasRows: false),
+            CapabilityLoadPolicy.resolvePresentation(snapshot: rows("B"), active: rows("B"), isLoading: false, loadError: nil, hasRows: false),
             .emptySuccess
         )
     }
 
     func testCurrentSnapshotEmptyFailureShowsFullFailureState() {
         XCTAssertEqual(
-            CapabilityLoadPolicy.resolvePresentation(snapshotProfile: "B", activeProfile: "B", isLoading: false, loadError: "boom", hasRows: false),
+            CapabilityLoadPolicy.resolvePresentation(snapshot: rows("B"), active: rows("B"), isLoading: false, loadError: "boom", hasRows: false),
             .failure("boom")
         )
     }
 
     func testPopulatedSameProfileRefreshFailureKeepsRowsWithBanner() {
         XCTAssertEqual(
-            CapabilityLoadPolicy.resolvePresentation(snapshotProfile: "B", activeProfile: "B", isLoading: false, loadError: "refresh boom", hasRows: true),
+            CapabilityLoadPolicy.resolvePresentation(snapshot: rows("B"), active: rows("B"), isLoading: false, loadError: "refresh boom", hasRows: true),
             .list(banner: "refresh boom")
         )
         // Clean populated load renders the plain list.
         XCTAssertEqual(
-            CapabilityLoadPolicy.resolvePresentation(snapshotProfile: "B", activeProfile: "B", isLoading: false, loadError: nil, hasRows: true),
+            CapabilityLoadPolicy.resolvePresentation(snapshot: rows("B"), active: rows("B"), isLoading: false, loadError: nil, hasRows: true),
             .list(banner: nil)
         )
     }
 
+    // MARK: - Kept board (#1533)
+
+    func testTheBoardOpensOnWhatItShowedLastTime() async throws {
+        let kept = KeptBoardAnswers()
+        var responses = standardKanbanResponses(boardSlug: "alpha")
+        responses["/api/plugins/kanban/board"] = keptBoardResponse(task: "Write the plan")
+        responses["/api/plugins/kanban/board?board=alpha&include_archived=true"] = keptBoardResponse(task: "Archived one")
+        responses["/api/plugins/kanban/profiles"] = [
+            "profiles": [["name": "coder", "is_default": true, "description": "Writes code", "description_auto": false]]
+        ]
+        let requester = MockKanbanRequester(responsesByPath: responses)
+        let store = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        store.configure(requester: requester, serverIdentity: "https://example.test", answers: kept.answers)
+        await store.reload()
+        let shown = try XCTUnwrap(store.board)
+
+        // Every read the board opens on is kept, the board by its slug.
+        XCTAssertEqual(Set(kept.saved.keys), [
+            KanbanService.KeptRoute.boards, KanbanService.KeptRoute.board("alpha"), KanbanService.KeptRoute.profiles,
+            KanbanService.KeptRoute.projects, KanbanService.KeptRoute.orchestration,
+        ])
+        // The board with archived tasks isn't: the tab opens without them.
+        await store.reload(includeArchived: true)
+        XCTAssertEqual(KanbanService.kept(KanbanBoard.self, from: kept.saved[KanbanService.KeptRoute.board("alpha")]), shown)
+
+        // Next time, the board shows before Hermes is asked, and none of it
+        // can be changed until Hermes answers.
+        let offline = MockKanbanRequester(errorsByPath: ["/api/plugins/kanban/boards": MockRequestError.failed("dashboard unreachable")])
+        let next = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        next.configure(requester: offline, serverIdentity: "https://example.test", answers: kept.answers)
+        XCTAssertEqual(next.board, shown)
+        XCTAssertEqual(next.boards, store.boards)
+        XCTAssertEqual(next.resolvedSelectedBoardSlug, "alpha")
+        XCTAssertEqual(next.profiles.map(\.name), ["coder"])
+        XCTAssertEqual(next.orchestration, store.orchestration)
+        XCTAssertTrue(offline.calls.isEmpty)
+        XCTAssertNil(next.loadedBoardSlug)
+        XCTAssertFalse(next.isSelectedSnapshotLoaded)
+        XCTAssertNil(next.loadedContextStamp)
+        _ = try? await next.createTask(KanbanCreateTaskRequest(title: "Not on a kept board"))
+        XCTAssertFalse(offline.calls.contains { $0.method == "POST" })
+
+        // A read that fails leaves it up.
+        await next.reload()
+        XCTAssertEqual(next.board, shown)
+        XCTAssertTrue(next.errorMessage?.contains("dashboard unreachable") == true)
+        XCTAssertNil(next.loadedBoardSlug)
+
+        // Hermes' answer takes its place, and the board can be changed.
+        offline.errorsByPath = [:]
+        offline.responsesByPath = standardKanbanResponses(boardSlug: "alpha")
+        offline.responsesByPath["/api/plugins/kanban/board"] = keptBoardResponse(task: "Ship it")
+        await next.reload()
+        XCTAssertEqual(next.board?.columns.first?.tasks.map(\.title), ["Ship it"])
+        XCTAssertEqual(next.loadedBoardSlug, "alpha")
+        XCTAssertTrue(next.isSelectedSnapshotLoaded)
+        XCTAssertNil(next.errorMessage)
+
+        // With no dashboard to read, the kept board shows all the same, and
+        // says why it can't change.
+        let unconnected = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        unconnected.configure(requester: nil, serverIdentity: "https://example.test", answers: kept.answers)
+        XCTAssertEqual(unconnected.board?.columns.first?.tasks.map(\.title), ["Ship it"])
+        await unconnected.reload()
+        XCTAssertEqual(unconnected.errorMessage, "Connect to a Hermes dashboard to use Kanban.")
+        XCTAssertNotNil(unconnected.board)
+        XCTAssertNil(unconnected.loadedBoardSlug)
+    }
+
+    func testABoardPickedShowsWhatItShowedLastTimeWhileItLoads() async throws {
+        let kept = KeptBoardAnswers()
+        var responses = standardKanbanResponses(boardSlug: "alpha")
+        responses["/api/plugins/kanban/board"] = keptBoardResponse(task: "On alpha")
+        responses["/api/plugins/kanban/board?board=beta"] = keptBoardResponse(task: "On beta")
+        let requester = MockKanbanRequester(responsesByPath: responses)
+        let store = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        store.configure(requester: requester, serverIdentity: "https://example.test", answers: kept.answers)
+        await store.reload()
+        let alpha = try XCTUnwrap(store.board)
+        await store.selectBoard(slug: "beta")
+        XCTAssertEqual(store.board?.columns.first?.tasks.map(\.title), ["On beta"])
+
+        // Back to alpha: its kept board shows at once, not beta's cards,
+        // and stays read-only until Hermes answers.
+        requester.hold(pathPrefix: "/api/plugins/kanban/board?board=alpha")
+        let picking = Task { await store.selectBoard(slug: "alpha") }
+        for _ in 0..<5000 where requester.heldCount == 0 { await Task.yield() }
+        XCTAssertEqual(requester.heldCount, 1)
+        XCTAssertEqual(store.board, alpha)
+        XCTAssertNil(store.loadedBoardSlug)
+        XCTAssertFalse(store.isSelectedSnapshotLoaded)
+        requester.releaseAll()
+        await picking.value
+        XCTAssertEqual(store.loadedBoardSlug, "alpha")
+        XCTAssertTrue(store.isSelectedSnapshotLoaded)
+    }
+
+    /// An answer Conduit can't read isn't kept over the last one it could,
+    /// and answers that name the dashboard only after the store was pointed
+    /// at it show what's kept until Hermes answers (#1533).
+    func testOnlyAReadableAnswerIsKeptAndLateAnswersShowTheKeptBoard() async throws {
+        let kept = KeptBoardAnswers()
+        var responses = standardKanbanResponses(boardSlug: "alpha")
+        responses["/api/plugins/kanban/board"] = keptBoardResponse(task: "Write the plan")
+        responses["/api/plugins/kanban/profiles"] = [
+            "profiles": [["name": "coder", "is_default": true, "description": "Writes code", "description_auto": false]]
+        ]
+        let requester = MockKanbanRequester(responsesByPath: responses)
+        let store = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        store.configure(requester: requester, serverIdentity: "https://example.test", answers: kept.answers)
+        await store.reload()
+        let shown = try XCTUnwrap(store.board)
+
+        requester.responsesByPath["/api/plugins/kanban/profiles"] = ["profiles": "unreadable"]
+        await store.reload()
+        let keptProfiles = KanbanService.kept(KanbanProfilesResponse.self, from: kept.saved[KanbanService.KeptRoute.profiles])
+        XCTAssertEqual(keptProfiles?.profiles.map(\.name), ["coder"])
+
+        // Answers given again once Hermes has answered leave its board up.
+        store.configure(requester: requester, serverIdentity: "https://example.test", answers: KeptBoardAnswers().answers)
+        XCTAssertEqual(store.board, shown)
+
+        // Pointed at the dashboard before its answers named it.
+        let offline = MockKanbanRequester(errorsByPath: ["/api/plugins/kanban/boards": MockRequestError.failed("dashboard unreachable")])
+        let next = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        next.configure(requester: offline, serverIdentity: "https://example.test")
+        XCTAssertNil(next.board)
+        next.configure(requester: offline, serverIdentity: "https://example.test", answers: kept.answers)
+        XCTAssertEqual(next.board, shown)
+        XCTAssertEqual(next.profiles.map(\.name), ["coder"])
+        XCTAssertNil(next.loadedBoardSlug)
+        XCTAssertTrue(offline.calls.isEmpty)
+    }
+
+    /// The model override's roster is kept once per dashboard, so its
+    /// picker opens on it next time, and a read that fails leaves it kept
+    /// (#1533).
+    func testTheModelOverrideOpensOnTheRosterItListedLastTime() async throws {
+        let kept = KeptBoardAnswers()
+        var responses = standardKanbanResponses()
+        responses["/api/plugins/kanban/model-options"] = [
+            "providers": [
+                ["slug": "openai", "label": "OpenAI", "models": ["gpt-a"]],
+                ["slug": "empty", "label": "Empty", "models": [String]()],
+            ],
+        ]
+        let store = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        store.configure(requester: MockKanbanRequester(responsesByPath: responses), serverIdentity: "https://example.test", answers: kept.answers)
+        XCTAssertNil(store.keptModelOptions())
+        let listed = try await store.fetchModelOptions()
+        XCTAssertNotNil(kept.saved[KanbanService.KeptRoute.modelOptions])
+
+        let offline = MockKanbanRequester(errorsByPath: [
+            "/api/plugins/kanban/model-options": MockRequestError.failed("dashboard unreachable"),
+        ])
+        let next = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        next.configure(requester: offline, serverIdentity: "https://example.test", answers: kept.answers)
+        XCTAssertEqual(next.keptModelOptions(), listed)
+        XCTAssertEqual(next.keptModelOptions()?.map(\.slug), ["openai"], "Only what can be offered")
+        XCTAssertTrue(offline.calls.isEmpty)
+        _ = try? await next.fetchModelOptions()
+        XCTAssertEqual(next.keptModelOptions(), listed, "A read that fails leaves it kept")
+
+        // A roster with nothing to offer, as Hermes answers while its
+        // inventory is down, is answered but not kept over it.
+        offline.errorsByPath = [:]
+        let degraded = try await next.fetchModelOptions()
+        XCTAssertTrue(degraded.isEmpty)
+        XCTAssertEqual(next.keptModelOptions(), listed)
+    }
+
+    /// Once Hermes has listed the boards, answers given again don't put a
+    /// kept list back over its own, even while the board's read fails.
+    func testAnswersGivenAgainAfterHermesListedTheBoardsLeaveItsList() async throws {
+        let kept = KeptBoardAnswers()
+        var responses = standardKanbanResponses(boardSlug: "alpha")
+        responses["/api/plugins/kanban/board"] = keptBoardResponse(task: "Write the plan")
+        let earlier = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        earlier.configure(requester: MockKanbanRequester(responsesByPath: responses), serverIdentity: "https://example.test", answers: kept.answers)
+        await earlier.reload()
+
+        let hermes = MockKanbanRequester(
+            responsesByPath: ["/api/plugins/kanban/boards": ["boards": [["slug": "gamma", "name": "Gamma", "is_current": true]], "current": "gamma"]],
+            errorsByPath: ["/api/plugins/kanban/board": MockRequestError.failed("board unreadable")]
+        )
+        let store = KanbanStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        store.configure(requester: hermes, serverIdentity: "https://example.test")
+        await store.reload()
+        XCTAssertEqual(store.boards.map(\.slug), ["gamma"])
+        XCTAssertNil(store.loadedBoardSlug)
+
+        store.configure(requester: hermes, serverIdentity: "https://example.test", answers: kept.answers)
+        XCTAssertEqual(store.boards.map(\.slug), ["gamma"])
+        XCTAssertEqual(store.currentServerBoardSlug, "gamma")
+    }
+
+    /// A board answer with one task in To Do, as Hermes sends it.
+    private func keptBoardResponse(task title: String) -> [String: Any] {
+        [
+            "columns": [["name": "todo", "tasks": [["id": "t-\(title.count)", "title": title, "status": "todo"]]]],
+            "tenants": [], "assignees": [], "latest_event_id": 1, "now": 2,
+        ]
+    }
+
     // MARK: - Helpers
+
+    private static let capabilityDashboardA = UUID(uuidString: "00000000-0000-0000-0000-00000000000A")!
+    private static let capabilityDashboardB = UUID(uuidString: "00000000-0000-0000-0000-00000000000B")!
+
+    /// A capability snapshot of `profile` on a dashboard, through no bridge.
+    private func rows(_ profile: String, dashboard: UUID = KanbanTests.capabilityDashboardA) -> CapabilitySnapshotOwner {
+        CapabilitySnapshotOwner(dashboardID: dashboard, bridge: nil, profile: profile)
+    }
 
     private func makeStore(
         requester: MockKanbanRequester,
@@ -874,6 +1184,23 @@ private final class MockKanbanRequester: DashboardJSONRequester {
     }
 }
 
+/// The board's answers kept on the phone, as AppState keeps them.
+@MainActor
+private final class KeptBoardAnswers {
+    private(set) var saved: [String: [String: Any]] = [:]
+
+    var answers: KeptAnswers {
+        KeptAnswers(
+            kept: { route in self.saved[route] },
+            keep: { route, _, read in
+                let answer = try await read()
+                self.saved[route] = answer
+                return answer
+            }
+        )
+    }
+}
+
 private func standardKanbanResponses(boardSlug: String = "default") -> [String: [String: Any]] {
     [
         "/api/plugins/kanban/boards": [
@@ -897,4 +1224,25 @@ private func standardKanbanResponses(boardSlug: String = "default") -> [String: 
         ],
         "/api/plugins/kanban/dispatch": [:]
     ]
+}
+
+/// Every write to the store's observed state, as objectWillChange counted.
+@MainActor
+private func observeAllState(of store: KanbanStore) -> ObservedValues<Void> {
+    ObservedValues {
+        _ = store.boards
+        _ = store.currentServerBoardSlug
+        _ = store.board
+        _ = store.profiles
+        _ = store.projects
+        _ = store.orchestration
+        _ = store.selectedBoardSlug
+        _ = store.loadedBoardSlug
+        _ = store.isLoading
+        _ = store.isMutating
+        _ = store.errorMessage
+        _ = store.mutationErrorMessage
+        _ = store.liveInvalidation
+        _ = store.liveStreamConnected
+    }
 }

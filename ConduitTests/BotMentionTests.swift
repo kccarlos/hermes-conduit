@@ -235,27 +235,6 @@ final class BotMentionTests: XCTestCase {
         )
     }
 
-    // MARK: - Forever-chat reroute
-
-    func testNewAndResetRerouteToCompactOnlyInCanonicalChat() {
-        XCTAssertEqual(
-            BotMentions.foreverChatRerouteText(for: "/new", isCanonicalBotChat: true),
-            "/compact"
-        )
-        XCTAssertEqual(
-            BotMentions.foreverChatRerouteText(for: "/reset", isCanonicalBotChat: true),
-            "/compact"
-        )
-        XCTAssertNil(BotMentions.foreverChatRerouteText(for: "/new", isCanonicalBotChat: false))
-        // Padded forms reroute; anything else keeps slash-command freedom.
-        XCTAssertEqual(
-            BotMentions.foreverChatRerouteText(for: "  /new  ", isCanonicalBotChat: true),
-            "/compact"
-        )
-        XCTAssertNil(BotMentions.foreverChatRerouteText(for: "/new extra", isCanonicalBotChat: true))
-        XCTAssertNil(BotMentions.foreverChatRerouteText(for: "/compact", isCanonicalBotChat: true))
-    }
-
     // MARK: - Tag helpers
 
     func testMentionTagPrefersFriendlyFormAndHandleFallsBack() {
@@ -278,5 +257,145 @@ final class BotMentionTests: XCTestCase {
             BotMentions.mentionNameForms("Research Buddy"),
             ["research-buddy", "researchbuddy"]
         )
+    }
+
+    // MARK: - Teammate messages
+
+    func testATeammateDeliveryIsReadFromItsSignature() {
+        XCTAssertEqual(
+            BotTeammateMessages.inbound("Message from 🤖 Atlas (@atlas): Found three flights.\nThe cheapest is Tuesday."),
+            BotTeammateMessages.Inbound(sender: "Atlas", handle: "atlas", body: "Found three flights.\nThe cheapest is Tuesday.")
+        )
+        XCTAssertEqual(BotTeammateMessages.inbound("Message from 🤖 Atlas: hi")?.handle, "Atlas")
+        XCTAssertEqual(BotTeammateMessages.inbound("Message from 🤖 Atlas (@Atlas): hi")?.body, "hi", "a capitalised handle still signs")
+        XCTAssertEqual(BotTeammateMessages.inbound("Message from Scout (@scout@laptop): yo")?.handle, "scout")
+        XCTAssertEqual(
+            BotTeammateMessages.inbound("[Message from agent 'scout'] hello"),
+            BotTeammateMessages.Inbound(sender: "scout", handle: "scout", body: "hello")
+        )
+    }
+
+    func testAnUnsignedMessageFromStaysTheUsersText() {
+        XCTAssertNil(BotTeammateMessages.inbound("Message from Mom: call me back"), "no bot signature")
+        XCTAssertNil(BotTeammateMessages.inbound("Can you pass a message from 🤖 Atlas: on?"))
+        XCTAssertNil(BotTeammateMessages.inbound("hello"))
+    }
+
+    func testDeliveriesNameTheirTeammate() {
+        XCTAssertEqual(
+            BotTeammateMessages.deliveryTarget(toolName: "message_agent", input: #"{"target":"@Scout@laptop","message":"hi"}"#),
+            "scout"
+        )
+        XCTAssertEqual(
+            BotTeammateMessages.deliveryTarget(
+                toolName: "terminal",
+                input: #"{"command":"hermes -p scout chat --in ~ -c \"Bot Chat\" -Q -q \"Message from 🤖 atlas (@atlas): hi\""}"#
+            ),
+            "scout"
+        )
+        XCTAssertEqual(
+            BotTeammateMessages.deliveryTarget(toolName: "terminal", input: #"hermes --profile=scout chat -q 'Message from Atlas: hi'"#),
+            "scout"
+        )
+        XCTAssertEqual(
+            BotTeammateMessages.deliveryTarget(toolName: "terminal", input: #"hermes -p 'scout' chat -q "Message from Atlas: hi""#),
+            "scout"
+        )
+        XCTAssertNil(BotTeammateMessages.deliveryTarget(toolName: "terminal", input: #"{"command":"ls -la"}"#))
+        XCTAssertNil(BotTeammateMessages.deliveryTarget(toolName: "message_agent", input: #"{"message":"hi"}"#))
+        XCTAssertNil(BotTeammateMessages.deliveryTarget(toolName: "web_search", input: #"{"target":"scout"}"#))
+    }
+
+    func testATeammateIsNamedFromTheRoster() {
+        let roster = [bot("scout", title: "Trip Scout"), bot("atlas")]
+        XCTAssertEqual(BotTeammateMessages.bot(named: "@Scout", in: roster)?.name, "scout")
+        XCTAssertEqual(BotTeammateMessages.bot(named: "trip-scout", in: roster)?.name, "scout")
+        XCTAssertEqual(BotTeammateMessages.bot(named: "Trip Scout", in: roster)?.name, "scout", "a signature without a handle names the title")
+        XCTAssertEqual(BotTeammateMessages.displayName(for: "scout", in: roster), "Trip Scout")
+        XCTAssertEqual(BotTeammateMessages.displayName(for: "nova", in: roster), "nova", "a bot not in the roster keeps its key")
+    }
+
+    func testAMenuMentionIsSpacedOffTheDraft() {
+        let scout = MentionAutocomplete.Candidate(tag: "scout", title: "Scout")
+        XCTAssertEqual(MentionAutocomplete.inserting("", with: scout), "@scout ")
+        XCTAssertEqual(MentionAutocomplete.inserting("ask", with: scout), "ask @scout ")
+        XCTAssertEqual(MentionAutocomplete.inserting("ask ", with: scout), "ask @scout ")
+        XCTAssertEqual(MentionAutocomplete.inserting("ask @sc", with: scout), "ask @scout ", "a typed @query is completed")
+    }
+    // MARK: - Round 2: replies, deliveries, previews
+
+    private func row(_ id: String, _ role: MessageRole, _ content: String = "", tool: ToolActivity? = nil) -> ChatMessage {
+        ChatMessage(id: id, role: role, content: content, timestamp: "1", tool: tool)
+    }
+
+    func testOnlyTheRunningTurnsReplyStaysOpen() {
+        let folded = [
+            row("u1", .user, "Message from 🤖 Atlas (@atlas): check the flights"),
+            row("a1", .assistant, "On it, Atlas."),
+        ]
+        XCTAssertEqual(BotTeammateMessages.runningReplyID(in: folded), "a1")
+        // A new turn before its reply: the folded one isn't the running one.
+        let next = folded + [row("u2", .user, "thanks")]
+        XCTAssertNil(BotTeammateMessages.runningReplyID(in: next))
+        XCTAssertEqual(BotTeammateMessages.teammateReplies(
+            in: next,
+            streamingMessageID: BotTeammateMessages.runningReplyID(in: next)
+        )["a1"], "Atlas")
+    }
+
+    func testARepliesToATeammateFoldUnlessTheBotAskedFirst() {
+        let unsolicited = [
+            row("u1", .user, "hi"),
+            row("a1", .assistant, "hello"),
+            row("u2", .user, "Message from 🤖 Atlas (@atlas): can you check the flights?"),
+            row("a2", .assistant, "On it, Atlas."),
+            row("u3", .user, "thanks"),
+            row("a3", .assistant, "Sure."),
+        ]
+        XCTAssertEqual(BotTeammateMessages.teammateReplies(in: unsolicited), ["a2": "Atlas"])
+        XCTAssertEqual(BotTeammateMessages.teammateReplies(in: unsolicited, streamingMessageID: "a2"), [:])
+
+        let asked = [
+            row("u1", .user, "ask atlas about flights"),
+            row("t1", .tool, tool: ToolActivity(
+                name: "message_agent", input: #"{"target":"atlas","message":"flights?"}"#, status: .complete
+            )),
+            row("u2", .user, "Message from 🤖 Atlas (@atlas): Tuesday is cheapest."),
+            row("a2", .assistant, "Atlas says Tuesday is cheapest."),
+        ]
+        XCTAssertEqual(BotTeammateMessages.teammateReplies(in: asked), [:], "the report to the user stays open")
+    }
+
+    func testADeliveryShowsWhatWasSaidAndTheTerminalReply() {
+        let agent = BotTeammateMessages.delivery(
+            toolName: "message_agent", input: #"{"target":"@Atlas","message":"flights?"}"#, output: nil
+        )
+        XCTAssertEqual(agent, .init(target: "atlas", message: "flights?", reply: nil))
+        let terminal = BotTeammateMessages.delivery(
+            toolName: "process",
+            input: #"hermes -p atlas chat -Q -q "Message from 🤖 Scout (@scout): flights?""#,
+            output: #"{"output":"session_id: abc\nTuesday is cheapest.","exit_code":0}"#
+        )
+        XCTAssertEqual(terminal, .init(target: "atlas", message: "flights?", reply: "Tuesday is cheapest."))
+    }
+
+    func testALongDeliveryIsStillADelivery() {
+        let body = String(repeating: "word ", count: 20_000)
+        let inbound = BotTeammateMessages.inbound("Message from 🤖 Atlas (@atlas): " + body)
+        XCTAssertEqual(inbound?.handle, "atlas")
+        XCTAssertEqual(inbound?.body, body.trimmingCharacters(in: .whitespaces))
+    }
+
+    func testASignedNameMayHaveParentheses() {
+        let inbound = BotTeammateMessages.inbound("Message from 🤖 Atlas (v2) (@atlas): hi (there): ok")
+        XCTAssertEqual(inbound?.sender, "Atlas (v2)")
+        XCTAssertEqual(inbound?.handle, "atlas")
+        XCTAssertEqual(inbound?.body, "hi (there): ok")
+        XCTAssertNil(BotTeammateMessages.inbound("Message from Mom (home): call me"))
+    }
+
+    func testADeliveryPreviewsAsWhoSaidWhat() {
+        XCTAssertEqual(PreviewText.plain("Message from 🤖 Atlas (@atlas): Found **three** flights."), "Atlas: Found three flights.")
+        XCTAssertEqual(PreviewText.plain("Message from Mom: call me"), "Message from Mom: call me")
     }
 }

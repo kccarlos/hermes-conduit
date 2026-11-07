@@ -6,7 +6,9 @@
 //  This is a NATIVE SwiftUI app, not a React Native port.
 //
 
+import Combine
 import SwiftUI
+import TipKit
 import UIKit
 import UserNotifications
 import os
@@ -15,16 +17,29 @@ private let backgroundPushLogger = Logger(subsystem: "com.milim.relay", category
 
 final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // A freeze saves what the chat did just before (#1533).
+        MainThreadHangWatchdog.shared.start()
         UNUserNotificationCenter.current().delegate = self
-        // A "Hermes wants to talk" notification's Talk button (#449).
-        HermesCallNotifications.registerCategory()
+        // A "Hermes wants to talk" notification's Talk button (#449), and a
+        // Pulse push's Quiet for today.
+        NotificationCategories.register()
+        // Bots Home's tip (BotsHomeGesturesTip), hidden in UI tests and
+        // the App Store screenshots.
+        if BotsHomeGesturesTip.hiddenForTesting {
+            Tips.hideAllTipsForTesting()
+        }
+        try? Tips.configure()
         // Set up before launch returns: a call the Apple Watch starts can
         // launch Conduit in the background, and its message waits on this.
         MainActor.assumeIsolated {
+            // Low Power Mode and Low Data Mode stretch every poll.
+            DeviceConditionsMonitor.shared.start()
             WatchVoiceLink.shared.activate()
             // Calls from Hermes ring through PushKit (#449): a call that
             // launched Conduit is delivered once the registry is up.
             HermesNativeCalls.shared.activate()
+            // The relay needs this launch's push token if it changed.
+            PushNotificationService.shared.refreshDeviceTokenAtLaunch()
             // Apple Health wakes Conduit when shared data changes, and a
             // background refresh catches up.
             AppState.registerHealthSyncTask()
@@ -38,6 +53,12 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             if location.settings.isOn || location.configUnreadable {
                 AppStateRuntimeRegistry.shared.appState.activateLocationSharing()
             }
+            // Without background sharing the location monitor has no token
+            // to report: say so, so a token the relay still holds is cleared
+            // (notifier #287). An unreadable config says nothing yet.
+            if !location.settings.background, !location.configUnreadable {
+                PushNotificationService.shared.updateLocationToken(nil)
+            }
             // Calendar, reminders and phone status: a background refresh, and
             // the calendar changing while Conduit runs.
             AppState.registerPhoneSyncTask()
@@ -46,11 +67,17 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             }
             // Lock Screen progress of a turn sent before a relaunch (#605):
             // the chat's stream can still update and end it.
-            LiveTurnActivities.shared.adoptExisting()
+            LiveTurnActivities.shared?.adoptExisting()
+            // Hermes dictations whose words never came, from this run's
+            // predecessor too: offered in the composer for Retry.
+            Task { await DictationClipInbox.shared.load() }
         }
         Task.detached(priority: .background) {
             AttachmentStaging.sweepStaleFiles()
         }
+        // iOS's daily usage and hang reports, kept on this device for
+        // Diagnostics & logs. Subscribes on its own background queue.
+        MetricKitReports.shared.start()
         if let payload = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
             Task { @MainActor in
                 PushNotificationService.shared.receiveNotificationPayload(payload)
@@ -69,15 +96,23 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
     /// that applies without asking. Conduit fetches it from the host and
     /// applies it in the time iOS gives.
     ///
-    /// This is the only silent push the relay sends. Visible pushes are
-    /// handled by the notification center delegate (willPresent / didReceive),
-    /// so anything else here has nothing to do; it's logged so an unexpected
-    /// one shows up.
+    /// The relay's only other silent push is its registration challenge: a
+    /// nonce Conduit sends back to prove it holds this device token. Visible
+    /// pushes are handled by the notification center delegate (willPresent /
+    /// didReceive), so anything else here has nothing to do; it's logged so
+    /// an unexpected one shows up.
     func application(
         _ application: UIApplication,
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
+        if let nonce = PushNotificationService.tokenChallenge(in: userInfo) {
+            Task { @MainActor in
+                PushNotificationService.shared.receiveTokenChallenge(nonce)
+                completionHandler(.noData)
+            }
+            return
+        }
         guard AppState.isPhoneChangesPush(userInfo) else {
             backgroundPushLogger.info("Background push that isn't a phone.changes push: nothing to do")
             completionHandler(.noData)
@@ -105,6 +140,69 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let request = response.notification.request
+        // Ask Which Dashboard at Launch (#1908): whatever a tapped
+        // notification or its button does next needs Hermes, so a launch
+        // waiting for a dashboard pick signs in for it. Not for a dismissal,
+        // or directions that only open Maps.
+        if response.actionIdentifier != UNNotificationDismissActionIdentifier,
+           request.identifier != MapsNavigator.notificationIdentifier {
+            Task { @MainActor in
+                AppStateRuntimeRegistry.shared.appState.releaseLaunchDashboardChoice(for: "a notification")
+            }
+        }
+        // Quiet for today on a Pulse push: done in the background, on the
+        // dashboard the push came from. One that couldn't be done there (no
+        // connection in time, or the push is from another dashboard) says
+        // so, and that notification's tap tries again with Conduit open.
+        if response.actionIdentifier == PulseNotifications.quietTodayActionIdentifier {
+            let userInfo = request.content.userInfo
+            Task { @MainActor in
+                let target = PushNotificationService.shared.pulseQuietTarget(userInfo)
+                var quiet = false
+                if let target {
+                    // In the background: never switches dashboards, and the
+                    // wait and the request fit the time iOS gives a tap
+                    // with room left to post the retry.
+                    quiet = await AppStateRuntimeRegistry.shared.appState.quietPulseForToday(
+                        target, switching: false, wait: .seconds(8), timeoutMilliseconds: 8_000)
+                }
+                if !quiet {
+                    try? await UNUserNotificationCenter.current().add(PulseNotifications.retryRequest(target: target))
+                }
+                completionHandler()
+            }
+            return
+        }
+        if request.identifier == PulseNotifications.retryIdentifier, !(request.trigger is UNPushNotificationTrigger) {
+            let target = PulseNotifications.retryTarget(request.content.userInfo)
+            Task { @MainActor in
+                let app = AppStateRuntimeRegistry.shared.appState
+                completionHandler()
+                // A push Conduit couldn't place: the Pulse screen, where Quiet
+                // for today is a tap away, rather than a guess at its host.
+                guard let target else {
+                    app.openPulse(card: nil)
+                    return
+                }
+                // Conduit is open: a push from another saved dashboard switches to it, as a tap on it would.
+                let quiet = await app.quietPulseForToday(target, switching: true, wait: .seconds(20))
+                // The Pulse screen shows it quiet, or offers Quiet for today
+                // again; only the Pulse of the dashboard the push came from.
+                if quiet || app.pulseQuietOwnership(target) == .route {
+                    app.openPulse(card: nil)
+                }
+            }
+            return
+        }
+        // "Draft ready in Conduit" from the share sheet (#812): coming to the
+        // front picks the draft up; one already on screen takes it now.
+        if request.identifier.hasPrefix(ShareDraftInbox.notificationIdentifierPrefix), !(request.trigger is UNPushNotificationTrigger) {
+            Task { @MainActor in
+                AppStateRuntimeRegistry.shared.appState.sharedDraftWasStaged()
+                completionHandler()
+            }
+            return
+        }
         // Only the notification Conduit posted itself, never a push carrying the key.
         if request.identifier == MapsNavigator.notificationIdentifier, !(request.trigger is UNPushNotificationTrigger),
            let maps = MapsNavigator.url(fromNotification: request.content.userInfo) {
@@ -148,6 +246,15 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             completionHandler([])
             return
         }
+        // A draft shared while Conduit is on screen opens in it: no banner.
+        if notification.request.identifier.hasPrefix(ShareDraftInbox.notificationIdentifierPrefix),
+           !(notification.request.trigger is UNPushNotificationTrigger) {
+            Task { @MainActor in
+                AppStateRuntimeRegistry.shared.appState.sharedDraftWasStaged()
+            }
+            completionHandler([])
+            return
+        }
         // Directions to tap: posted from the background, kept if Conduit
         // came to the front before it showed.
         if notification.request.identifier == MapsNavigator.notificationIdentifier {
@@ -157,6 +264,22 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
         if notification.request.content.categoryIdentifier == HermesCallNotifications.categoryIdentifier {
             completionHandler([.banner, .list, .sound])
             return
+        }
+        // Quiet for today that couldn't be done in the background says so wherever the user is.
+        if notification.request.identifier == PulseNotifications.retryIdentifier,
+           !(notification.request.trigger is UNPushNotificationTrigger) {
+            completionHandler([.banner, .list])
+            return
+        }
+        // A step's timer from a rich card rings wherever the user is.
+        if notification.request.identifier.hasPrefix(RichStepsMemory.notificationPrefix) {
+            completionHandler([.banner, .list, .sound])
+            return
+        }
+        // A push while Conduit is open may be a wait in another chat: the
+        // Needs you list reads now, and its banner shows instead (#1705).
+        if notification.request.trigger is UNPushNotificationTrigger {
+            Task { @MainActor in AppStateRuntimeRegistry.shared.appState.noteNeedsYouPush() }
         }
         completionHandler([])
     }
@@ -174,7 +297,7 @@ struct ConduitApp: App {
     @ObservedObject private var pendingVoiceIntents = PendingVoiceIntentStore.shared
     @ObservedObject private var appLanguage = AppLanguageStore.shared
     /// The accent picked in Settings > Appearance (#697).
-    @AppStorage(ConduitAccentChoice.storageKey) private var accentChoice = ConduitAccentChoice.defaultChoice
+    @AppStorage(ConduitAccent.storageKey) private var accentChoice = ConduitAccent.defaultValue
     /// A chat another app asked to open (`conduit://session/<id>`), held
     /// until Hermes is connected: a cold launch opens it once connecting
     /// finishes instead of failing against an empty session list.
@@ -221,15 +344,46 @@ struct ConduitApp: App {
                 // cannot refresh them.
                 appState.appLanguageDidChange()
                 appState.publishWidgetLanguage()
-                HermesCallNotifications.registerCategory()
+                // The Notification Service Extension writes banners in it.
+                NotificationSharedSettings.appLanguage = AppLanguage.current.rawValue
+                NotificationCategories.register()
             }
             .preferredColorScheme(appState.themePreference.colorScheme)
             .tint(.conduitAccent)
             // The accent colours resolve the choice from this trait, so a
             // new pick redraws in place: no view is rebuilt.
             .environment(\.conduitAccent, accentChoice)
+            .background(WindowAccentTint(choice: accentChoice))
+            // Notes touches app-wide so the backdrop can rest when idle.
+            .background(InteractionIdleTouchProbe())
+            // On a Mac, a mouse wheel over a list with swipe actions
+            // crashed newer macOS (#1480).
+            .background(MacWheelSwipeGuardProbe())
+            // The Watch app draws in the same accent. Shared once a pick
+            // settles: dragging in the colour picker changes it many times.
+            .task(id: accentChoice) {
+                guard (try? await Task.sleep(for: .milliseconds(600))) != nil else { return }
+                appState.shareWatchCallVoices()
+            }
+            // So does the padlock or shield: shared again once any change to
+            // the notifications state settles (keys, confirmations, the
+            // switch, and also unrelated ones such as push routes; the Watch
+            // link sends only a context that differs from the last one).
+            .task {
+                let changes = PushNotificationService.shared.objectWillChange
+                    .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
+                for await _ in changes.values {
+                    appState.shareWatchCallVoices()
+                }
+            }
+            // And when the active dashboard changes, even when nothing about
+            // notifications does (a switch whose sign-in fails).
+            .task(id: appState.activeDashboardID) {
+                appState.shareWatchCallVoices()
+            }
 #if DEBUG
             .modifier(WidgetLaunchUITestFixture.modifier(appState: appState))
+            .modifier(ScreenshotCallFixtureModifier(appState: appState))
 #endif
             // Links Conduit writes into chats (a voice call's job link)
             // open inside the app; every other link goes to the system.
@@ -262,16 +416,62 @@ struct ConduitApp: App {
                 pendingExternalLink = link
             }
             .task(id: externalLinkRouteKey) {
-                guard appState.isConnected, let link = pendingExternalLink else { return }
+                guard let link = pendingExternalLink else { return }
+                guard appState.isConnected else {
+                    // A launch waiting for a dashboard pick signs in for it.
+                    appState.releaseLaunchDashboardChoice(for: "a link")
+                    return
+                }
                 pendingExternalLink = nil
                 appState.openAppLink(link)
             }
+            // A draft shared from another app while Conduit is on screen.
+            .task { SharedDraftStagedObserver.start() }
+            // Pictures' sizes and cards' heights from earlier launches, read
+            // once off the main thread as the app opens, so the rows of a
+            // chat it restores take their final height when they mount
+            // (#1238). ChatView asks too; a read under way is joined.
+            .task { await TranscriptPictureMemory.loadKeptSizes() }
             .task { await PushNotificationService.shared.refresh() }
             // Siri learns the cached profile names for its profile phrases.
             .task { SiriProfileShortcuts.refresh() }
             .task(id: notificationRouteKey) {
-                guard appState.isConnected, let target = notifications.pendingTarget else { return }
-                if await appState.openNotificationTarget(target) {
+                guard let target = notifications.pendingTarget else { return }
+                if notifications.pendingRouteAwaitsCall {
+                    // Waiting for the call its switch would have ended (or,
+                    // after a relaunch, the one Conduit closing ended): it
+                    // opens once there's no call and Conduit is on screen,
+                    // unless a newer tap replaced it meanwhile.
+                    guard await PushNotificationService.waitForCallToEnd(
+                        interval: Self.callEndRecheckInterval,
+                        isReady: { appState.callWaitCanEnd }
+                    ), !Task.isCancelled, notifications.pendingTarget == target else { return }
+                }
+                // A refusal an earlier run left on the drawer shell's error
+                // line is done with: the call it waited for ended, or this
+                // tap replaced the one it was about.
+                appState.clearCallRefusal()
+                guard appState.isConnected else {
+                    // A launch waiting for a dashboard pick signs in for it.
+                    appState.releaseLaunchDashboardChoice(for: "a notification")
+                    notifications.notificationRouteAwaitsConnection(target)
+                    return
+                }
+                guard notifications.beginNotificationRoute(target) else {
+                    // Its window ran out while the app was offline.
+                    if target.call != nil {
+                        HermesNativeCalls.shared.routedAnswerFailed(target)
+                    }
+                    return
+                }
+                let outcome = await appState.openNotificationTargetOutcome(target)
+                // Cancelled: a newer tap, a reconnect or a retry started
+                // this route over, and that run decides what happens. An
+                // identical newer tap shares this target, so clearing it
+                // here would drop that run's route.
+                guard !Task.isCancelled else { return }
+                switch outcome {
+                case .opened:
                     // A call from Hermes (#449) opens voice in its chat,
                     // unless its CallKit call ended meanwhile and let go of
                     // the route. Started before the route clears, which ends
@@ -280,11 +480,53 @@ struct ConduitApp: App {
                         HermesNativeCalls.shared.routedAnswerFailed(target)
                     }
                     notifications.clearPendingTarget(target)
-                } else if !notifications.handleFailedNotificationRoute(target), target.call != nil {
-                    HermesNativeCalls.shared.routedAnswerFailed(target)
+                case .retry, .unverified:
+                    if !notifications.handleFailedNotificationRoute(target) {
+                        // The window ran out: the last failure says why, if
+                        // it has something to say.
+                        if case .unverified(let message) = outcome {
+                            appState.errorMessage = message
+                        }
+                        if target.call != nil {
+                            HermesNativeCalls.shared.routedAnswerFailed(target)
+                        }
+                    }
+                case .failed:
+                    // The open already said why it can't; another try would
+                    // only say it again.
+                    notifications.clearPendingTarget(target)
+                    if target.call != nil {
+                        HermesNativeCalls.shared.routedAnswerFailed(target)
+                    }
+                case .afterCall:
+                    // It said it opens when the call ends; never a call's
+                    // own open, which switches during its call.
+                    notifications.notificationRouteAwaitsCall(target)
+                }
+            }
+            // Quiet for today's retry waiting for a call (or, after a
+            // relaunch, the one Conduit closing ended), as a notification
+            // waits above: it goes through once there's no call and Conduit
+            // is on screen.
+            .task(id: notifications.pulseQuietAttempt) {
+                guard let target = notifications.pendingPulseQuiet else { return }
+                guard await PushNotificationService.waitForCallToEnd(
+                    interval: Self.callEndRecheckInterval,
+                    isReady: { appState.callWaitCanEnd }
+                ) else { return }
+                appState.clearCallRefusal()
+                // A newer tap took over meanwhile, or the day it was for ended.
+                guard notifications.takePendingPulseQuiet(target) else { return }
+                let quiet = await appState.quietPulseForToday(target, switching: true, wait: .seconds(20))
+                if quiet || appState.pulseQuietOwnership(target) == .route {
+                    appState.openPulse(card: nil)
                 }
             }
             .task(id: voiceIntentRouteKey) {
+                // A launch waiting for a dashboard pick signs in for Siri.
+                if pendingVoiceIntents.hasPendingIntent {
+                    appState.releaseLaunchDashboardChoice(for: "Siri")
+                }
                 // Siri's call shows its screen while it waits for Hermes.
                 appState.presentWaitingCallIfNeeded()
                 // A screenshot waits for Conduit to settle after connecting.
@@ -307,6 +549,10 @@ struct ConduitApp: App {
 
     /// How often a screenshot waiting for Conduit to settle checks again.
     private static let settleRecheckInterval: Duration = .milliseconds(250)
+
+    /// How often a notification waiting for a call checks it again; it
+    /// opens once two checks in a row find no call, with Conduit on screen.
+    private static let callEndRecheckInterval: Duration = .seconds(1)
 
     private var parkedScreenQuestionKey: String {
         "\(appState.isConnected):\(appState.isConnecting):\(appState.isProfileSwitching):\(appState.parkedScreenQuestionRevision)"

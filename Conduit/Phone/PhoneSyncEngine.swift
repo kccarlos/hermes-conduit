@@ -7,14 +7,16 @@
 //  last pass, then trade results for the changes Hermes is waiting on.
 //
 //  EventKit has no change history, so the phone remembers a hash of each
-//  item it last sent and uploads only the difference; everything goes whole
-//  again once a day, when the user changes what's shared, or when the host's
-//  store is new. Hashes move only after the host took the batch, so a lost
-//  answer just means the next pass sends it again (the host's writes are
-//  idempotent). Changes Hermes asks for come back from the exchange: new
-//  items apply straight away when the user chose "Add without asking",
-//  everything else waits for the user's answer on a card (or, in a live
-//  voice call, out loud).
+//  item it last sent and uploads only the difference, and nothing at all
+//  when nothing changed (the host's status says what's waiting; a keepalive
+//  still goes every few hours); everything goes whole again once a day,
+//  when the user changes what's shared, or when the host's store is new.
+//  Hashes move only after the host took the batch, so a lost answer just
+//  means the next pass sends it again (the host's writes are idempotent).
+//  Changes Hermes asks for come back from the exchange: new items apply
+//  straight away when the user chose "Add without asking", everything else
+//  waits for the user's answer on a card (or, in a live voice call, out
+//  loud).
 //
 
 import CryptoKit
@@ -35,6 +37,12 @@ struct PhoneSyncState: Codable, Equatable {
     var alarmsHash: String?
     var contactsHash: String?
     var lastFullSync: Date?
+    /// The time zone and sharing the last upload the host took reported,
+    /// hashed, and when it went: a pass with nothing new sends nothing
+    /// until the keepalive (ContextUploadPolicy). Optional so a state file
+    /// from before still reads.
+    var frameHash: String?
+    var lastIngest: Date?
     var lastSync: Date?
     var lastAttempt: Date?
     var pause: PhoneSyncPause?
@@ -60,6 +68,8 @@ struct PhoneSyncState: Codable, Equatable {
         contactsHash = nil
         lastFullSync = nil
         fingerprint = nil
+        frameHash = nil
+        lastIngest = nil
     }
 }
 
@@ -171,6 +181,9 @@ final class PhoneSyncEngine: ObservableObject {
     @Published private(set) var state: PhoneSyncState
     @Published private(set) var isSyncing = false
     @Published private(set) var lastError: String?
+    /// What to do when the last turn-off's delete met a profile that turned
+    /// the plugin off (nothing was deleted), or nil (issue 1671).
+    private(set) var deleteRefusedPluginOff: String?
     @Published private(set) var preferences: PhoneSyncPreferences
     /// Changes waiting for the user's answer, oldest first.
     @Published private(set) var prompts: [PhoneChangePrompt] = []
@@ -178,10 +191,15 @@ final class PhoneSyncEngine: ObservableObject {
     @Published var autoAdded: PhoneAutoAdded?
     /// The people the user picked for Hermes.
     @Published private(set) var people: [PhonePerson]
+    /// Picked people the last read from Contacts missed, by id, with why.
+    @Published private(set) var peopleProblems: [String: PhonePersonProblem] = [:]
+    /// Whether the picked people can be read again from Contacts.
+    @Published private(set) var contactsAccess: PhoneContactsAccess
 
     let calendarSource: PhoneCalendarSource
     let statusSource: PhoneStatusSource
     let alarmSource: PhoneAlarmSource
+    let contactsSource: PhoneContactsSource
     private let store: PhoneSyncStateStore
     private let keys: PhoneSyncKeyStore
     private let defaults: UserDefaults
@@ -199,11 +217,19 @@ final class PhoneSyncEngine: ObservableObject {
     /// doesn't hand the same one out again. In memory: it covers races in
     /// one run of the app.
     private var applying: Set<String> = []
+    /// Changes the user approved on a Pulse card (Add, or Undo of one), by
+    /// id, with when the approval lapses: the tap was the asking, so this
+    /// app applies them without the phone's own card. In memory too: the
+    /// host hands a change out right after the tap, and one that comes
+    /// later, or after a relaunch, gets the usual card.
+    private var approvedOnCard: [String: Date] = [:]
+    static let cardApprovalWindow: TimeInterval = 15 * 60
 
     init(
         calendarSource: PhoneCalendarSource,
         statusSource: PhoneStatusSource,
         alarmSource: PhoneAlarmSource = PhoneAlarmSources.system(),
+        contactsSource: PhoneContactsSource = SystemContactsSource(),
         store: PhoneSyncStateStore = .standard,
         keys: PhoneSyncKeyStore = .keychain,
         defaults: UserDefaults = .standard,
@@ -214,6 +240,8 @@ final class PhoneSyncEngine: ObservableObject {
         self.calendarSource = calendarSource
         self.statusSource = statusSource
         self.alarmSource = alarmSource
+        self.contactsSource = contactsSource
+        contactsAccess = contactsSource.access
         self.store = store
         self.keys = keys
         self.defaults = defaults
@@ -240,11 +268,42 @@ final class PhoneSyncEngine: ObservableObject {
         let kept = Array(people.prefix(PhonePerson.maximum))
         PhonePeopleStore.save(kept, to: defaults)
         self.people = kept
+        peopleProblems = peopleProblems.filter { id, _ in kept.contains { $0.id == id } }
+    }
+
+    /// Reads the picked people again from Contacts, when Conduit may: what a
+    /// contact says now replaces what Conduit had (their relation stays),
+    /// and someone who can't be read keeps their last copy and is listed in
+    /// `peopleProblems`.
+    func refreshPeople() async {
+        contactsAccess = contactsSource.access
+        guard contactsAccess.canRead, !people.isEmpty else {
+            peopleProblems = [:]
+            return
+        }
+        let missing = Set(people.filter { $0.contactID == nil }.map(\.id))
+        let found = missing.isEmpty ? [:] : await contactsSource.identifiers(for: missing)
+        let identifiers = people.compactMap { $0.contactID ?? found?[$0.id] }
+        let reads = await contactsSource.read(identifiers)
+        // People changed while Contacts was read are matched by id, so an
+        // edit or removal made meanwhile stands.
+        let (refreshed, problems) = PhonePeopleStore.refreshed(people, reads: reads, found: found, access: contactsAccess)
+        if refreshed != people { savePeople(refreshed) }
+        peopleProblems = problems
+    }
+
+    /// Asks once for Contacts access, then reads the picked people again.
+    func requestContactsAccess() async {
+        contactsAccess = await contactsSource.requestAccess()
+        await refreshPeople()
     }
 
     /// Runs a pass, or joins the one already running and runs once more
     /// after it, so what changed meanwhile isn't missed.
-    func sync(deadline: Date, request: @escaping Request) async -> Outcome {
+    /// `keepalive`: how old the last upload may be before one goes with
+    /// nothing new (ContextUploadPolicy.phoneKeepalive(for:)).
+    func sync(deadline: Date, keepalive: TimeInterval = ContextUploadPolicy.phoneKeepalive,
+              request: @escaping Request) async -> Outcome {
         let turnOffs = self.turnOffs
         if let current = running {
             _ = await current.value
@@ -252,7 +311,7 @@ final class PhoneSyncEngine: ObservableObject {
             if running == current { running = nil }
             if let newer = running { return await newer.value }
         }
-        let task = Task { await self.pass(deadline: deadline, request: request) }
+        let task = Task { await self.pass(deadline: deadline, keepalive: keepalive, request: request) }
         running = task
         isSyncing = true
         let outcome = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
@@ -307,14 +366,17 @@ final class PhoneSyncEngine: ObservableObject {
         keys.clear()
         guard readStateIfNeeded() else { return false }
         var deleted = false
+        deleteRefusedPluginOff = nil
         if let request {
             do {
                 _ = try await request("\(Self.base)/wipe", "POST", ["device_id": state.deviceID])
                 deleted = true
-            } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
+            } catch DashboardTicketBridgeError.http(let status, let detail)
+                        where status == 404 && !DashboardTicketBridgeError.isPluginOffDetail(detail) {
                 deleted = true
             } catch {
                 lastError = Self.describe(error)
+                deleteRefusedPluginOff = DashboardTicketBridgeError.pluginOffDetail(of: error)
             }
         }
         state.startOver()
@@ -324,7 +386,7 @@ final class PhoneSyncEngine: ObservableObject {
 
     // MARK: The pass
 
-    private func pass(deadline: Date, request: @escaping Request) async -> Outcome {
+    private func pass(deadline: Date, keepalive: TimeInterval, request: @escaping Request) async -> Outcome {
         let preferences = self.preferences
         guard preferences.isOn, let destination = preferences.destination else { return .off }
         guard readStateIfNeeded() else { return .unfinished }
@@ -338,9 +400,10 @@ final class PhoneSyncEngine: ObservableObject {
         lastError = nil
         defer { persist() }
         do {
-            let key = try await ensureKey(request: request)
+            let (key, hostPending) = try await ensureKey(request: request)
             try checkTime(deadline)
-            let pending = try await upload(preferences: preferences, key: key, request: request)
+            let pending = try await upload(preferences: preferences, key: key, hostPending: hostPending,
+                                           keepalive: keepalive, request: request)
             try checkTime(deadline)
             if pending > 0 || !state.unreported.isEmpty || !prompts.isEmpty {
                 try await exchange(key: key, request: request)
@@ -358,15 +421,22 @@ final class PhoneSyncEngine: ObservableObject {
                 state.pause = .signInRequired
                 return .paused(.signInRequired)
             case .http(let status, _) where status == 404:
-                state.pause = .pluginMissing
-                return .paused(.pluginMissing)
-            case .http(let status, let detail) where status == 409:
+                // A profile that turned the plugin off says how to turn it on.
+                let pause = DashboardTicketBridgeError.pluginOffDetail(of: error).map(PhoneSyncPause.pluginOff) ?? .pluginMissing
+                state.pause = pause
+                return .paused(pause)
+            case .http(let status, let detail) where status == 409 && HostKeyConflict.isKeyLoss(detail):
                 // The host lost or replaced this phone's key: set it up again.
                 keys.clear()
                 state.forgetSent()
                 lastError = detail
                 return .unfinished
-            case .http(let status, let detail) where status == 400 || status == 413:
+            case .http(let status, let detail) where status == 409 && HostKeyConflict.isNewerPluginStore(detail):
+                // A store written by a newer plugin: updating the plugin
+                // fixes it, a new key wouldn't. The key and hashes stay.
+                state.pause = .pluginMissing
+                return .paused(.pluginMissing)
+            case .http(let status, let detail) where status == 400 || status == 409 || status == 413:
                 state.pause = .refused(detail)
                 return .paused(.refused(detail))
             default:
@@ -384,16 +454,19 @@ final class PhoneSyncEngine: ObservableObject {
         if now() >= deadline { throw DeadlineReached() }
     }
 
-    private func ensureKey(request: Request) async throws -> PhoneSyncCrypto.SessionKey {
+    /// The agreed key, and the changes the host has waiting when its status
+    /// says (nil from a plugin whose status doesn't, or with a new key).
+    private func ensureKey(request: Request) async throws -> (PhoneSyncCrypto.SessionKey, Int?) {
         let status = try await request("\(Self.base)/status?device_id=\(state.deviceID)", "GET", nil)
         let generation = status["generation"] as? String
-        let hostKid = (status["device"] as? [String: Any])?["kid"] as? String
+        let device = status["device"] as? [String: Any]
+        let hostKid = device?["kid"] as? String
         if let generation, let known = state.generation, known != generation {
             state.forgetSent()
         }
         if let key = keys.load(), key.kid == hostKid {
             state.generation = generation ?? state.generation
-            return key
+            return (key, (device?["pending"] as? NSNumber)?.intValue)
         }
         let devicePrivate = Curve25519.KeyAgreement.PrivateKey()
         let answer = try await request("\(Self.base)/key", "POST", [
@@ -409,7 +482,7 @@ final class PhoneSyncEngine: ObservableObject {
         keys.save(key)
         state.forgetSent()
         state.generation = (answer["generation"] as? String) ?? generation
-        return key
+        return (key, nil)
     }
 
     /// The calendar window this pass shares.
@@ -421,7 +494,10 @@ final class PhoneSyncEngine: ObservableObject {
     }
 
     /// Sends what changed; the number of changes the host has waiting.
-    private func upload(preferences: PhoneSyncPreferences, key: PhoneSyncCrypto.SessionKey, request: Request) async throws -> Int {
+    /// Nothing changed: nothing goes (until the keepalive), and the count
+    /// is the one the host's status gave.
+    private func upload(preferences: PhoneSyncPreferences, key: PhoneSyncCrypto.SessionKey, hostPending: Int?,
+                        keepalive: TimeInterval, request: Request) async throws -> Int {
         let currentNow = now()
         let full = state.fingerprint != preferences.fingerprint
             || state.lastFullSync.map { currentNow.timeIntervalSince($0) > PhoneSyncLimits.fullSyncInterval } ?? true
@@ -442,7 +518,7 @@ final class PhoneSyncEngine: ObservableObject {
         var newContactsHash = state.contactsHash
         var statusSent = false
 
-        let readsEvents = preferences.calendar == .full && calendarSource.eventAccess == .full
+        let readsEvents = preferences.calendar.reads && calendarSource.eventAccess == .full
         let readsReminders = preferences.reminders && calendarSource.remindersAuthorized
         let calendars = calendarSource.calendars(eventsReadable: readsEvents, reminders: readsReminders)
             .filter { entry in
@@ -494,8 +570,7 @@ final class PhoneSyncEngine: ObservableObject {
 
         if preferences.status {
             var status = await statusSource.snapshot()
-            let comparable = status.filter { $0.key != "at" }
-            let hash = Self.hash(comparable)
+            let hash = Self.hash(Self.comparableStatus(status))
             let stale = state.statusSentAt.map { currentNow.timeIntervalSince($0) > PhoneSyncLimits.statusRefresh } ?? true
             if full || hash != state.statusHash || stale {
                 status["at"] = PhoneDates.format(currentNow)
@@ -530,6 +605,7 @@ final class PhoneSyncEngine: ObservableObject {
             newAlarmsHash = nil
         }
         if preferences.contacts {
+            await refreshPeople()
             let contacts = people.map(\.json)
             let hash = Self.hash(contacts)
             if full || hash != state.contactsHash {
@@ -540,11 +616,28 @@ final class PhoneSyncEngine: ObservableObject {
             newContactsHash = nil
         }
 
-        let batchID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        batch["batch_id"] = batchID
-        let body = try await Self.sealBatch(batch, key: key, deviceID: state.deviceID, batchID: batchID)
-        let answer = try await request("\(Self.base)/ingest", "POST", body)
-        // Taken: what was sent is now what the host has.
+        let frame = Self.hash(Self.frame(of: batch))
+        let send = ContextUploadPolicy.phoneIngestNeeded(
+            carriesNews: Self.carriesNews(batch), frame: frame, lastFrame: state.frameHash,
+            lastPosted: state.lastIngest, hostReportsPending: hostPending != nil, keepalive: keepalive, now: currentNow)
+        var pending = hostPending ?? 0
+        if send {
+            // A large upload goes in parts the host takes. Nothing below
+            // counts as sent until it took the last one, so a refused part
+            // sends the whole pass again (a full one starting over).
+            let parts = await Self.partsInBackground(batch, maxItems: PhoneSyncLimits.batchItems,
+                                                     maxBytes: PhoneSyncLimits.batchBytes)
+            for var part in parts {
+                let batchID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                part["batch_id"] = batchID
+                let body = try await Self.sealBatch(part, key: key, deviceID: state.deviceID, batchID: batchID)
+                let answer = try await request("\(Self.base)/ingest", "POST", body)
+                pending = (answer["pending"] as? NSNumber)?.intValue ?? 0
+            }
+            state.frameHash = frame
+            state.lastIngest = currentNow
+        }
+        // Taken (or nothing to take): what was read is now what the host has.
         state.eventHashes = newEventHashes
         state.reminderHashes = newReminderHashes
         state.calendarsHash = newCalendarsHash
@@ -556,7 +649,34 @@ final class PhoneSyncEngine: ObservableObject {
         state.fingerprint = preferences.fingerprint
         if full { state.lastFullSync = currentNow }
         persist()
-        return (answer["pending"] as? NSNumber)?.intValue ?? 0
+        return pending
+    }
+
+    /// The status as far as sending it again goes: its time is left out,
+    /// and the battery counts in 5% steps above 20% (the 15-minute refresh
+    /// still brings the exact level), so a phone in use doesn't upload
+    /// with every percent it loses.
+    nonisolated static func comparableStatus(_ status: [String: Any]) -> [String: Any] {
+        var comparable = status.filter { $0.key != "at" }
+        if let battery = (comparable["battery"] as? NSNumber)?.doubleValue, battery > 0.2 {
+            comparable["battery"] = (battery * 20).rounded(.down) / 20
+        }
+        return comparable
+    }
+
+    /// What every upload carries besides its sections. Any other key counts
+    /// as news, so a section added later always goes (fails safe).
+    nonisolated static let frameKeys: Set<String> = ["sent_at", "time_zone", "sharing", "batch_id"]
+
+    /// The time zone and sharing an upload reports; `sent_at` changes every
+    /// time and says nothing new.
+    nonisolated static func frame(of batch: [String: Any]) -> [String: Any] {
+        batch.filter { $0.key == "time_zone" || $0.key == "sharing" }
+    }
+
+    /// Whether an upload has a section to send.
+    nonisolated static func carriesNews(_ batch: [String: Any]) -> Bool {
+        batch.keys.contains { !frameKeys.contains($0) }
     }
 
     /// The sharing as it really is: access taken away in the Settings app
@@ -569,14 +689,18 @@ final class PhoneSyncEngine: ObservableObject {
         let calendar: PhoneCalendarAccess
         switch (preferences.calendar, access) {
         case (.full, .full): calendar = .full
-        case (.off, _), (_, .off): calendar = .off
+        case (.readOnly, .full), (.readOnly, .readOnly), (.full, .readOnly): calendar = .readOnly
+        // Read-only without read access leaves nothing Hermes may have.
+        case (.off, _), (_, .off), (.readOnly, .writeOnly), (.writeOnly, .readOnly): calendar = .off
         case (.full, .writeOnly), (.writeOnly, .full), (.writeOnly, .writeOnly): calendar = .writeOnly
         }
-        sharing["calendar"] = calendar.rawValue
-        if calendar != .full { sharing["attendee_emails"] = false }
+        sharing["calendar"] = calendar == .readOnly ? PhoneCalendarAccess.full.rawValue : calendar.rawValue
+        sharing["calendar_read_only"] = calendar == .readOnly
+        if !calendar.reads { sharing["attendee_emails"] = false }
         let reminders = preferences.reminders && remindersAuthorized
         sharing["reminders"] = reminders
-        if calendar != .full, !reminders { sharing["details"] = false }
+        sharing["reminders_read_only"] = reminders && preferences.remindersReadOnly
+        if !calendar.reads, !reminders { sharing["details"] = false }
         sharing["alarms"] = preferences.alarms && alarmsAuthorized
         return sharing
     }
@@ -606,6 +730,82 @@ final class PhoneSyncEngine: ObservableObject {
         return Section(upsert: upsert, delete: delete, hashes: hashes)
     }
 
+    /// An upload as parts the host takes, each with at most `maxItems` items
+    /// (what phone_store counts against MAX_ITEMS: calendars, upserts,
+    /// deletions, alarms and people) and about `maxBytes` of JSON. The first
+    /// part is the upload with as many event and reminder deletions, then
+    /// upserts, as fit: it carries every other section and each section's
+    /// `full`. The others only add deletions and upserts (never `full`) under
+    /// the same `sent_at`, which the host applies after the first. An upload
+    /// that fits is one part.
+    ///
+    /// The host applies each part on its own, so between a full first part
+    /// and the last one it has only some of the snapshot; if a later part is
+    /// refused, nothing counts as sent and the next pass sends it all again.
+    nonisolated static func parts(of batch: [String: Any], maxItems: Int, maxBytes: Int) -> [[String: Any]] {
+        func size(_ value: Any) -> Int {
+            (try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed]))?.count ?? 0
+        }
+        func count(_ value: Any?) -> Int { (value as? [Any])?.count ?? 0 }
+        var head = batch
+        // Deletions first, so an upload that fits keeps them all in its first part.
+        var deletes: [(section: String, list: String, item: Any)] = []
+        var upserts: [(section: String, list: String, item: Any)] = []
+        var later = batch.filter { frameKeys.contains($0.key) }
+        for section in ["events", "reminders"] {
+            guard var body = batch[section] as? [String: Any] else { continue }
+            deletes += (body["delete"] as? [Any] ?? []).map { (section, "delete", $0) }
+            upserts += (body["upsert"] as? [Any] ?? []).map { (section, "upsert", $0) }
+            body["upsert"] = [[String: Any]]()
+            if body["delete"] != nil { body["delete"] = [String]() }
+            head[section] = body
+            var more: [String: Any] = ["full": false, "upsert": [[String: Any]](), "delete": [String]()]
+            more["from"] = body["from"]
+            more["to"] = body["to"]
+            later[section] = more
+        }
+        var items = count(head["calendars"]) + count(head["alarms"]) + count(head["contacts"])
+        var bytes = size(head)
+        var base = head
+        var taken: [String: [String: [Any]]] = [:]
+        var parts: [[String: Any]] = []
+        func close() {
+            var part = base
+            for (section, lists) in taken {
+                var body = part[section] as? [String: Any] ?? [:]
+                for (list, values) in lists { body[list] = values }
+                part[section] = body
+            }
+            // A later part has only the sections it adds to.
+            if !parts.isEmpty {
+                part = part.filter { frameKeys.contains($0.key) || taken[$0.key] != nil }
+            }
+            parts.append(part)
+        }
+        for (section, list, item) in deletes + upserts {
+            let itemBytes = size(item) + 1
+            // A later part takes at least one item, however large.
+            let mustTakeOne = !parts.isEmpty && taken.isEmpty
+            if !mustTakeOne, items + 1 > maxItems || bytes + itemBytes > maxBytes {
+                close()
+                base = later
+                taken = [:]
+                items = 0
+                bytes = size(later)
+            }
+            taken[section, default: [:]][list, default: []].append(item)
+            items += 1
+            bytes += itemBytes
+        }
+        close()
+        return parts
+    }
+
+    nonisolated private static func partsInBackground(_ batch: [String: Any], maxItems: Int,
+                                                      maxBytes: Int) async -> [[String: Any]] {
+        parts(of: batch, maxItems: maxItems, maxBytes: maxBytes)
+    }
+
     /// A full upload can be thousands of items, so it's serialized and
     /// sealed off the main thread.
     nonisolated private static func sealBatch(_ batch: [String: Any], key: PhoneSyncCrypto.SessionKey,
@@ -621,11 +821,7 @@ final class PhoneSyncEngine: ObservableObject {
     }
 
     nonisolated static func hash(_ value: Any) -> String {
-        // Anything JSON can't spell still hashes by its description, never
-        // all to the same empty value.
-        let data = (try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]))
-            ?? Data(String(describing: value).utf8)
-        return SHA256.hash(data: data).prefix(12).map { String(format: "%02x", $0) }.joined()
+        ContextFingerprint.of(value)
     }
 
     // MARK: Changes from Hermes
@@ -659,15 +855,43 @@ final class PhoneSyncEngine: ObservableObject {
                 if !state.unreported.contains(known) { state.unreported.append(known) }
                 continue
             }
-            if change.auto, change.kind.addsWithoutAsking, preferences.autoAdd {
+            if !preferences.allows(change.kind) {
+                // Read-only (or no longer shared): never a card, whatever
+                // the host asked. A host from before read-only can ask.
+                // Reported, not remembered as answered: it's the setting
+                // now, so the same change asked again after the user allows
+                // changes gets its card.
+                let refusal = PhoneChangeResult(id: change.id, outcome: .failed, note: Self.refusalNote(change.kind))
+                if !state.unreported.contains(refusal) { state.unreported.append(refusal) }
+                continue
+            }
+            if let approved = approvedOnCard.removeValue(forKey: change.id), approved > now() {
+                await applyNow(change, auto: false)
+            } else if change.auto, change.kind.addsWithoutAsking, preferences.autoAdd {
                 await applyNow(change, auto: true)
             } else {
                 fresh.append(PhoneChangePrompt(change: change, calendarTitle: calendarTitle(for: change),
                                                alarmTitle: alarmTitle(for: change)))
             }
         }
-        prompts = fresh
+        // One approved on a card while this ran gets no card: the pass the
+        // approval runs applies it.
+        prompts = fresh.filter { approvedOnCard[$0.id] == nil }
         persist()
+    }
+
+    /// A change the user approved on a Pulse card, by its id: applied now
+    /// if its card is already waiting here, else when the host hands it out
+    /// within 15 minutes (AppState.applyPulseApproval runs the pass). A
+    /// change for another device never comes here, and its approval lapses.
+    func approveFromCard(_ changeID: String) async {
+        let now = self.now()
+        approvedOnCard = approvedOnCard.filter { $0.value > now }
+        if let prompt = prompts.first(where: { $0.id == changeID }) {
+            await answer(prompt, approve: true)
+            return
+        }
+        approvedOnCard[changeID] = now.addingTimeInterval(Self.cardApprovalWindow)
     }
 
     /// The user's answer to a card (or to the question in a voice call).
@@ -694,9 +918,23 @@ final class PhoneSyncEngine: ObservableObject {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
+    /// Why a change the user doesn't allow was refused, for Hermes (not UI
+    /// copy, so not localized).
+    nonisolated static func refusalNote(_ kind: PhoneChange.Kind) -> String {
+        if kind.isAlarm { return "The user doesn't let Hermes set alarms on this iPhone" }
+        return kind.isEvent
+            ? "The user doesn't let Hermes make this change to their calendar (read-only or not shared)"
+            : "The user doesn't let Hermes change their reminders (read-only or not shared)"
+    }
+
     private func applyNow(_ change: PhoneChange, auto: Bool) async {
         guard state.answered[change.id] == nil, applying.insert(change.id).inserted else { return }
         defer { applying.remove(change.id) }
+        // The user can make it read-only while a card waits.
+        guard preferences.allows(change.kind) else {
+            record(PhoneChangeResult(id: change.id, outcome: .failed, note: Self.refusalNote(change.kind)))
+            return
+        }
         if change.kind.isAlarm {
             await applyAlarm(change, auto: auto)
             return
@@ -750,8 +988,6 @@ final class PhoneSyncEngine: ObservableObject {
     // MARK: Live voice calls
 
     struct VoiceNotReady: Error {}
-    /// Voice adds and deletions only: updates stay with Hermes' cards.
-    struct NotForVoice: Error {}
 
     /// One sealed read for a live voice call (`op: "voice"`, at `path`): the
     /// host's result, for this iPhone's data only. Checks only that sharing
@@ -777,22 +1013,18 @@ final class PhoneSyncEngine: ObservableObject {
         return json["result"] ?? NSNull()
     }
 
-    /// Adds or deletes an event or reminder the user asked for in a voice
-    /// call, straight away (no card: they said so out loud). The next upload
-    /// sends it. Like `voiceRead`, the caller checks the voice mode may use it.
+    /// Adds, changes or deletes an event or reminder, or sets or cancels an
+    /// alarm, the user asked for in a voice call, straight away (no card:
+    /// they said so out loud). The next upload sends it. Like `voiceRead`,
+    /// the caller checks the voice mode may use it.
     func applyFromVoice(_ change: PhoneChange) async throws -> String? {
-        guard change.kind.addsWithoutAsking || change.kind == .deleteEvent || change.kind == .deleteReminder else {
-            throw NotForVoice()
-        }
-        guard preferences.isOn, readStateIfNeeded() else { throw VoiceNotReady() }
+        // Still shared, and not read-only, after the wait for the user's yes.
+        guard preferences.isOn, preferences.allows(change.kind), readStateIfNeeded() else { throw VoiceNotReady() }
         if change.kind.isAlarm {
-            guard preferences.alarms else { throw VoiceNotReady() }
             return try await alarmSource.apply(change, now: now())
         }
-        if change.kind == .deleteEvent || change.kind == .deleteReminder {
-            let isEvent = change.kind == .deleteEvent
-            // Still shared after the wait for the user's yes.
-            guard isEvent ? preferences.calendar == .full : preferences.reminders else { throw VoiceNotReady() }
+        if !change.kind.isAddition {
+            let isEvent = change.kind.isEvent
             // Only what's still shared: an id read before its calendar was
             // left out isn't.
             if let calendar = await calendarSource.itemCalendar(itemID: (isEvent ? change.eventID : change.reminderID) ?? "",
@@ -802,7 +1034,7 @@ final class PhoneSyncEngine: ObservableObject {
             }
         }
         let itemID = try await calendarSource.apply(change, window: window)
-        // A deletion needs nothing here: the next upload sees it gone.
+        // A change or deletion needs nothing here: the next upload sees it.
         if change.kind.isAddition, let itemID {
             if change.kind.isEvent {
                 if state.eventHashes[itemID] == nil { state.eventHashes[itemID] = "" }

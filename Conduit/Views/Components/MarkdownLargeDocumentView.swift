@@ -124,12 +124,12 @@ private struct LargeDocumentBanner: View {
                 "This message is very large (\(sizeLabel))",
                 systemImage: "doc.text.magnifyingglass"
             )
-            .font(.footnote.weight(.semibold))
+            .scaledFont(.footnote.weight(.semibold))
             .foregroundStyle(usesAccentSurface ? Color.white.opacity(0.86) : .secondary)
 
             Button(action: expand) {
                 Label("Show full message", systemImage: "chevron.down")
-                    .font(.footnote.weight(.semibold))
+                    .scaledFont(.footnote.weight(.semibold))
             }
             .tint(usesAccentSurface ? .white : .conduitAccent)
         }
@@ -383,7 +383,7 @@ extension MarkdownBlock {
         switch self {
         case .heading(_, let text), .paragraph(let text): return text
         case .quote(let lines): return lines.map(\.text).joined(separator: "\n")
-        case .unorderedList(let items), .orderedList(let items): return items.joined(separator: "\n")
+        case .unorderedList(let items), .orderedList(let items, _): return items.joined(separator: "\n")
         case .table(let headers, _, let rows):
             return ([headers] + rows).map { $0.joined(separator: " ") }.joined(separator: "\n")
         case .code(_, let source): return source
@@ -392,6 +392,7 @@ extension MarkdownBlock {
         case .math(let source): return source
         case .image(let url, let alt): return "\(alt) \(url)"
         case .htmlPreview(let path): return path
+        case .desktopCard(let card): return card.source
         case .divider: return ""
         }
     }
@@ -469,8 +470,22 @@ struct LargeMarkdownExpandedView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let prepared {
+                let pictures = Self.pictureRanges(prepared.chunks)
                 ForEach(0..<renderedChunkCount, id: \.self) { index in
-                    chunkView(prepared, chunk: prepared.chunks[index], index: index)
+                    // Two or more pictures in a row draw as one grid of the
+                    // ones mounted (issue 1801), at the first of them.
+                    switch MarkdownProseRun.pictureSlot(at: index, in: pictures, shown: 0..<renderedChunkCount) {
+                    case .single:
+                        chunkView(prepared, chunk: prepared.chunks[index], index: index)
+                    case .grid(let range):
+                        MarkdownPictureGrid(
+                            blocks: range.compactMap { Self.pictureBlock(prepared.chunks[$0]) },
+                            gatewayMediaDataURL: gatewayMediaDataURL
+                        )
+                        .id("\(prepared.sourceIdentity)-\(index)")
+                    case .covered:
+                        EmptyView()
+                    }
                 }
                 if renderedChunkCount < prepared.chunks.count {
                     progressFooter(remainingCount: prepared.chunks.count - renderedChunkCount)
@@ -513,6 +528,17 @@ struct LargeMarkdownExpandedView: View {
         .onDisappear {
             selectionCoordinator.clearSelection()
         }
+    }
+
+    /// The picture a chunk is, when it is one that can share a grid.
+    static func pictureBlock(_ chunk: MarkdownLargeChunk) -> MarkdownBlock? {
+        guard case .block(let block, _) = chunk, MarkdownProseRun.isGridPicture(block) else { return nil }
+        return block
+    }
+
+    /// The runs of two or more pictures among a document's chunks.
+    static func pictureRanges(_ chunks: [MarkdownLargeChunk]) -> [Range<Int>] {
+        MarkdownProseRun.pictureRanges(flags: chunks.map { pictureBlock($0) != nil })
     }
 
     private func registerSegments() {
@@ -629,7 +655,7 @@ struct LargeMarkdownExpandedView: View {
                 "Continue reading (\(remainingCount) sections left)",
                 systemImage: "chevron.down"
             )
-            .font(.footnote.weight(.semibold))
+            .scaledFont(.footnote.weight(.semibold))
         }
         .tint(usesAccentSurface ? .white : .conduitAccent)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -686,7 +712,7 @@ private struct LargeDocumentPreparingView: View {
         HStack(spacing: 8) {
             ProgressView().controlSize(.small)
             Text("Preparing large message…")
-                .font(.footnote)
+                .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -712,7 +738,7 @@ private struct LargeDocumentPreparingView: View {
 final class LargeFlowChunkBox {
     private var cachedText: NSAttributedString?
     private var cachedCategory: UIContentSizeCategory?
-    private var cachedChatTextSize: ChatTextSize?
+    private var cachedChatTextSize: ChatTextAppearance?
     private var cachedUsesAccentSurface: Bool?
 
     @MainActor
@@ -722,7 +748,7 @@ final class LargeFlowChunkBox {
         foregroundStyle: Color,
         usesAccentSurface: Bool,
         contentCategory: UIContentSizeCategory = UIApplication.shared.preferredContentSizeCategory,
-        chatTextSize: ChatTextSize = .default
+        chatTextSize: ChatTextAppearance = .default
     ) -> NSAttributedString? {
         if let cachedText,
            cachedCategory == contentCategory,
@@ -779,7 +805,7 @@ struct LargeFlowChunkView: View {
         ) {
             SelectableTextView(
                 attributedText: attributed,
-                font: ChatTypography.font(for: .body, chatSize: chatTextSize),
+                font: ChatTypography.font(for: .body, appearance: chatTextSize),
                 textColor: usesAccentSurface ? .white : UIColor(foregroundStyle),
                 lineSpacing: 4,
                 linkColor: usesAccentSurface ? .white : .link,
@@ -823,7 +849,7 @@ struct LargeMarkdownCallout: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Label(detail.title, systemImage: detail.icon)
-                .font(.caption.weight(.bold))
+                .scaledFont(.caption.weight(.bold))
                 .foregroundStyle(detail.color)
             ForEach(Array(content.pieceBlocks.enumerated()), id: \.offset) { index, blocks in
                 LargeFlowChunkView(
@@ -911,19 +937,30 @@ struct LargeCodeBlockView: View {
     @Environment(\.chatRowDisclosure) private var disclosure
     @State private var expanded = false
     @State private var copied = false
-    @State private var slices: [String]?
-    /// (hasMoreLines, lineCount) computed once off-main; whole-block scans
-    /// must not run per body evaluation.
-    @State private var lineStats: (hasMore: Bool, count: Int)?
+    @State private var slices: LargeCodeBlockResult<[String]>?
+    /// (hasMoreLines, lineCount) computed once per source off-main; whole-block
+    /// scans must not run per body evaluation.
+    @State private var lineStats: LargeCodeBlockResult<(hasMore: Bool, count: Int)>?
+
+    /// `expanded` starts the block open, as if Show all had been tapped.
+    init(source: String, language: String, usesAccentSurface: Bool, expanded: Bool = false) {
+        self.source = source
+        self.language = language
+        self.usesAccentSurface = usesAccentSurface
+        _expanded = State(initialValue: expanded)
+    }
 
     private var normalizedLanguage: String { MarkdownLanguage.normalized(language) }
 
     var body: some View {
+        let sourceIdentity = LargeCodeBlockResult<Void>.sourceIdentity(of: source)
         VStack(alignment: .leading, spacing: 0) {
             header
             ScrollView(.horizontal, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
-                    if let slices {
+                    // While a changed source is re-sliced the previous slices
+                    // stay up rather than collapsing to the preview.
+                    if let slices = slices?.value {
                         ForEach(0..<slices.count, id: \.self) { index in
                             LargeCodeSliceView(
                                 source: slices[index],
@@ -945,13 +982,13 @@ struct LargeCodeBlockView: View {
                             language: normalizedLanguage,
                             usesAccentSurface: usesAccentSurface
                         )
-                        if lineStats?.hasMore == true {
+                        if lineStats?.value.hasMore == true {
                             Button {
                                 disclosure?.willToggle(nil, to: true)
                                 withAnimation(.easeInOut(duration: 0.15)) { expanded = true }
                             } label: {
-                                Label("Show all \(lineStats?.count ?? 0) lines", systemImage: "chevron.down")
-                                    .font(.caption.weight(.semibold))
+                                Label("Show all \(lineStats?.value.count ?? 0) lines", systemImage: "chevron.down")
+                                    .scaledFont(.caption.weight(.semibold))
                             }
                             .tint(usesAccentSurface ? .white : .conduitAccent)
                             .padding(.top, 8)
@@ -972,10 +1009,12 @@ struct LargeCodeBlockView: View {
                     lineWidth: 1
                 )
         }
-        .task(id: "stats-\(source.utf8.count)") {
-            // One-time whole-block scans, off the MainActor and cancellation
-            // cooperative with this view's lifecycle.
-            guard lineStats == nil else { return }
+        .task(id: "stats-\(sourceIdentity)") {
+            // One whole-block scan per source, off the MainActor and
+            // cancellation cooperative with this view's lifecycle. A block in
+            // the streaming tail keeps this view while its source grows, so a
+            // result is only reused for the source it was computed from.
+            guard lineStats?.needsRecompute(for: sourceIdentity) ?? true else { return }
             let currentSource = source
             let stats = await MarkdownCodeSlicer.lineStats(
                 source: currentSource,
@@ -983,10 +1022,10 @@ struct LargeCodeBlockView: View {
                 previewByteBudget: MarkdownLargeDocumentPolicy.codePreviewBytes
             )
             guard !Task.isCancelled else { return }
-            lineStats = stats
+            lineStats = LargeCodeBlockResult(sourceIdentity: sourceIdentity, value: stats)
         }
-        .task(id: expanded ? "full-\(source.utf8.count)" : "preview") {
-            guard expanded, slices == nil else { return }
+        .task(id: expanded ? "full-\(sourceIdentity)" : "preview") {
+            guard expanded, slices?.needsRecompute(for: sourceIdentity) ?? true else { return }
             let currentSource = source
             let maxLines = MarkdownLargeDocumentPolicy.codeSliceLineCount
             let maxBytes = MarkdownLargeDocumentPolicy.codeSliceBytes
@@ -996,14 +1035,14 @@ struct LargeCodeBlockView: View {
                 maxBytes: maxBytes
             )
             guard !Task.isCancelled, expanded, let result else { return }
-            slices = result
+            slices = LargeCodeBlockResult(sourceIdentity: sourceIdentity, value: result)
         }
     }
 
     private var header: some View {
         HStack {
             Text(normalizedLanguage == "plain" ? AppLocalization.string("Code") : normalizedLanguage)
-                .font(.caption2.monospaced().weight(.semibold))
+                .scaledFont(.caption2.monospaced().weight(.semibold))
                 .foregroundStyle(usesAccentSurface ? Color.white.opacity(0.86) : .secondary)
             Spacer()
             Button {
@@ -1017,13 +1056,30 @@ struct LargeCodeBlockView: View {
                 }
             } label: {
                 Label(copied ? AppLocalization.string("Copied") : AppLocalization.string("Copy"), systemImage: copied ? "checkmark" : "doc.on.doc")
-                    .font(.caption2.weight(.semibold))
+                    .scaledFont(.caption2.weight(.semibold))
             }
             .tint(usesAccentSurface ? .white : .conduitAccent)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(usesAccentSurface ? Color.black.opacity(0.28) : Color.primary.opacity(0.055))
+    }
+}
+
+/// A whole-block result of `LargeCodeBlockView` (line statistics, expanded
+/// slices) kept with the source it was computed from, so a changed source —
+/// a block still streaming in, or an edit of the same length — is computed
+/// again instead of keeping the first result.
+struct LargeCodeBlockResult<Value> {
+    let sourceIdentity: String
+    let value: Value
+
+    static func sourceIdentity(of source: String) -> String {
+        "\(source.utf8.count)-\(source.hashValue)"
+    }
+
+    func needsRecompute(for sourceIdentity: String) -> Bool {
+        self.sourceIdentity != sourceIdentity
     }
 }
 
@@ -1036,7 +1092,7 @@ enum LargeCodeSliceIdentity {
     static func identity(
         source: String,
         sizeCategory: ContentSizeCategory,
-        chatTextSize: ChatTextSize
+        chatTextSize: ChatTextAppearance
     ) -> String {
         "\(source.hashValue)-\(sizeCategory)-chat:\(chatTextSize.cacheIdentity)"
     }
@@ -1106,7 +1162,7 @@ private struct LargeCodeSliceView: View {
     @Environment(\.chatTextSize) private var chatTextSize
 
     private var font: UIFont {
-        ChatTypography.font(for: .blockCode, chatSize: chatTextSize)
+        ChatTypography.font(for: .blockCode, appearance: chatTextSize)
     }
 
     private var sliceIdentity: String {
@@ -1207,12 +1263,10 @@ extension MarkdownCodeSlicer {
     /// true when either ceiling (lines or bytes) leaves content unpreviewed.
     static func lineStats(source: String, previewLineBudget: Int, previewByteBudget: Int) async -> (hasMore: Bool, count: Int) {
         await Task.yield()
+        // Bytes, not Characters: faster on every streamed update, and "\r\n"
+        // is one Character that never equals "\n".
         var newlines = 0
-        var index = source.startIndex
-        while index < source.endIndex {
-            if source[index] == "\n" { newlines += 1 }
-            index = source.index(after: index)
-        }
+        for byte in source.utf8 where byte == 0x0A { newlines += 1 }
         let hasMore = newlines >= previewLineBudget || source.utf8.count > previewByteBudget
         return (hasMore, newlines + 1)
     }

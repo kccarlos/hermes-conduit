@@ -2,7 +2,8 @@
 //  AppState+V2Shell.swift
 //  Conduit
 //
-//  Read-only lookups the V2 navigation shell draws from. They add no state:
+//  Read-only lookups the V2 navigation shell draws from (the classic
+//  drawer's Projects list reads projectsWithUnread too). They add no state:
 //  everything here derives from the catalog, read state and roster AppState
 //  already owns.
 //
@@ -10,6 +11,19 @@
 import SwiftUI
 
 extension AppState {
+    /// A bot's own color, as its chat's glow shows it: the color picked
+    /// for its profile or drawn from its photo, else its Hermes color, else
+    /// its name's hue. Bots Home's rings and the overview use it, so a
+    /// ring matches the bot (build 248: the rings took the name's hue
+    /// whenever Hermes kept no color).
+    func botColor(_ bot: BotProfile) -> Color {
+        Self.botColor(bot, glow: profileGlowColors()[bot.name])
+    }
+
+    static func botColor(_ bot: BotProfile, glow: ProfileGlowRGB?) -> Color {
+        glow?.color ?? BotAvatarView.color(for: bot.appearanceColor, name: bot.name)
+    }
+
     /// The color the backdrop's warm glow takes for a profile: the one
     /// picked for it or drawn from its photo (`profileGlowColors`), else the
     /// color its bot was given in Hermes, or nil (the gold accent). The bot
@@ -19,9 +33,11 @@ extension AppState {
     /// resolves to a roster bot, a workspace profile's name included.
     func profileGlowTint(_ profile: String) -> Color? {
         if let glow = profileGlowColors()[profile] { return glow.color }
-        // The common case has no roster at all: one check, no passes.
-        guard !botRoster.isEmpty else { return nil }
-        guard let bot = Self.linkedBot(named: profile, in: botRoster),
+        // The kept bots until Hermes answers (#1533). The common case has
+        // no roster at all: one check, no passes.
+        let roster = shownBotRoster
+        guard !roster.isEmpty else { return nil }
+        guard let bot = Self.linkedBot(named: profile, in: roster),
               let color = bot.appearanceColor?.trimmingCharacters(in: .whitespacesAndNewlines),
               !color.isEmpty else { return nil }
         return BotAvatarView.color(for: color, name: bot.name)
@@ -29,13 +45,17 @@ extension AppState {
 
     /// Which of `profiles` have a listed conversation with activity the
     /// user hasn't seen. Only rows this device has listed count, so a profile
-    /// never opened here shows no dot rather than a guess. One walk of the
+    /// never opened here shows no dot rather than a guess (All lists the
+    /// other profiles' rows). One walk of the
     /// catalog for the whole profile strip, which redraws with every top bar.
     func profilesWithUnread(among profiles: [String]) -> Set<String> {
         var unread = Set<String>()
         // Owners repeat across rows, so each distinct one is matched once.
         var profilesByOwner: [String: [String]] = [:]
-        for session in sessions {
+        // All's combined read lists the other profiles' rows too.
+        let others = isAllProfilesChatsOn && allProfilesCatalog.dashboardID == activeDashboardID
+            ? allProfilesCatalog.sessions : []
+        for session in sessions + others {
             guard unread.count < profiles.count else { break }
             guard let owner = session.profile else { continue }
             let matched: [String]
@@ -52,10 +72,24 @@ extension AppState {
         return unread
     }
 
+    /// Which projects hold a conversation with a reply the user hasn't
+    /// seen (issue 1496): the chats the project tree lists, as its running
+    /// count reads them, each from its catalog copy when the catalog has one.
+    func projectsWithUnread() -> Set<String> {
+        var unread = Set<String>()
+        for project in projects {
+            let hasUnread = project.previewSessions.contains { preview in
+                isSessionUnread(catalogRow(answeringTo: preview) ?? preview)
+            }
+            if hasUnread { unread.insert(project.id) }
+        }
+        return unread
+    }
+
     /// Whether a voice call's screen is up or on its way up. Opening a call
     /// uncovers the chat the old drawer hid; the V2 shell keeps its list.
     var isVoiceCallScreenPresented: Bool {
-        showVoiceSheet || showGeminiLiveSheet || showGPTLiveSheet || showGrokLiveSheet || showLocalLiveSheet
+        showVoiceSheet || showQwenLiveSheet || showGeminiLiveSheet || showGPTLiveSheet || showGrokLiveSheet || showLocalLiveSheet
     }
 
     /// The conversation a nested row (a call's job, a chat's call) sits

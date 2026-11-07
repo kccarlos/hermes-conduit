@@ -9,6 +9,10 @@ struct ChatMessageScrollTarget: Identifiable, Equatable {
     let message: ChatMessage
     let semanticID: String
     let restorationMetadata: ChatScrollAnchorMetadata
+    /// Derived once per rebuild, not re-parsed on every step-run scan.
+    let isStep: Bool
+    /// A self-improvement review's card, derived once like `isStep`.
+    let isReview: Bool
     /// Transcript-order position, maintained by the cache so views can
     /// iterate the targets collection directly (no Array(enumerated()) copy
     /// per body evaluation) and still report stable row order to the
@@ -17,10 +21,25 @@ struct ChatMessageScrollTarget: Identifiable, Equatable {
     /// Where this row sits in its turn's run of thinking and tool steps, so
     /// the run can draw as one card. Nil for every other row.
     var step: ChatStepPlacement? = nil
+    /// On a reply: the run of steps right above it, when that run has
+    /// thinking (its menu's Show thinking). Nil for every other row.
+    var stepsAbove: ChatStepGroup? = nil
+    /// Where this self-improvement review sits in a run of reviews, so two
+    /// or more draw as one line until opened (#1518). Nil for every other
+    /// row.
+    var reviewRun: ChatReviewPlacement? = nil
 
     /// SwiftUI keeps the existing source-row identity for rendering and
     /// controls. Only scroll targeting uses the source-independent ID.
     var id: String { message.id }
+
+    /// The row a restored viewport lands on: a review inside a run of
+    /// reviews isn't laid out while the run is closed, as it is whenever a
+    /// chat opens, so its run's line stands in for it.
+    var restorationAnchorID: String {
+        if let run = reviewRun?.run, run.count >= 2 { return run.id }
+        return id
+    }
 }
 
 enum ChatMessageScrollTargetCacheUpdate: Equatable {
@@ -67,6 +86,31 @@ struct ChatMessageScrollTargetCache: Equatable {
             return .unchanged
         }
 
+        // Rows put in above the ones already here (Load earlier messages):
+        // the old rows keep their fingerprints, so only the new ones are
+        // hashed. The targets are made again for every row, since a new row
+        // can share a fingerprint with an old one and so change its
+        // occurrence, as the full rebuild below would (issue 1726).
+        if commonPrefix == 0, !targets.isEmpty, messages.count > targets.count {
+            let inserted = messages.count - targets.count
+            var commonSuffix = 0
+            while commonSuffix < targets.count,
+                  targets[targets.count - 1 - commonSuffix].message == messages[messages.count - 1 - commonSuffix] {
+                commonSuffix += 1
+            }
+            if commonSuffix == targets.count {
+                let insertedMessages = Array(messages[..<inserted])
+                let updatedFingerprints = ChatMessageScrollTargets.fingerprints(for: insertedMessages) + fingerprints
+                TranscriptPerf.lastFingerprintedMessageCount = insertedMessages.count
+                TranscriptPerf.lastFingerprintedByteCount = Self.fingerprintedBytes(of: insertedMessages)
+                fingerprints = updatedFingerprints
+                targets = ChatMessageScrollTargets.make(for: messages, fingerprints: updatedFingerprints)
+                placeRuns(from: 0)
+                renderingRevision &+= 1
+                return .semanticsChanged
+            }
+        }
+
         // Hash only the changed suffix.
         let suffixStart = commonPrefix
         let suffixMessages = Array(messages[suffixStart...])
@@ -86,11 +130,13 @@ struct ChatMessageScrollTargetCache: Equatable {
                     message: message,
                     semanticID: target.semanticID,
                     restorationMetadata: target.restorationMetadata,
+                    isStep: ChatStepGroup.isStep(message),
+                    isReview: ChatMessageScrollTarget.drawsReviewCard(message),
                     order: target.order
                 )
             }
             targets.replaceSubrange(suffixStart..., with: replacement)
-            placeSteps(from: suffixStart)
+            placeRuns(from: suffixStart)
             renderingRevision &+= 1
             return .renderingChanged
         }
@@ -117,7 +163,7 @@ struct ChatMessageScrollTargetCache: Equatable {
             )
             fingerprints.replaceSubrange(suffixStart..., with: suffixFingerprints)
             targets.replaceSubrange(suffixStart..., with: suffixTargets)
-            placeSteps(from: suffixStart)
+            placeRuns(from: suffixStart)
             renderingRevision &+= 1
             return .semanticsChanged
         }
@@ -134,9 +180,44 @@ struct ChatMessageScrollTargetCache: Equatable {
             for: messages,
             fingerprints: updatedFingerprints
         )
-        placeSteps(from: 0)
+        placeRuns(from: 0)
         renderingRevision &+= 1
         return .semanticsChanged
+    }
+
+    private mutating func placeRuns(from index: Int) {
+        placeSteps(from: index)
+        placeReviews(from: index)
+    }
+
+    /// Re-place the runs of reviews from `index` on, starting at the run
+    /// that reaches it: a review at the end joins the run above it.
+    private mutating func placeReviews(from index: Int) {
+        var start = min(index, targets.count)
+        while start > 0, targets[start - 1].isReview {
+            start -= 1
+        }
+        var i = start
+        while i < targets.count {
+            guard targets[i].isReview else {
+                if targets[i].reviewRun != nil { targets[i].reviewRun = nil }
+                i += 1
+                continue
+            }
+            var end = i
+            while end < targets.count, targets[end].isReview {
+                end += 1
+            }
+            let run = ChatReviewRun(
+                memberIDs: targets[i..<end].map(\.id),
+                lastTimestamp: targets[end - 1].message.timestamp
+            )
+            for k in i..<end {
+                let placement = ChatReviewPlacement(run: run, index: k - i)
+                if targets[k].reviewRun != placement { targets[k].reviewRun = placement }
+            }
+            i = end
+        }
     }
 
     /// Re-place the runs of steps from `index` on, starting at the run
@@ -144,18 +225,22 @@ struct ChatMessageScrollTargetCache: Equatable {
     /// steps, or end it.
     private mutating func placeSteps(from index: Int) {
         var start = min(index, targets.count)
-        while start > 0, ChatStepGroup.isStep(targets[start - 1].message) {
+        while start > 0, targets[start - 1].isStep {
             start -= 1
         }
         var i = start
+        var runAbove: ChatStepGroup?
         while i < targets.count {
-            guard ChatStepGroup.isStep(targets[i].message) else {
+            guard targets[i].isStep else {
                 if targets[i].step != nil { targets[i].step = nil }
+                let above = targets[i].message.role == .assistant && runAbove?.hasThinking == true ? runAbove : nil
+                if targets[i].stepsAbove != above { targets[i].stepsAbove = above }
+                runAbove = nil
                 i += 1
                 continue
             }
             var end = i
-            while end < targets.count, ChatStepGroup.isStep(targets[end].message) {
+            while end < targets.count, targets[end].isStep {
                 end += 1
             }
             let group = ChatStepGroup(
@@ -165,7 +250,9 @@ struct ChatMessageScrollTargetCache: Equatable {
             for k in i..<end {
                 let placement = ChatStepPlacement(group: group, index: k - i)
                 if targets[k].step != placement { targets[k].step = placement }
+                if targets[k].stepsAbove != nil { targets[k].stepsAbove = nil }
             }
+            runAbove = group
             i = end
         }
     }
@@ -181,10 +268,6 @@ struct ChatRenderedScrollScope: Hashable {
     let restorationGeneration: UInt64?
     let transcriptRevision: UInt64
     let viewportTransitionGeneration: UInt64
-}
-
-struct ChatRenderedScrollContent: Equatable {
-    let scope: ChatRenderedScrollScope
 }
 
 enum ChatMessageScrollTargets {
@@ -216,6 +299,8 @@ enum ChatMessageScrollTargets {
                     fingerprint: fingerprint,
                     duplicateCount: duplicateCounts[fingerprint, default: 0]
                 ),
+                isStep: ChatStepGroup.isStep(message),
+                isReview: ChatMessageScrollTarget.drawsReviewCard(message),
                 order: baseOrder + offset
             )
         }

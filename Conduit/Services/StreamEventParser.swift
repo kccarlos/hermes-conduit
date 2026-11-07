@@ -50,7 +50,24 @@ enum StreamEventParser {
                 ?? payload?["text"]?.stringValue
                 ?? payload?["rendered"]?.stringValue
             let reasoning = payload?["reasoning"]?.stringValue
-            return .messageComplete(sessionId: sessionId, messageId: messageId, content: content, reasoning: reasoning)
+            let alreadyShown = payload?["response_previewed"]?.boolValue == true
+                || payload?["response_reused"]?.boolValue == true
+            return .messageComplete(
+                sessionId: sessionId,
+                messageId: messageId,
+                content: content,
+                reasoning: reasoning,
+                alreadyShown: alreadyShown
+            )
+
+        case "message.interim":
+            let text = payload?["text"]?.stringValue ?? ""
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return .messageInterim(
+                sessionId: sessionId,
+                text: text,
+                alreadyStreamed: payload?["already_streamed"]?.boolValue == true
+            )
 
         case "message.reaction":
             guard let rowId = HermesClient.exactIntValue(payload?["row_id"]), rowId > 0 else { return nil }
@@ -60,6 +77,26 @@ enum StreamEventParser {
                 reactions: MessageNormalizer.messageReactions(from: payload?["reactions"]),
                 role: payload?["role"]?.stringValue ?? ""
             )
+
+        case "user.message":
+            // A user message another client of this session sent (only
+            // some gateways announce it; the row is already stored). Text
+            // only says it is someone else's: the transcript reads it.
+            let text = payload?["text"]?.stringValue ?? ""
+            guard !sessionId.isEmpty,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return .userMessage(
+                sessionId: sessionId,
+                rowId: HermesClient.exactIntValue(payload?["row_id"]),
+                text: text,
+                origin: payload?["origin"]?.stringValue
+            )
+
+        case "sessions.changed":
+            // Hermes' change watcher: a stored session row moved (a new
+            // message, a rename, a deletion), whichever process wrote it.
+            // Session-less, sent to every client of the gateway.
+            return .sessionsChanged
 
         case "error":
             return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? AppLocalization.string("Hermes reported an error."))
@@ -100,7 +137,7 @@ enum StreamEventParser {
             )
 
         case "tool.start", "tool_call":
-            let name = payload?["name"]?.stringValue ?? ""
+            let name = Self.liveToolName(payload)
             let toolID = ["tool_id", "tool_call_id", "call_id"]
                 .compactMap { payload?[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty }
@@ -112,7 +149,7 @@ enum StreamEventParser {
             return .toolStart(sessionId: sessionId, toolName: name, toolInput: input, toolID: toolID)
 
         case "tool.complete", "tool_result":
-            let name = payload?["name"]?.stringValue ?? ""
+            let name = Self.liveToolName(payload)
             let toolID = ["tool_id", "tool_call_id", "call_id"]
                 .compactMap { payload?[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty }
@@ -175,6 +212,17 @@ enum StreamEventParser {
             let max = payload?["context_max"]?.intValue ?? 0
             return .contextUpdate(sessionId: sessionId, percent: percent, used: used, max: max)
 
+        case "session.usage":
+            // Hermes' live usage tick, about once a second while a turn
+            // runs: the context fields sit under `usage`, and are all
+            // absent while the window is unknown. An unknown window is
+            // no reading, not an empty one.
+            guard let usage = payload?["usage"]?.objectValue,
+                  let max = usage["context_max"]?.intValue, max > 0 else { return nil }
+            let used = usage["context_used"]?.intValue ?? 0
+            let percent = usage["context_percent"]?.doubleValue ?? (Double(used) / Double(max) * 100)
+            return .contextUpdate(sessionId: sessionId, percent: percent, used: used, max: max)
+
         case "cwd.update", "workspace.update":
             let cwd = payload?["cwd"]?.stringValue ?? ""
             return .cwdUpdate(sessionId: sessionId, cwd: cwd)
@@ -184,6 +232,18 @@ enum StreamEventParser {
             let provider = payload?["provider"]?.stringValue ?? ""
             return .modelUpdate(sessionId: sessionId, model: model, provider: provider)
 
+        case "background.complete", "btw.complete":
+            let text = (payload?["text"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            let question = payload?["question"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .sideAgentComplete(
+                sessionId: sessionId,
+                kind: type == "btw.complete" ? .btw : .background,
+                taskId: payload?["task_id"]?.stringValue ?? "",
+                text: text,
+                question: question?.isEmpty == false ? question : nil
+            )
+
         case let eventType where eventType.hasPrefix("subagent."):
             guard let payload else { return nil }
             let activity = Self.delegateAgentActivity(from: payload, eventType: eventType, sessionId: sessionId)
@@ -192,6 +252,18 @@ enum StreamEventParser {
         default:
             return .unparsed(payload: obj.mapValues { $0.anyValue })
         }
+    }
+
+    /// The tool a live event names. Hermes names the deferred tool a
+    /// Tool Search `tool_call` ran; a wrapper name is resolved from its
+    /// envelope in case a gateway sends it unresolved.
+    private static func liveToolName(_ payload: [String: AnyCodable]?) -> String {
+        let name = payload?["name"]?.stringValue ?? ""
+        guard ToolSearchBridge.isWrapper(name),
+              let call = ToolSearchBridge.underlyingCall((payload?["args"] ?? payload?["arguments"])?.anyValue) else {
+            return name
+        }
+        return call.name
     }
 
     private static func delegateAgentActivity(from payload: [String: AnyCodable], eventType: String, sessionId: String) -> DelegateAgentActivity {

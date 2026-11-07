@@ -33,6 +33,8 @@ private let echoCancellingAudioLogger = Logger(subsystem: "com.milim.relay", cat
 @MainActor
 final class EchoCancellingLiveVoiceAudio: NSObject {
     private let coordinator: VoiceAudioSessionCoordinator
+    /// The iPhone's microphone when a Bluetooth headset's won't start (#177).
+    private let microphoneFallback: VoiceBuiltInMicrophoneFallback
     private let session = AVAudioSession.sharedInstance()
     private var engine: AVAudioEngine?
     private var player: AVAudioPlayerNode?
@@ -57,6 +59,9 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
     /// dropped buffers don't count.
     private var playbackGeneration: UInt64 = 0
     private var pendingBuffers = 0
+    /// What's scheduled and not played yet, oldest first, so a route
+    /// change's restart plays it on the new engine.
+    private var queuedBuffers: [AVAudioPCMBuffer] = []
     /// An odd trailing byte, carried into the next chunk as
     /// AVSpeechPlaybackService does.
     private var remainder = Data()
@@ -71,10 +76,10 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
     /// Generous, as AVSpeechPlaybackService's: a late-starting output
     /// must never have its speech cut off as "stalled".
     var drainWatchdogGrace: TimeInterval = 10
-    /// Identity of the current audio lifetime, bumped by every full stop.
-    /// Session notifications read it synchronously on their own thread, so
-    /// one queued from an earlier call can't stop the next.
-    private var lifetime: UInt64 = 0
+    /// Identity of the current audio lifetime. Session notifications read
+    /// it synchronously on their own thread, so one queued from an earlier
+    /// call can't stop the next.
+    private var lifetime = LiveVoiceAudioLifetime()
     private let observedLifetime = OSAllocatedUnfairLock<UInt64>(initialState: 0)
     nonisolated private var lifetimeForObservers: UInt64 { observedLifetime.withLock { $0 } }
     /// The rate the speaker side starts at, before the first chunk says.
@@ -97,6 +102,7 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
     /// cannot read the MainActor-isolated singleton.
     init(coordinator: VoiceAudioSessionCoordinator? = nil, outputSampleRate: Double) {
         self.coordinator = coordinator ?? .shared
+        microphoneFallback = VoiceBuiltInMicrophoneFallback()
         defaultOutputSampleRate = outputSampleRate
         super.init()
         NotificationCenter.default.addObserver(
@@ -177,15 +183,15 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
         }
         guard let format = playerFormat else { return }
         remainder.append(pcm)
-        let alignedBytes = remainder.count - (remainder.count % 2)
-        let frames = AVAudioFrameCount(alignedBytes / 2)
+        let (samples, leftover) = VoicePCMEncoding.splitPCM16(remainder)
+        let frames = AVAudioFrameCount(samples.count / 2)
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
               let channel = buffer.floatChannelData?[0] else { return }
         buffer.frameLength = frames
-        remainder.prefix(alignedBytes).withUnsafeBytes { raw in
+        samples.withUnsafeBytes { raw in
             AVSpeechPlaybackService.convertPCM16(raw, into: channel, frames: Int(frames))
         }
-        remainder.removeFirst(alignedBytes)
+        remainder = leftover
         schedule(buffer, on: player)
     }
 
@@ -213,12 +219,15 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
 
     private func schedule(_ buffer: AVAudioPCMBuffer, on player: AVAudioPlayerNode) {
         pendingBuffers += 1
+        queuedBuffers.append(buffer)
         extendDrainDeadline(by: Double(buffer.frameLength) / buffer.format.sampleRate)
         let generation = playbackGeneration
         player.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.playbackGeneration == generation else { return }
                 self.pendingBuffers = max(0, self.pendingBuffers - 1)
+                // One player plays its buffers in order.
+                if !self.queuedBuffers.isEmpty { self.queuedBuffers.removeFirst() }
             }
         }
         if !player.isPlaying { player.play() }
@@ -235,6 +244,7 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
     func interrupt() {
         playbackGeneration &+= 1
         pendingBuffers = 0
+        queuedBuffers.removeAll()
         remainder.removeAll(keepingCapacity: true)
         clearDrainWatchdog()
         player?.stop()
@@ -259,6 +269,7 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
                     // engine can't play it untracked later.
                     self.playbackGeneration &+= 1
                     self.pendingBuffers = 0
+                    self.queuedBuffers.removeAll()
                     self.player?.stop()
                 }
                 self.drainDeadline = nil
@@ -288,6 +299,9 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
         if let engine, engine.isRunning { return }
         if lease == nil {
             lease = try coordinator.acquire(.conversationCapture)
+            lifetime.begin()
+            let current = lifetime.id
+            observedLifetime.withLock { $0 = current }
         }
         // Every rendering lifetime starts on a new engine (see
         // VoiceAudioEngineRecovery); a stale-graph failure re-applies the
@@ -295,7 +309,8 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
         try VoiceAudioEngineRecovery.startFresh(
             rebuild: { tearDownEngine() },
             reassert: { try coordinator.reassert() },
-            start: { try startEngine() }
+            start: { try startEngine() },
+            switchMicrophone: { try self.microphoneFallback.engage() }
         )
     }
 
@@ -352,7 +367,7 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
         do {
             try engine.start()
         } catch {
-            echoCancellingAudioLogger.error("Echo-cancelling live audio failed to start: \(String(describing: error), privacy: .public)")
+            echoCancellingAudioLogger.error("Echo-cancelling live audio failed to start: \(LogRedaction.describing(error), privacy: .public)")
             NotificationCenter.default.removeObserver(self, name: .AVAudioEngineConfigurationChange, object: engine)
             input.removeTap(onBus: 0)
             engine.stop()
@@ -395,11 +410,12 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
     private func tearDown() {
         inputWanted = false
         outputWanted = false
-        lifetime &+= 1
-        let current = lifetime
+        lifetime.end()
+        let current = lifetime.id
         observedLifetime.withLock { $0 = current }
         tearDownEngine()
         playerFormat = nil
+        microphoneFallback.clear()
         if let lease {
             self.lease = nil
             coordinator.release(lease)
@@ -410,6 +426,7 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
         tapGeneration &+= 1
         playbackGeneration &+= 1
         pendingBuffers = 0
+        queuedBuffers.removeAll()
         remainder.removeAll(keepingCapacity: true)
         clearDrainWatchdog()
         converter = nil
@@ -422,18 +439,34 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
         player = nil
     }
 
-    /// A route change (speaker to AirPods and back) stops the engine:
-    /// rebuild the graph against the new hardware. Queued speech is
-    /// dropped. If it can't come back, the call hears about it like an
-    /// interruption.
+    /// A route change (speaker to AirPods and back, the call screen's
+    /// Speaker button) stops the engine: rebuild the graph against the new
+    /// hardware. Speech still queued plays on the new engine, from the
+    /// start of the chunk that was playing: dropping it cut the model off
+    /// mid-sentence. If it can't come back, the call hears about it like
+    /// an interruption.
     private func restartAfterConfigurationChange() {
         guard inputWanted || outputWanted, engine?.isRunning != true else { return }
+        let unplayed = queuedBuffers
+        // The stream goes on, so an odd byte still waiting keeps its place:
+        // dropped, every later sample would pair the wrong bytes.
+        // Restored only once running: the restart tears the engine down
+        // again on its way up.
+        let pendingByte = remainder
         tearDownEngine()
         do {
             try coordinator.reassert()
             try ensureRunning()
+            remainder = pendingByte
+            if let player, let playerFormat {
+                let kept = unplayed.filter { $0.format == playerFormat }
+                kept.forEach { schedule($0, on: player) }
+                if kept.count < unplayed.count {
+                    echoCancellingAudioLogger.notice("Dropped \(unplayed.count - kept.count, privacy: .public) speech chunks in another format after a route change")
+                }
+            }
         } catch {
-            echoCancellingAudioLogger.error("Echo-cancelling live audio restart failed: \(String(describing: error), privacy: .public)")
+            echoCancellingAudioLogger.error("Echo-cancelling live audio restart failed: \(LogRedaction.describing(error), privacy: .public)")
             stopAfterInterruption()
         }
     }
@@ -443,7 +476,7 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
     /// microphone once the system lets go, as it does for the default
     /// capture.
     private func stopAfterInterruption(observed: UInt64? = nil) {
-        if let observed, observed != lifetime { return }
+        if let observed, !lifetime.accepts(observed) { return }
         guard inputWanted || outputWanted else { return }
         let wasListening = inputWanted
         tearDown()
@@ -506,6 +539,7 @@ final class EchoCancellingLiveVoiceAudio: NSObject {
         var isPlaying: Bool { audio.isPlaying }
         func play(_ pcm: Data, sampleRate: Double) throws { try audio.play(pcm, sampleRate: sampleRate) }
         func interrupt() { audio.interrupt() }
+        func endReply() { audio.discardRemainder() }
         func stop() { audio.stopOutput() }
         func setMuted(_ muted: Bool) { audio.isOutputMuted = muted }
     }
@@ -630,6 +664,8 @@ final class LiveVoiceAudioSelector {
 
     fileprivate func interrupt() { current?.output.interrupt() }
 
+    fileprivate func endReply() { current?.output.endReply() }
+
     fileprivate func setOutputMuted(_ muted: Bool) {
         outputMuted = muted
         current?.output.setMuted(muted)
@@ -665,7 +701,20 @@ final class LiveVoiceAudioSelector {
         var isPlaying: Bool { selector.isPlaying }
         func play(_ pcm: Data, sampleRate: Double) throws { try selector.play(pcm, sampleRate: sampleRate) }
         func interrupt() { selector.interrupt() }
+        func endReply() { selector.endReply() }
         func stop() { selector.stopOutput() }
         func setMuted(_ muted: Bool) { selector.setOutputMuted(muted) }
     }
+}
+
+/// One audio lifetime's identity: a new one when it begins and when it
+/// ends, so a notification seen while idle never matches the next call.
+struct LiveVoiceAudioLifetime {
+    private(set) var id: UInt64 = 0
+
+    mutating func begin() { id &+= 1 }
+
+    mutating func end() { id &+= 1 }
+
+    func accepts(_ observed: UInt64) -> Bool { observed == id }
 }

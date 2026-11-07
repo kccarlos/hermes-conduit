@@ -139,28 +139,105 @@ extension DashboardTicketBridge: VoiceConfigurationRequesting {
 final class HermesVoiceConfigurationService: ObservableObject {
     @Published private(set) var snapshot: VoiceConfigurationSnapshot
     @Published private(set) var isLoading = false
+    /// Whether Hermes answered the last read: nil until one ends. Until it
+    /// answers, the snapshot is the one kept on the phone, if any; a read
+    /// that fails keeps what's shown (#1533).
+    @Published private(set) var answered: Bool?
     @Published private(set) var errorMessage: String?
     /// The last speech server status read for this profile, for the setup step.
     @Published private(set) var speechServer: SpeechServerStatus?
     /// The last read of what the speech server needs to speak the replies,
     /// for the Assistant voice step.
     @Published private(set) var speechServerVoice: SpeechServerVoiceStatus?
+    /// Local's fast model as the host last gave it, kept on the phone, for
+    /// its settings to open on; a read that fails keeps it (#1533).
+    private(set) var lastFrontModel: LocalLiveFrontModelStatus?
+    /// Hermes' last `/api/env` answer, in memory only, never on the phone's
+    /// disk: a read of it that fails keeps which keys the page showed set
+    /// (#1533).
+    private var lastEnvironment: [String: Any]?
+
+    /// A read is out, or none has ended: Hermes is still to say.
+    var isChecking: Bool { isLoading || answered == nil }
+
+    /// Hermes is still to say which keys are set: `/api/env` is never
+    /// kept, so a page opened on its kept answers doesn't know, and a read
+    /// of it that fails leaves it unknown. A key row offers no field until
+    /// it says, since a key Hermes holds would be written over unseen
+    /// (#1533).
+    var awaitsKeys: Bool { !snapshot.environmentLoaded }
 
     private let requester: VoiceConfigurationRequesting
+    private let answers: KeptAnswers?
     let profile: String
     /// The dashboard address this phone uses, which the speech server's
     /// model address starts with. Nil when the service has no bridge.
     let dashboardBaseURL: String?
+    /// The query parameter naming `profile` on Local Live's status and key
+    /// routes (DashboardPath.conduitProfileParameter), read at each request:
+    /// the plugin's capabilities can arrive after Settings opened.
+    let profileParameter: @MainActor () -> String
 
-    init(requester: VoiceConfigurationRequesting, profile: String, dashboardBaseURL: String? = nil) {
+    init(requester: VoiceConfigurationRequesting, profile: String, dashboardBaseURL: String? = nil,
+         profileParameter: @escaping @MainActor () -> String = { "profile" },
+         answers: KeptAnswers? = nil) {
         self.requester = requester
+        self.answers = answers
         self.profile = profile
         self.dashboardBaseURL = dashboardBaseURL
-        snapshot = .unavailable(profile: profile, reason: AppLocalization.string("Voice settings have not been loaded."))
+        self.profileParameter = profileParameter
+        snapshot = Self.keptSnapshot(profile: profile, answers: answers)
+            ?? .unavailable(profile: profile, reason: AppLocalization.string("Voice settings have not been loaded."))
+        speechServer = answers?.kept(KeptRead.speechServer).map(SpeechServerStatus.init(response:))
+        lastFrontModel = (answers?.kept(KeptRead.speechServerVoice)?["front_model"] as? [String: Any])
+            .map(LocalLiveFrontModelStatus.init(response:))
     }
 
-    convenience init(bridge: DashboardTicketBridge, profile: String) {
-        self.init(requester: bridge, profile: profile, dashboardBaseURL: bridge.baseURL)
+    convenience init(bridge: DashboardTicketBridge, profile: String, profileParameter: @escaping @MainActor () -> String = { "profile" },
+                     answers: KeptAnswers? = nil) {
+        self.init(requester: bridge, profile: profile, dashboardBaseURL: bridge.baseURL, profileParameter: profileParameter, answers: answers)
+    }
+
+    /// The reads the page keeps the answers of (#1533). The config and its
+    /// schema are the ones the agent settings pages keep, so each page opens
+    /// on whichever read them last. `/api/env` is never kept.
+    enum KeptRead {
+        static let config = AppState.KeptRoute.config
+        static let schema = AppState.KeptRoute.configSchema
+        static let sttToolset = "/api/tools/toolsets/stt/config"
+        static let ttsToolset = "/api/tools/toolsets/tts/config"
+        /// Speech to text's speech server as the notifier reads it: what's
+        /// set, not whether it answers.
+        static let speechServer = SpeechServerTranscription.statusPath
+        /// Assistant speech's status, kept without the server's key, as no
+        /// key is: only Local's fast model is drawn from it, since the
+        /// server's address and steps hang on the key.
+        static let speechServerVoice = SpeechServerSpeechStream.statusPath
+    }
+
+    /// The page as Hermes last answered it, from the answers kept on the
+    /// phone; nil unless the config and both speech toolsets are kept, so a
+    /// voice never reads not ready for want of a kept answer. Which keys
+    /// are set isn't kept, so none reads as missing.
+    private static func keptSnapshot(profile: String, answers: KeptAnswers?) -> VoiceConfigurationSnapshot? {
+        guard let answers, answers.kept(KeptRead.sttToolset) != nil, answers.kept(KeptRead.ttsToolset) != nil else { return nil }
+        return redrawn(profile: profile, answers: answers, environment: nil)
+    }
+
+    /// The page from the config kept on the phone, the one a reload drew
+    /// or kept, with which keys are set as `environment` says; toolsets
+    /// this Hermes doesn't offer stay out, as when it answered. Nil
+    /// without a kept config.
+    private static func redrawn(
+        profile: String, answers: KeptAnswers?, environment: [String: Any]?
+    ) -> VoiceConfigurationSnapshot? {
+        guard let answers, let config = answers.kept(KeptRead.config) else { return nil }
+        let ttsReadiness = answers.kept(KeptRead.ttsToolset)
+        return VoiceConfigurationParser.parse(
+            profile: profile, schema: answers.kept(KeptRead.schema), config: config,
+            sttReadiness: answers.kept(KeptRead.sttToolset), ttsReadiness: ttsReadiness,
+            environment: environment, ttsToolsetConfigAvailable: ttsReadiness != nil
+        )
     }
 
     func reload() async {
@@ -168,10 +245,10 @@ final class HermesVoiceConfigurationService: ObservableObject {
         defer { isLoading = false }
         errorMessage = nil
 
-        async let schemaResult = result(for: "/api/config/schema")
-        async let configResult = result(for: "/api/config")
-        async let sttResult = result(for: "/api/tools/toolsets/stt/config")
-        async let ttsResult = result(for: "/api/tools/toolsets/tts/config")
+        async let schemaResult = result(for: KeptRead.schema, keeping: true)
+        async let configResult = result(for: KeptRead.config, keeping: true)
+        async let sttResult = result(for: KeptRead.sttToolset, keeping: true)
+        async let ttsResult = result(for: KeptRead.ttsToolset, keeping: true)
         async let environmentResult = result(for: "/api/env")
 
         let schema = await schemaResult
@@ -180,32 +257,54 @@ final class HermesVoiceConfigurationService: ObservableObject {
         let tts = await ttsResult
         let environment = await environmentResult
 
+        if case .success(let answer) = environment { lastEnvironment = answer }
+
         guard case .success(let configObject) = config else {
-            let reason = AppLocalization.string("This Hermes server doesn't offer voice settings. Update Hermes to use Voice. Text chat still works.")
-            snapshot = .unavailable(profile: profile, reason: reason)
             errorMessage = Self.message(from: config)
+            answered = false
+            // A read that fails keeps the settings shown, Hermes' answer
+            // from before or the one kept on the phone (#1533), with which
+            // keys are set if Hermes said this time.
+            guard !snapshot.capability.isGatewayConnected else {
+                if !snapshot.environmentLoaded, lastEnvironment != nil,
+                   let kept = Self.redrawn(profile: profile, answers: answers, environment: lastEnvironment) {
+                    snapshot = kept
+                }
+                return
+            }
+            // With nothing shown: a Hermes that answers without the voice
+            // routes needs updating; one that doesn't answer, connecting.
+            let reason = Self.isRouteMissing(config)
+                ? AppLocalization.string("This Hermes server doesn't offer voice settings. Update Hermes to use Voice. Text chat still works.")
+                : AppLocalization.string("Connect to Hermes before starting voice.")
+            snapshot = .unavailable(profile: profile, reason: reason)
             return
         }
 
+        // A read that fails among the others keeps what it showed, Hermes'
+        // answer from before, kept on the phone (#1533).
+        let sttReadiness = (try? stt.get()) ?? answers?.kept(KeptRead.sttToolset)
+        let ttsReadiness = (try? tts.get()) ?? answers?.kept(KeptRead.ttsToolset)
         let parsed = VoiceConfigurationParser.parse(
             profile: profile,
-            schema: try? schema.get(),
+            schema: (try? schema.get()) ?? answers?.kept(KeptRead.schema),
             config: configObject,
-            sttReadiness: try? stt.get(),
-            ttsReadiness: try? tts.get(),
-            environment: try? environment.get(),
+            sttReadiness: sttReadiness,
+            ttsReadiness: ttsReadiness,
+            environment: lastEnvironment,
             // STT toolset readiness is intentionally NOT passed to the
             // parser: it cannot influence transcription capability, only the
             // picker population and diagnostics built from its rows.
-            ttsToolsetConfigAvailable: (try? tts.get()) != nil
+            ttsToolsetConfigAvailable: ttsReadiness != nil
         )
         snapshot = parsed
+        answered = true
         // The speech server step refreshes with the rest once it was shown.
         if speechServer != nil { _ = await speechServerStatus() }
         if speechServerVoice != nil { _ = await speechServerVoiceStatus() }
         // Toolset config was added after some public gateways. Its absence is
         // a capability limitation, not a failed text-chat connection.
-        if (try? stt.get()) == nil && (try? tts.get()) == nil {
+        if sttReadiness == nil && ttsReadiness == nil {
             errorMessage = AppLocalization.string("Update Hermes to use Voice. This version can't tell Conduit whether voice is ready.")
         }
     }
@@ -247,56 +346,64 @@ final class HermesVoiceConfigurationService: ObservableObject {
     /// lands in `<section>.provider` and any stale `use_gateway`
     /// gateway-routing intent is removed — a leftover `use_gateway: true`
     /// would override the user's fresh BYOK selection on legacy runtimes.
-    /// Like the other config editors, this is a full-document GET→PUT, so a
-    /// concurrent profile-config edit from another writer could be clobbered;
-    /// the single-writer UI flow makes that a deliberate, pre-existing
-    /// trade-off rather than a new one.
+    /// Like the other config editors, this is a full-document GET→PUT; it
+    /// runs in ProfileConfigWriteQueue, so another save can't land between
+    /// the two and be put back.
     private func saveVendorSelection(_ vendor: String, kind: VoiceProviderDescriptor.Kind) async -> Bool {
         let sectionKey = kind.rawValue
-        guard var config = try? await requester.requestJSON(path: profilePath("/api/config"), method: "GET", body: nil) else {
-            errorMessage = AppLocalization.string("Could not load voice settings to save this change.")
-            return false
+        let saved = await ProfileConfigWriteQueue.run { @MainActor [self] () -> Bool in
+            guard var config = try? await requester.requestJSON(path: profilePath("/api/config"), method: "GET", body: nil) else {
+                errorMessage = AppLocalization.string("Could not load voice settings to save this change.")
+                return false
+            }
+            var section = config[sectionKey] as? [String: Any] ?? [:]
+            section["provider"] = vendor
+            section.removeValue(forKey: "use_gateway")
+            config[sectionKey] = section
+            do {
+                _ = try await requester.requestJSON(
+                    path: profilePath("/api/config"), method: "PUT",
+                    body: ["config": config]
+                )
+                return true
+            } catch {
+                errorMessage = AppLocalization.string("Could not save \(sectionKey).provider: \(UserFacingError.message(for: error))")
+                return false
+            }
         }
-        var section = config[sectionKey] as? [String: Any] ?? [:]
-        section["provider"] = vendor
-        section.removeValue(forKey: "use_gateway")
-        config[sectionKey] = section
-        do {
-            _ = try await requester.requestJSON(
-                path: profilePath("/api/config"), method: "PUT",
-                body: ["config": config]
-            )
-            await reload()
-            return true
-        } catch {
-            errorMessage = AppLocalization.string("Could not save \(sectionKey).provider: \(UserFacingError.message(for: error))")
-            return false
-        }
+        if saved { await reload() }
+        return saved
     }
 
     private func saveProviderSelection(rowName: String, kind: VoiceProviderDescriptor.Kind) async -> Bool {
-        do {
-            let response = try await requester.requestJSON(
-                path: profilePath("/api/tools/toolsets/\(kind.rawValue)/provider"),
-                method: "PUT",
-                body: ["provider": rowName]
-            )
-            if let error = response["error"] as? String, !error.isEmpty {
-                errorMessage = AppLocalization.string("Could not select \(rowName): \(error)")
-                return false
+        // Hermes writes the profile config for this one, so it waits its
+        // turn behind (and holds off) the GET→PUT saves.
+        let needsNousAuth: Bool? = await ProfileConfigWriteQueue.run { @MainActor [self] () -> Bool? in
+            do {
+                let response = try await requester.requestJSON(
+                    path: profilePath("/api/tools/toolsets/\(kind.rawValue)/provider"),
+                    method: "PUT",
+                    body: ["provider": rowName]
+                )
+                if let error = response["error"] as? String, !error.isEmpty {
+                    errorMessage = AppLocalization.string("Could not select \(rowName): \(error)")
+                    return nil
+                }
+                return response["needs_nous_auth"] as? Bool == true
+            } catch {
+                errorMessage = AppLocalization.string("Could not select \(rowName): \(UserFacingError.message(for: error))")
+                return nil
             }
-            await reload()
-            if response["needs_nous_auth"] as? Bool == true {
-                // The write landed; Hermes is flagging that the managed route
-                // still needs sign-in. Diagnostic, never a silent failure.
-                let feature = kind == .stt ? "speech-to-text" : "speech"
-                errorMessage = AppLocalization.string("Hermes saved this selection, but the Nous subscription needs sign-in before \(feature) can use it.")
-            }
-            return true
-        } catch {
-            errorMessage = AppLocalization.string("Could not select \(rowName): \(UserFacingError.message(for: error))")
-            return false
         }
+        guard let needsNousAuth else { return false }
+        await reload()
+        if needsNousAuth {
+            // The write landed; Hermes is flagging that the managed route
+            // still needs sign-in. Diagnostic, never a silent failure.
+            let feature = kind == .stt ? "speech-to-text" : "speech"
+            errorMessage = AppLocalization.string("Hermes saved this selection, but the Nous subscription needs sign-in before \(feature) can use it.")
+        }
+        return true
     }
 
     func save(value: String, for key: String) async -> Bool {
@@ -305,6 +412,15 @@ final class HermesVoiceConfigurationService: ObservableObject {
             return false
         }
         let stored = VoiceConfigurationParser.storedValue(for: value, key: key)
+        // The whole GET→PUT waits for any other config save, here or on
+        // another settings page: overlapping, the later PUT would put back
+        // what the earlier one changed, such as a speech server key.
+        return await ProfileConfigWriteQueue.run { @MainActor [self] () -> Bool in
+            await writeValue(stored, original: value, for: key)
+        }
+    }
+
+    private func writeValue(_ stored: String, original value: String, for key: String) async -> Bool {
         guard var config = try? await requester.requestJSON(path: profilePath("/api/config"), method: "GET", body: nil) else {
             errorMessage = AppLocalization.string("Could not load voice settings to save this change.")
             return false
@@ -322,10 +438,7 @@ final class HermesVoiceConfigurationService: ObservableObject {
             Self.setNested(stored, in: &config, dottedKey: key)
         }
         do {
-            _ = try await requester.requestJSON(
-                path: profilePath("/api/config"), method: "PUT",
-                body: ["config": config]
-            )
+            try await putConfig(config)
             // The snapshot only reflects a confirmed write; a failed PUT
             // must leave it matching the server. A key saved into the config
             // (the speech server's) is never kept in memory.
@@ -347,6 +460,12 @@ final class HermesVoiceConfigurationService: ObservableObject {
     /// this profile. It is a Hermes setting, so it also applies to Hermes'
     /// own CLI and Desktop voice input.
     func saveLiveTranscription(_ enabled: Bool) async -> Bool {
+        await ProfileConfigWriteQueue.run { @MainActor [self] () -> Bool in
+            await writeLiveTranscription(enabled)
+        }
+    }
+
+    private func writeLiveTranscription(_ enabled: Bool) async -> Bool {
         guard var config = try? await requester.requestJSON(path: profilePath("/api/config"), method: "GET", body: nil) else {
             errorMessage = AppLocalization.string("Could not load voice settings to save this change.")
             return false
@@ -355,10 +474,7 @@ final class HermesVoiceConfigurationService: ObservableObject {
         stt["streaming"] = enabled
         config["stt"] = stt
         do {
-            _ = try await requester.requestJSON(
-                path: profilePath("/api/config"), method: "PUT",
-                body: ["config": config]
-            )
+            try await putConfig(config)
             snapshot.liveTranscription = enabled
             return true
         } catch {
@@ -372,35 +488,47 @@ final class HermesVoiceConfigurationService: ObservableObject {
     func speechServerStatus() async -> SpeechServerStatus {
         let status: SpeechServerStatus
         do {
-            let response = try await requester.requestJSON(
-                path: profilePath(SpeechServerTranscription.statusPath), method: "GET", body: nil)
+            let response = try await keeping(KeptRead.speechServer) {
+                try await requester.requestJSON(path: profilePath(KeptRead.speechServer), method: "GET", body: nil)
+            }
             status = SpeechServerStatus(response: response)
         } catch let error as DashboardTicketBridgeError where GeminiLiveTokenClient.isMissingRoute(error) {
-            status = .pluginMissing
+            // A profile that turned the plugin off says how to turn it on.
+            status = DashboardTicketBridgeError.pluginOffDetail(of: error).map(SpeechServerStatus.pluginOff) ?? .pluginMissing
         } catch {
-            status = SpeechServerStatus(configured: false, available: false, url: nil, hasKey: false,
-                                        reason: UserFacingError.message(for: error), pluginMissing: false)
+            status = .failed(UserFacingError.message(for: error))
         }
         // A profile switch cancels the older read; it must not overwrite the
-        // newer profile's status.
-        if !Task.isCancelled { speechServer = status }
+        // newer profile's status. One that fails keeps the status shown, the
+        // kept one included (#1533).
+        if !Task.isCancelled, !status.readFailed || speechServer == nil { speechServer = status }
         return status
     }
 
     /// What the speech server needs to speak Classic's replies: the model
     /// address and key the notifier's Local Live route takes.
     func speechServerVoiceStatus() async -> SpeechServerVoiceStatus {
-        let status: SpeechServerVoiceStatus
+        var status: SpeechServerVoiceStatus
         do {
-            let response = try await requester.requestJSON(
-                path: profilePath(SpeechServerSpeechStream.statusPath), method: "GET", body: nil)
+            let response = try await keeping(KeptRead.speechServerVoice) {
+                try await requester.requestJSON(
+                    path: dashboardProfilePath(SpeechServerSpeechStream.statusPath), method: "GET", body: nil)
+            }
             status = SpeechServerVoiceStatus(response: response, dashboardBaseURL: dashboardBaseURL)
         } catch let error as DashboardTicketBridgeError where GeminiLiveTokenClient.isMissingRoute(error) {
-            status = .pluginMissing
+            // A profile that turned the plugin off says how to turn it on.
+            status = DashboardTicketBridgeError.pluginOffDetail(of: error).map(SpeechServerVoiceStatus.pluginOff) ?? .pluginMissing
         } catch {
             status = SpeechServerVoiceStatus(unavailable: UserFacingError.message(for: error))
+            status.readFailed = true
         }
-        if !Task.isCancelled { speechServerVoice = status }
+        // As the speech server's: a profile switch's older read changes
+        // nothing, and one that fails keeps the status shown, so the
+        // Assistant voice step stays as it was (#1533).
+        if !Task.isCancelled, !status.readFailed || speechServerVoice == nil {
+            speechServerVoice = status
+            if !status.readFailed { lastFrontModel = status.frontModel }
+        }
         return status
     }
 
@@ -408,8 +536,11 @@ final class HermesVoiceConfigurationService: ObservableObject {
     func rotateSpeechServerVoiceKey() async -> Bool {
         do {
             let response = try await requester.requestJSON(
-                path: profilePath(SpeechServerSpeechStream.keyPath), method: "POST", body: [:])
-            if (response["api_key"] as? String)?.isEmpty == false {
+                path: dashboardProfilePath(SpeechServerSpeechStream.keyPath), method: "POST", body: [:])
+            if let key = response["api_key"] as? String, !key.isEmpty {
+                // The status shown carries the new key, should the read
+                // after this fail: the old key stopped working (#1533).
+                if speechServerVoice?.apiKey != nil { speechServerVoice?.apiKey = key }
                 errorMessage = nil
                 return true
             }
@@ -430,7 +561,8 @@ final class HermesVoiceConfigurationService: ObservableObject {
                 path: profilePath(SpeechServerTranscription.testPath), method: "POST", body: [:])
             return SpeechServerTestResult(response: response)
         } catch let error as DashboardTicketBridgeError where GeminiLiveTokenClient.isMissingRoute(error) {
-            return SpeechServerTestResult(connected: false, latencyMilliseconds: nil, reason: SpeechServerStatus.pluginMissingReason)
+            return SpeechServerTestResult(connected: false, latencyMilliseconds: nil,
+                                          reason: DashboardTicketBridgeError.pluginOffDetail(of: error) ?? SpeechServerStatus.pluginMissingReason)
         } catch {
             return SpeechServerTestResult(connected: false, latencyMilliseconds: nil, reason: UserFacingError.message(for: error))
         }
@@ -475,23 +607,41 @@ final class HermesVoiceConfigurationService: ObservableObject {
         }
     }
 
-    /// Call after a live voice operation reports that a route is absent. This
-    /// does not disconnect Hermes or change ordinary text-chat capabilities.
-    func markAudioEndpointUnavailable(kind: VoiceProviderDescriptor.Kind, reason: String) {
-        switch kind {
-        case .stt: snapshot.capability.supportsTranscription = false
-        case .tts: snapshot.capability.supportsSpeech = false
+    /// A read, its answer kept for the page when `keeps`.
+    private func result(for path: String, keeping keeps: Bool = false) async -> Result<[String: Any], Error> {
+        let read = { [self] () async throws -> [String: Any] in
+            try await requester.requestJSON(path: profilePath(path), method: "GET", body: nil)
         }
-        snapshot.capability.unavailableReason = reason
+        do { return .success(keeps ? try await keeping(path, read) : try await read()) }
+        catch { return .failure(error) }
     }
 
-    private func result(for path: String) async -> Result<[String: Any], Error> {
-        do { return .success(try await requester.requestJSON(path: profilePath(path), method: "GET", body: nil)) }
-        catch { return .failure(error) }
+    /// Saves the whole config. What it wrote is what the page opens on
+    /// next, kept on the phone, as the other settings pages' saves are.
+    private func putConfig(_ config: [String: Any]) async throws {
+        _ = try await keeping(KeptRead.config, writes: true) {
+            _ = try await requester.requestJSON(path: profilePath("/api/config"), method: "PUT", body: ["config": config])
+            return config
+        }
+    }
+
+    /// Runs `read` and keeps its answer for the route, so the page opens on
+    /// it next time (#1533); `writes` for a save answering with what it
+    /// wrote.
+    private func keeping(
+        _ route: String, writes: Bool = false, _ read: () async throws -> [String: Any]
+    ) async throws -> [String: Any] {
+        guard let answers else { return try await read() }
+        return try await answers.keep(route, writes, read)
     }
 
     private func profilePath(_ path: String) -> String {
         DashboardPath.withProfile(path, profile: profile)
+    }
+
+    /// A route that needs the dashboard process (Local Live's key check).
+    private func dashboardProfilePath(_ path: String) -> String {
+        DashboardPath.withProfile(path, profile: profile, parameter: profileParameter())
     }
 
     private func replaceCredential(_ credential: VoiceCredentialStatus) {
@@ -501,6 +651,11 @@ final class HermesVoiceConfigurationService: ObservableObject {
             snapshot.credentials.sort { $0.key < $1.key }
         }
         snapshot.environment[credential.key] = credential
+        // So does the answer a failed read falls back on.
+        if lastEnvironment != nil {
+            let row: [String: Any] = ["is_set": credential.isSet, "description": credential.description]
+            lastEnvironment?[credential.key] = row
+        }
     }
 
     private func credentialDescription(_ key: String) -> String {
@@ -510,6 +665,13 @@ final class HermesVoiceConfigurationService: ObservableObject {
     private static func message(from result: Result<[String: Any], Error>) -> String? {
         if case .failure(let error) = result { return UserFacingError.message(for: error) }
         return nil
+    }
+
+    /// Hermes answered that it has no such route: an older Hermes.
+    private static func isRouteMissing(_ result: Result<[String: Any], Error>) -> Bool {
+        guard case .failure(let error) = result,
+              case DashboardTicketBridgeError.http(let status, _) = error else { return false }
+        return status == 404 || status == 405 || status == 410
     }
 
     private static func setNested(_ value: String, in object: inout [String: Any], dottedKey: String) {
@@ -618,7 +780,10 @@ enum VoiceConfigurationParser {
             id: id, displayName: id.replacingOccurrences(of: "_", with: " ").capitalized,
             kind: kind, supportsStreaming: false
         )
-        let row = readiness.first { $0.id == id && $0.kind == kind }
+        // Two rows can name one provider (a plugin's row beside a built-in
+        // one): the row Hermes marks active speaks for the selection.
+        let matching = readiness.filter { $0.id == id && $0.kind == kind }
+        let row = matching.first(where: \.isActive) ?? matching.first
         let fields = typedFields(id: id, kind: kind)
         let required = row?.requiredCredentials ?? credentials.filter { credential in
             (id == "stepfun" && credential.key == "STEPFUN_API_KEY") ||
@@ -977,13 +1142,19 @@ enum VoiceConfigurationParser {
         return nil
     }
 
+    /// Whether Hermes reports the selected provider ready. The row's own
+    /// `status` decides, for any provider id: Hermes computes `is_active`
+    /// only for rows it knows how to match to `tts.provider` (built-ins
+    /// carrying `tts_provider`), so a plugin or newer provider's row (a
+    /// custom OpenAI-compatible one, say) reads inactive even while it is
+    /// the one selected, and requiring it would call that voice not ready.
     private static func selectedProviderIsReady(
         _ providers: [VoiceProviderConfiguration],
         selectedID: String
     ) -> Bool {
         guard let selected = providers.first(where: { $0.descriptor.id == selectedID }),
               let readiness = selected.readiness else { return false }
-        return readiness.isActive && readiness.status.lowercased() == "ready"
+        return readiness.status.caseInsensitiveCompare("ready") == .orderedSame
     }
 
     private static func unique(_ values: [String]) -> [String] {

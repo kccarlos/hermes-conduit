@@ -11,8 +11,11 @@
 //
 
 import AVFAudio
+import Combine
 import Foundation
 import OSLog
+import os
+import UIKit
 
 private let audioSessionLogger = Logger(subsystem: "com.milim.relay", category: "VoiceAudio")
 
@@ -52,6 +55,9 @@ protocol VoiceAudioSessionControlling: AnyObject {
     /// Sends output to the loudspeaker; the override is cleared by
     /// CallKit's Speaker button, or by the next category change.
     func overrideOutputToSpeaker() throws
+    /// Clears a speaker override: output goes back to the route's own
+    /// (the earpiece, or a headset, Bluetooth, the car).
+    func clearOutputOverride() throws
 }
 
 /// Defaults for session seams that never route: test doubles that don't
@@ -62,10 +68,23 @@ extension VoiceAudioSessionControlling {
     var isOutputOnBuiltInReceiver: Bool { false }
     func isConfigured(as configuration: VoiceAudioSessionConfiguration) -> Bool { false }
     func overrideOutputToSpeaker() throws {}
+    func clearOutputOverride() throws {}
 }
 
-@MainActor
-final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
+/// The blocking AVAudioSession calls. `SystemVoiceAudioSession` makes them
+/// on its serial queue, never the main thread; tests substitute a fake.
+protocol VoiceAudioSessionBackend: AnyObject, Sendable {
+    func setCategory(
+        _ category: AVAudioSession.Category,
+        mode: AVAudioSession.Mode,
+        options: AVAudioSession.CategoryOptions
+    ) throws
+    func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws
+    func overrideOutputToSpeaker() throws
+    func clearOutputOverride() throws
+}
+
+final class SharedAVAudioSessionBackend: VoiceAudioSessionBackend {
     func setCategory(
         _ category: AVAudioSession.Category,
         mode: AVAudioSession.Mode,
@@ -76,6 +95,69 @@ final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
 
     func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
         try AVAudioSession.sharedInstance().setActive(active, options: options)
+    }
+
+    func overrideOutputToSpeaker() throws {
+        try AVAudioSession.sharedInstance().overrideOutputAudioPort(.speaker)
+    }
+
+    func clearOutputOverride() throws {
+        try AVAudioSession.sharedInstance().overrideOutputAudioPort(.none)
+    }
+}
+
+/// Every session change goes through one serial queue. Deactivation is
+/// blocking IPC that waits for audio I/O to wind down, so it runs there
+/// without the main thread waiting. Activation and category changes still
+/// wait (callers need the error, and a live session before starting an
+/// engine), and being on the same queue they run after any deactivation
+/// queued before them. A deactivation still queued when a newer change
+/// arrives is dropped: stop-then-listen-again doesn't flap the session or
+/// resume other apps' audio for an instant.
+@MainActor
+final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
+    private let backend: VoiceAudioSessionBackend
+    private let queue: DispatchQueue
+    /// Bumped by every change other than deactivation; a queued
+    /// deactivation runs only if nothing newer was asked for since.
+    private let generation = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
+    init(backend: VoiceAudioSessionBackend? = nil, queue: DispatchQueue? = nil) {
+        self.backend = backend ?? SharedAVAudioSessionBackend()
+        self.queue = queue ?? DispatchQueue(label: "com.milim.relay.audio-session", qos: .userInitiated)
+    }
+
+    func setCategory(
+        _ category: AVAudioSession.Category,
+        mode: AVAudioSession.Mode,
+        options: AVAudioSession.CategoryOptions
+    ) throws {
+        let backend = self.backend
+        try onQueue { try backend.setCategory(category, mode: mode, options: options) }
+    }
+
+    func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
+        let backend = self.backend
+        if active {
+            try onQueue { try backend.setActive(true, options: options) }
+            return
+        }
+        let generation = self.generation
+        let scheduled = generation.withLock { $0 }
+        queue.async {
+            guard generation.withLock({ $0 }) == scheduled else { return }
+            do {
+                try backend.setActive(false, options: options)
+            } catch {
+                audioSessionLogger.error("audio session deactivation failed: \(LogRedaction.describing(error), privacy: .public)")
+            }
+        }
+    }
+
+    /// Supersedes any queued deactivation, then waits for the change.
+    private func onQueue(_ change: () throws -> Void) rethrows {
+        generation.withLock { $0 &+= 1 }
+        try queue.sync(execute: change)
     }
 
     var isOtherAudioPlaying: Bool {
@@ -101,8 +183,28 @@ final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
     }
 
     func overrideOutputToSpeaker() throws {
-        try AVAudioSession.sharedInstance().overrideOutputAudioPort(.speaker)
+        let backend = self.backend
+        try onQueue { try backend.overrideOutputToSpeaker() }
     }
+
+    func clearOutputOverride() throws {
+        let backend = self.backend
+        try onQueue { try backend.clearOutputOverride() }
+    }
+}
+
+/// What the call screen's Speaker button shows during a call from Hermes.
+/// Conduit's call screen covers CallKit's, whose Speaker button iOS shows
+/// only on the lock screen or away from the app, so an answered call had
+/// no way onto the loudspeaker but volume up at the earpiece.
+@MainActor
+final class NativeCallSpeakerState: ObservableObject {
+    /// A call from Hermes is up, on a device with an earpiece (an iPad
+    /// plays from its speaker anyway).
+    @Published fileprivate(set) var isShown = false
+    /// The call plays from the built-in loudspeaker now, by this button,
+    /// CallKit's, or the Control Center route picker.
+    @Published fileprivate(set) var isOn = false
 }
 
 /// Ownership token returned by `acquire`. Release is idempotent: releasing an
@@ -129,8 +231,11 @@ final class VoiceAudioSessionCoordinator {
     static let shared = VoiceAudioSessionCoordinator()
 
     /// The session policy currently applied to the system session, or nil
-    /// while no audio intent is active. Exposed read-only for diagnostics
-    /// and deterministic ownership tests.
+    /// while no audio intent is active. Nil means Conduit holds nothing, not
+    /// that the session is off: in a call from Hermes CallKit keeps it
+    /// active, so code that reconfigures the session checks `isInNativeCall`
+    /// too. Exposed read-only for diagnostics and deterministic ownership
+    /// tests.
     private(set) var appliedPolicy: Policy?
 
     /// Raised when a policy transition failed partway — typically the
@@ -144,8 +249,18 @@ final class VoiceAudioSessionCoordinator {
     /// call is gone: the conversation then uses the call's policy, whose
     /// speaker the call screen can turn off.
     private(set) var isInNativeCall = false
-    /// The call's audio has had its one move to the loudspeaker.
-    private var nativeCallSpeakerChosen = false
+    /// CallKit activated the call's audio and hasn't taken it back. The
+    /// session is then CallKit's to keep active: activating it again from
+    /// here (every acquire and every route change's reassert did) flipped
+    /// the call screen's Speaker button back off while the audio stayed on
+    /// the loudspeaker.
+    private var isNativeCallAudioActive = false
+
+    /// The call screen's Speaker button, while a call from Hermes is up.
+    let nativeCallSpeaker: NativeCallSpeakerState
+    /// Whether this device has an earpiece to move off: false on iPad and
+    /// Mac, where the call plays from the speaker anyway.
+    private let hasEarpiece: Bool
 
     enum Policy: Equatable {
         /// `.playAndRecord` + `.voiceChat`: Voice Conversation capture, and
@@ -191,8 +306,14 @@ final class VoiceAudioSessionCoordinator {
     /// Optional injection instead of a default-constructed argument: default
     /// parameter values are evaluated in a nonisolated context, which cannot
     /// construct the MainActor-isolated `SystemVoiceAudioSession`.
-    init(session: VoiceAudioSessionControlling? = nil) {
+    init(session: VoiceAudioSessionControlling? = nil, hasEarpiece: Bool? = nil) {
         self.session = session ?? SystemVoiceAudioSession()
+        self.hasEarpiece = hasEarpiece ?? Self.deviceHasEarpiece
+        self.nativeCallSpeaker = NativeCallSpeakerState()
+    }
+
+    private static var deviceHasEarpiece: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone && !ProcessInfo.processInfo.isiOSAppOnMac
     }
 
     /// `onTakenOver` makes the owner one that gives way: it is called, on a
@@ -215,7 +336,7 @@ final class VoiceAudioSessionCoordinator {
         } catch {
             leases.removeValue(forKey: lease.id)
             audioSessionLogger.error(
-                "audio intent acquisition failed for \(Self.describe(intent), privacy: .public): \(String(describing: error), privacy: .public)"
+                "audio intent acquisition failed for \(Self.describe(intent), privacy: .public): \(LogRedaction.describing(error), privacy: .public)"
             )
             // The failed transition may have switched the category before
             // activation failed, leaving the physical session partially
@@ -235,6 +356,10 @@ final class VoiceAudioSessionCoordinator {
             Task { @MainActor in handler() }
         }
         notifyOwnersChanged()
+        // Here, before the player's engine starts: an override posts a
+        // route change, and one landing on a running engine stops it and
+        // drops the audio already scheduled (a one-chunk reply entirely).
+        if intent == .conversationPlayback { ensureConversationSpeaker() }
         return lease
     }
 
@@ -248,7 +373,7 @@ final class VoiceAudioSessionCoordinator {
             // Transition and deactivation failures must never crash the
             // caller.
             audioSessionLogger.error(
-                "audio session policy transition failed on release: \(String(describing: error), privacy: .public)"
+                "audio session policy transition failed on release: \(LogRedaction.describing(error), privacy: .public)"
             )
             // A partial transition may have half-switched the physical
             // session under the remaining owners: restore their dominant
@@ -261,6 +386,27 @@ final class VoiceAudioSessionCoordinator {
         audioSessionLogger.debug(
             "audio intent released: \(Self.describe(intent), privacy: .public) (owners: \(self.leases.count))"
         )
+        // The microphone leaving a reply playing can leave it on the earpiece.
+        if intent == .conversationCapture { ensureConversationSpeaker() }
+    }
+
+    /// A conversation's reply plays on the loudspeaker when nothing is
+    /// connected. `.defaultToSpeaker` asks for that once, when the category
+    /// is set; the output-only engine that plays the reply after the
+    /// microphone stopped (barge-in off) could still land on the earpiece,
+    /// and nothing put it back. Only from the earpiece, so headphones,
+    /// Bluetooth and the car keep their route, and never in a call from
+    /// Hermes, whose Speaker button owns the choice. Once on the speaker it
+    /// does nothing: an override posts a route change of its own.
+    func ensureConversationSpeaker() {
+        guard appliedPolicy == .conversation, !isInNativeCall,
+              leases.values.contains(.conversationPlayback),
+              session.isOutputOnBuiltInReceiver else { return }
+        do {
+            try session.overrideOutputToSpeaker()
+        } catch {
+            audioSessionLogger.error("conversation speaker override failed: \(LogRedaction.describing(error), privacy: .public)")
+        }
     }
 
     /// A call from Hermes answered in CallKit (#449): CallKit activates the
@@ -269,7 +415,9 @@ final class VoiceAudioSessionCoordinator {
     /// CallKit activated.
     func configureForIncomingCall() {
         isInNativeCall = true
-        nativeCallSpeakerChosen = false
+        isNativeCallAudioActive = false
+        nativeCallSpeaker.isShown = hasEarpiece
+        nativeCallRouteChanged()
         // Raised first: a conversation already holding the session must
         // move onto the call's policy even if this category change fails.
         needsReapply = true
@@ -277,31 +425,57 @@ final class VoiceAudioSessionCoordinator {
         do {
             try session.setCategory(configuration.category, mode: configuration.mode, options: configuration.options)
         } catch {
-            audioSessionLogger.error("incoming call category failed: \(String(describing: error), privacy: .public)")
+            audioSessionLogger.error("incoming call category failed: \(LogRedaction.describing(error), privacy: .public)")
         }
     }
 
-    /// CallKit activated the call's audio: it starts on the loudspeaker as
-    /// it always has, now as an override the Speaker button can clear.
-    /// Only the first activation: CallKit activates again after an
-    /// interruption, and that must not undo the earpiece the user chose.
-    /// And only from the earpiece: like `.defaultToSpeaker`, a call
-    /// answered on headphones, Bluetooth or in the car stays there (the
-    /// override would take the loudspeaker and the phone's own microphone).
+    /// CallKit activated the call's audio. The call starts where a phone
+    /// call does, on the earpiece (or the headset, Bluetooth, the car):
+    /// CallKit's Speaker button never learns of a move Conduit makes
+    /// itself, so a call Conduit put on the loudspeaker showed the button
+    /// off, and the first tap seemed to do nothing. The button is the way
+    /// onto the speaker.
     func nativeCallAudioActivated() {
-        guard isInNativeCall, !nativeCallSpeakerChosen else { return }
-        guard session.isOutputOnBuiltInReceiver else {
-            nativeCallSpeakerChosen = true
-            return
-        }
+        guard isInNativeCall else { return }
+        isNativeCallAudioActive = true
+        nativeCallRouteChanged()
+    }
+
+    /// The call's route changed (CallKit's Speaker button, the route
+    /// picker, a headset, this screen's own button): the button follows
+    /// where the call really plays.
+    func nativeCallRouteChanged() {
+        let isOn = isInNativeCall && session.isOutputOnBuiltInSpeaker
+        if nativeCallSpeaker.isOn != isOn { nativeCallSpeaker.isOn = isOn }
+    }
+
+    /// The call screen's Speaker button: the loudspeaker, or back to the
+    /// route's own output (the earpiece, or a headset that is on). The
+    /// same override CallKit's button makes; a category change in the
+    /// call keeps it (see applyDominantPolicy), and the session stays
+    /// CallKit's, never re-activated here.
+    func setNativeCallSpeaker(_ on: Bool) {
+        guard isInNativeCall else { return }
         do {
-            try session.overrideOutputToSpeaker()
-            // Only once it took: a failed move retries on the next
-            // activation rather than leaving the call on the earpiece.
-            nativeCallSpeakerChosen = true
+            if on {
+                try session.overrideOutputToSpeaker()
+            } else {
+                try session.clearOutputOverride()
+            }
         } catch {
-            audioSessionLogger.error("call speaker override failed: \(String(describing: error), privacy: .public)")
+            audioSessionLogger.error("call speaker \(on ? "on" : "off", privacy: .public) failed: \(LogRedaction.describing(error), privacy: .public)")
         }
+        // The route change follows, and updates it again.
+        nativeCallRouteChanged()
+    }
+
+    /// CallKit took the call's audio back (an interruption, the call
+    /// ending): the next acquire or reassert activates the session itself.
+    func nativeCallAudioDeactivated() {
+        guard isNativeCallAudioActive else { return }
+        isNativeCallAudioActive = false
+        // Even an acquire whose policy is already applied.
+        needsReapply = true
     }
 
     /// The last call from Hermes is gone: a conversation still holding the
@@ -309,14 +483,32 @@ final class VoiceAudioSessionCoordinator {
     func nativeCallEnded() {
         guard isInNativeCall else { return }
         isInNativeCall = false
+        isNativeCallAudioActive = false
+        nativeCallSpeaker.isShown = false
+        nativeCallSpeaker.isOn = false
         needsReapply = true
         guard !leases.isEmpty else { return }
         do {
             try applyDominantPolicy()
         } catch {
             // needsReapply stays raised: the next transition retries.
-            audioSessionLogger.error("conversation policy after the call failed: \(String(describing: error), privacy: .public)")
+            audioSessionLogger.error("conversation policy after the call failed: \(LogRedaction.describing(error), privacy: .public)")
         }
+    }
+
+    /// A video or audio card plays outside any lease, only while nothing
+    /// else holds the session (the card checks). Its changes still go
+    /// through the session seam, so they supersede a deactivation queued
+    /// when the last owner released, instead of having it land on the
+    /// card's playback.
+    func activateForCardPlayback() {
+        try? session.setCategory(.playback, mode: .default, options: [])
+        try? session.setActive(true, options: [])
+    }
+
+    /// Hands the audio back to whatever the card's media paused.
+    func deactivateAfterCardPlayback() {
+        try? session.setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     /// Reapplies the dominant policy after the system may have deactivated
@@ -366,7 +558,7 @@ final class VoiceAudioSessionCoordinator {
             try applyDominantPolicy()
         } catch {
             audioSessionLogger.error(
-                "audio session rollback to the remaining policy failed: \(String(describing: error), privacy: .public)"
+                "audio session rollback to the remaining policy failed: \(LogRedaction.describing(error), privacy: .public)"
             )
         }
     }
@@ -391,7 +583,12 @@ final class VoiceAudioSessionCoordinator {
                 if changesCategory {
                     try session.setCategory(configuration.category, mode: configuration.mode, options: configuration.options)
                 }
-                try session.setActive(true, options: [])
+                // CallKit keeps the call's audio active (see
+                // isNativeCallAudioActive); before it has, or after it
+                // took it back, the conversation activates it as usual.
+                if !(isInNativeCall && isNativeCallAudioActive) {
+                    try session.setActive(true, options: [])
+                }
                 // Best effort: losing the speaker must not fail capture. And
                 // only if the change really took it: an override posts a
                 // route change of its own.
@@ -405,11 +602,17 @@ final class VoiceAudioSessionCoordinator {
                 // playing it owns the session, which is what makes Read Aloud
                 // the Now Playing app (lock screen, Control Center, AirPods
                 // play/pause, #373).
-                let configuration = session.isOtherAudioPlaying
-                    ? VoiceAudioSessionConfiguration.standalonePlayback
-                    : VoiceAudioSessionConfiguration.standaloneNowPlaying
-                try session.setCategory(configuration.category, mode: configuration.mode, options: configuration.options)
-                try session.setActive(true, options: [])
+                // In a call from Hermes the session is CallKit's: a clip
+                // plays within the call's session, which is neither
+                // reconfigured nor re-activated here (#1093, issue 1770).
+                // The call's end applies this policy in full.
+                if !isInNativeCall {
+                    let configuration = session.isOtherAudioPlaying
+                        ? VoiceAudioSessionConfiguration.standalonePlayback
+                        : VoiceAudioSessionConfiguration.standaloneNowPlaying
+                    try session.setCategory(configuration.category, mode: configuration.mode, options: configuration.options)
+                    try session.setActive(true, options: [])
+                }
                 appliedPolicy = .standalonePlayback
             case .wakeListening:
                 let configuration = VoiceAudioSessionConfiguration.wakeListening
@@ -417,7 +620,14 @@ final class VoiceAudioSessionCoordinator {
                 try session.setActive(true, options: [])
                 appliedPolicy = .wakeListening
             case nil:
-                try session.setActive(false, options: .notifyOthersOnDeactivation)
+                // In a call from Hermes the session is CallKit's, which
+                // deactivates it when the call ends. Classic voice holds
+                // nothing while Hermes thinks or between listens; a
+                // deactivation there dropped the Speaker button's override,
+                // and the call came back on the earpiece every turn.
+                if !isInNativeCall {
+                    try session.setActive(false, options: .notifyOthersOnDeactivation)
+                }
                 appliedPolicy = nil
             }
             needsReapply = false

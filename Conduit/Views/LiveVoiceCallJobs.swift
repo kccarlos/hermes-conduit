@@ -23,19 +23,19 @@ struct LiveVoiceJobCard: View {
                     .frame(width: 22, height: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(verbatim: job.title)
-                        .font(.subheadline.weight(.semibold))
+                        .scaledFont(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                     Text(verbatim: Self.statusText(for: job))
-                        .font(.caption)
+                        .scaledFont(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                    .scaledFont(.caption.weight(.semibold))
+                    .foregroundStyle(.conduitTertiary)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -111,7 +111,7 @@ struct LiveVoiceCallJobStrip: View {
                 }
                 if count > 1 {
                     Text("\(count - 1) more in the transcript")
-                        .font(.caption)
+                        .scaledFont(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -133,21 +133,21 @@ struct LiveVoiceScreenCardRow: View {
                     .frame(width: 22, height: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(verbatim: Self.title(for: card))
-                        .font(.subheadline.weight(.semibold))
+                        .scaledFont(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                     if !card.title.isEmpty {
                         Text("On screen")
-                            .font(.caption)
+                            .scaledFont(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
+                    .scaledFont(.caption.weight(.semibold))
+                    .foregroundStyle(.conduitTertiary)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -279,24 +279,52 @@ private struct LiveVoiceTimelinePlacement {
 
 /// What the voice model put on screen, over the call.
 struct LiveVoiceScreenCardSheet: View {
-    let card: VoiceScreenCard
+    let title: String
+    let markdown: String
+    let cards: [RichCard]
+
+    init(card: VoiceScreenCard) {
+        self.init(title: LiveVoiceScreenCardRow.title(for: card), markdown: card.markdown, cards: card.cards)
+    }
+
+    /// A card Hermes showed in a Classic voice conversation, which has no
+    /// call screen to keep it on.
+    init(title: String, markdown: String, cards: [RichCard] = []) {
+        self.title = title.isEmpty ? AppLocalization.string("On screen") : title
+        self.markdown = markdown
+        self.cards = cards
+    }
 
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
+    /// The card's pictures, which a tapped one pages through.
+    @State private var imageGallery = ImageGallerySource()
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                // Hermes' own images (MEDIA: paths) load through the gateway.
-                let profile = appState.activeProfile
-                MarkdownText(source: card.markdown, gatewayMediaDataURL: { path in
-                    await appState.gatewayMediaDataURL(for: path, profile: profile)
-                })
-                .environment(\.gatewayMediaFiles, appState.gatewayMediaResolver)
+                VStack(alignment: .leading, spacing: 16) {
+                    if !cards.isEmpty {
+                        RichCardsView(cards: cards)
+                    }
+                    if !markdown.isEmpty {
+                        // Hermes' own images (MEDIA: paths) load through the gateway.
+                        let profile = appState.activeProfile
+                        let resolver = appState.gatewayMediaResolver
+                        let _ = imageGallery.update { [markdown] in
+                            ChatImageGallery.markdownItems(markdown, resolver: resolver, recognizesGatewayMedia: true)
+                        }
+                        MarkdownText(source: markdown, gatewayMediaDataURL: { path in
+                            await appState.gatewayMediaDataURL(for: path, profile: profile)
+                        })
+                        .environment(\.gatewayMediaFiles, resolver)
+                        .environment(\.imageGallery, imageGallery)
+                    }
+                }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .navigationTitle(LiveVoiceScreenCardRow.title(for: card))
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -319,6 +347,8 @@ struct LiveVoiceJobResultSheet: View {
     /// The job as last seen, so a job the ledger prunes while open (it only
     /// keeps the latest settled ones) stays readable.
     @State private var lastSeen: VoiceBackgroundJob?
+    /// The result's pictures, which a tapped one pages through.
+    @State private var imageGallery = ImageGallerySource()
 
     private var job: VoiceBackgroundJob? { jobs.jobs.first { $0.id == jobID } ?? lastSeen }
 
@@ -365,16 +395,21 @@ struct LiveVoiceJobResultSheet: View {
         } icon: {
             if job.status.isActive { ProgressView().controlSize(.small) }
         }
-        .font(.subheadline)
+        .scaledFont(.subheadline)
         .foregroundStyle(.secondary)
         if let result = job.result, LiveVoiceJobCard.hasResult(job) {
             // Hermes' own images (MEDIA: paths) load through the gateway,
             // from the profile the job ran in.
             let profile = job.profile ?? appState.activeProfile
+            let resolver = appState.gatewayMediaResolver(for: profile)
+            let _ = imageGallery.update {
+                ChatImageGallery.markdownItems(result, resolver: resolver, recognizesGatewayMedia: true)
+            }
             MarkdownText(source: result, gatewayMediaDataURL: { path in
                 await appState.gatewayMediaDataURL(for: path, profile: profile)
             })
-            .environment(\.gatewayMediaFiles, appState.gatewayMediaResolver(for: profile))
+            .environment(\.gatewayMediaFiles, resolver)
+            .environment(\.imageGallery, imageGallery)
         } else if job.status.isActive {
             Text("Hermes is still working on this. The result will show here.")
                 .foregroundStyle(.secondary)
@@ -392,5 +427,142 @@ struct LiveVoiceJobResultSheet: View {
 
     static func chatID(_ job: VoiceBackgroundJob) -> String? {
         [job.storedSessionID, job.runtimeSessionID].compactMap { $0 }.first { !$0.isEmpty }
+    }
+}
+
+/// What Hermes waits on the user for during a live call, with the chat's
+/// buttons: an approval, question or input request in the call's own chat
+/// (its cards, as Classic voice shows them), else one a job of the call
+/// waits on. A spoken answer works too, except for an input request. Observes the app only here, so the rest of the call
+/// doesn't redraw with it.
+struct LiveVoiceWaitingPanel: View {
+    @ObservedObject var jobs: VoiceBackgroundJobSupervisor
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        let chatCards = appState.openChatWaitingCards
+        if !chatCards.isEmpty {
+            VoiceApprovalPanel(approvals: chatCards)
+        } else if let job = jobs.callJobs(jobs.liveCallID).first(where: Self.waits) {
+            LiveVoiceJobWaitingCard(job: job, jobs: jobs)
+        }
+    }
+
+    static func waits(_ job: VoiceBackgroundJob) -> Bool {
+        // One the call let go of (its chat deleted, issue 1797) isn't the call's to answer.
+        guard job.status == .needsInput, !job.isDetachedThreadTurn else { return false }
+        return job.waitingApproval != nil || job.waitingQuestion.flatMap { HermesCallWaiting(clarify: $0)?.openQuestion } != nil
+    }
+}
+
+/// A job's approval or question on the call screen: Run and Reject, or the
+/// question's choices, answered as the job's chat card would answer them.
+struct LiveVoiceJobWaitingCard: View {
+    let job: VoiceBackgroundJob
+    let jobs: VoiceBackgroundJobSupervisor
+    @State private var sending = false
+    /// A multi-select question's picks, sent together as the chat's card does.
+    @State private var picked: Set<Int> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(verbatim: job.title)
+                .scaledFont(.subheadline.weight(.semibold))
+                .lineLimit(2)
+            if let approval = job.waitingApproval {
+                Text("APPROVAL NEEDED")
+                    .scaledFont(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                let asked = HermesApprovalText.description(approval.description).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !asked.isEmpty {
+                    Text(verbatim: asked)
+                        .scaledFont(.callout)
+                }
+                if !approval.command.isEmpty {
+                    Text(verbatim: HermesApprovalText.command(approval.command))
+                        .scaledFont(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(4)
+                }
+                HStack(spacing: 10) {
+                    Button(role: .destructive) {
+                        send { await jobs.answerJobApproval(job.id, choice: "deny") }
+                    } label: {
+                        Text("Reject")
+                    }
+                    .buttonStyle(.bordered)
+                    Button {
+                        send { await jobs.answerJobApproval(job.id, choice: "once") }
+                    } label: {
+                        Label("Run", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            } else if let question = job.waitingQuestion.flatMap({ HermesCallWaiting(clarify: $0)?.openQuestion }) {
+                Text(verbatim: question.text)
+                    .scaledFont(.callout)
+                if question.choices.isEmpty {
+                    Text("Answer in your own words.")
+                        .scaledFont(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Array(question.choices.enumerated()), id: \.offset) { index, choice in
+                    Button {
+                        if question.multiSelect {
+                            if picked.contains(index) { picked.remove(index) } else { picked.insert(index) }
+                        } else {
+                            // The number picks it, as a spoken "two" does.
+                            send { await jobs.answerJobQuestion(job.id, answer: String(index + 1)) }
+                        }
+                    } label: {
+                        HStack {
+                            Text(verbatim: "\(index + 1). \(choice.label)")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if question.multiSelect, picked.contains(index) {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityAddTraits(question.multiSelect && picked.contains(index) ? .isSelected : [])
+                }
+                if question.multiSelect {
+                    Button {
+                        // "1, 3", as a spoken pick of several is sent.
+                        let numbers = picked.sorted().map { String($0 + 1) }.joined(separator: ", ")
+                        picked = []
+                        send { await jobs.answerJobQuestion(job.id, answer: numbers) }
+                    } label: {
+                        Text("Send")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(picked.isEmpty)
+                }
+                // One of a form's questions, as its field may be.
+                if question.mayLeaveBlank {
+                    Button {
+                        picked = []
+                        send { await jobs.answerJobQuestion(job.id, answer: nil) }
+                    } label: {
+                        Text("Leave blank")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .conduitGlassControl(cornerRadius: 16)
+        // Picks belong to one question: the next in a batch starts clean.
+        .onChange(of: job.waitingQuestion.flatMap { HermesCallWaiting(clarify: $0)?.openQuestion?.id }) { _, _ in picked = [] }
+        .disabled(sending)
+    }
+
+    private func send(_ answer: @escaping @MainActor () async -> VoiceCallDecisionOutcome) {
+        sending = true
+        Task { @MainActor in
+            _ = await answer()
+            sending = false
+        }
     }
 }

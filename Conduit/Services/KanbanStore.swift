@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import SwiftUI
 
 /// Immutable capture of everything a mutation needs. Captured BEFORE the first
@@ -22,36 +23,44 @@ struct KanbanBoardContextStamp: Equatable {
 }
 
 @MainActor
-final class KanbanStore: ObservableObject {
+@Observable
+final class KanbanStore {
     static let selectedBoardKey = "conduit.kanbanBoardSlug"
 
-    @Published private(set) var boards: [KanbanBoardMetadata] = []
-    @Published private(set) var currentServerBoardSlug = "default"
-    @Published private(set) var board: KanbanBoard?
-    @Published private(set) var profiles: [KanbanProfile] = []
-    @Published private(set) var projects: [KanbanProject] = []
-    @Published private(set) var orchestration: KanbanOrchestrationSettings?
-    @Published private(set) var selectedBoardSlug = ""
+    private(set) var boards: [KanbanBoardMetadata] = []
+    private(set) var currentServerBoardSlug = "default"
+    private(set) var board: KanbanBoard?
+    private(set) var profiles: [KanbanProfile] = []
+    private(set) var projects: [KanbanProject] = []
+    private(set) var orchestration: KanbanOrchestrationSettings?
+    private(set) var selectedBoardSlug = ""
     /// Board identity of the snapshot currently on screen. Set ONLY when a
     /// load completes for the generation that is still current; mutations
     /// always target this value so a displayed card can never be written to a
     /// different board than the one it was read from.
-    @Published private(set) var loadedBoardSlug: String?
-    @Published private(set) var isLoading = false
-    @Published private(set) var isMutating = false
-    @Published private(set) var errorMessage: String?
-    @Published private(set) var mutationErrorMessage: String?
+    private(set) var loadedBoardSlug: String?
+    /// Hermes listed the boards since the store was pointed at this
+    /// dashboard: its answers, not the kept ones, are on screen.
+    private var boardsAnswered = false
+    private(set) var isLoading = false
+    private(set) var isMutating = false
+    private(set) var errorMessage: String?
+    private(set) var mutationErrorMessage: String?
     /// V3D: latest coalesced live-event invalidation (published only after a
     /// REFRESHED board reload so detail surfaces act on fresh REST state).
-    @Published private(set) var liveInvalidation: KanbanEventInvalidation?
+    private(set) var liveInvalidation: KanbanEventInvalidation?
+    /// The board's live event stream is connected: polls are a backstop.
+    private(set) var liveStreamConnected = false
 
     private let defaults: UserDefaults
     private let makeService: @MainActor (any DashboardJSONRequester) -> KanbanService
-    private var service: KanbanService?
-    private var requesterID: ObjectIdentifier?
-    private var serverIdentity = ""
-    private var persistenceKey: String?
-    private var loadGeneration = 0
+    @ObservationIgnored private var service: KanbanService?
+    @ObservationIgnored private var requesterID: ObjectIdentifier?
+    @ObservationIgnored private var serverIdentity = ""
+    @ObservationIgnored private var persistenceKey: String?
+    /// Where the board's answers are kept on this dashboard (#1533).
+    @ObservationIgnored private var answers: KeptAnswers?
+    @ObservationIgnored private var loadGeneration = 0
     /// Bumped on every configure(); captured by mutations so post-mutation
     /// refreshes and UI-state writes from an old server/board context are
     /// discarded.
@@ -59,7 +68,7 @@ final class KanbanStore: ObservableObject {
     /// Generation of the mutation that currently owns isMutating/
     /// mutationErrorMessage. Nil when no live operation owns the UI; configure()
     /// clears it immediately so a stale server's completion becomes inert.
-    private var activeMutationGeneration: Int?
+    @ObservationIgnored private var activeMutationGeneration: Int?
 
     /// The current configuration generation, captured BEFORE a suspension so a
     /// completion can prove it still belongs to the current server/board
@@ -130,23 +139,21 @@ final class KanbanStore: ObservableObject {
         return selectedBoardKey + "." + scopeToken(normalized)
     }
 
-    func configure(requester: (any DashboardJSONRequester)?, serverIdentity: String = "") {
-        guard let requester else {
-            configurationGeneration += 1
-            loadGeneration += 1
-            isLoading = false
-            endActiveMutationOwnership()
-            service = nil
-            requesterID = nil
-            board = nil
-            boards = []
-            loadedBoardSlug = nil
+    /// Points the store at a dashboard's board, and shows what it showed
+    /// last time there, kept in `answers` (#1533): offline too, with no
+    /// requester, for the dashboard `serverIdentity` names.
+    func configure(requester: (any DashboardJSONRequester)?, serverIdentity: String = "", answers: KeptAnswers? = nil) {
+        let normalizedServer = serverIdentity.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let identity = requester.map { ObjectIdentifier($0) }
+        if requesterID == identity && self.serverIdentity == normalizedServer {
+            // The same board, whose answers may name its dashboard only now
+            // (one just registered): what they kept shows until Hermes
+            // answers.
+            service?.answers = answers
+            self.answers = answers
+            if !boardsAnswered { showKept() }
             return
         }
-
-        let normalizedServer = serverIdentity.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let identity = ObjectIdentifier(requester)
-        if requesterID == identity && self.serverIdentity == normalizedServer { return }
 
         // Invalidate any cancelled load or in-flight mutation from the
         // previous bridge/server. Their completions must not repopulate this
@@ -157,8 +164,11 @@ final class KanbanStore: ObservableObject {
         isLoading = false
         endActiveMutationOwnership()
         loadedBoardSlug = nil
+        boardsAnswered = false
 
-        service = makeService(requester)
+        service = requester.map { makeService($0) }
+        service?.answers = answers
+        self.answers = answers
         requesterID = identity
         self.serverIdentity = normalizedServer
         let scopedKey = Self.scopedBoardKey(serverIdentity: normalizedServer)
@@ -166,7 +176,7 @@ final class KanbanStore: ObservableObject {
         selectedBoardSlug = defaults.string(forKey: scopedKey) ?? ""
 
         // One-time migration for the pre-scoped key.
-        if selectedBoardSlug.isEmpty, let legacy = defaults.string(forKey: Self.selectedBoardKey) {
+        if requester != nil, selectedBoardSlug.isEmpty, let legacy = defaults.string(forKey: Self.selectedBoardKey) {
             selectedBoardSlug = legacy
             defaults.set(legacy, forKey: scopedKey)
             defaults.removeObject(forKey: Self.selectedBoardKey)
@@ -180,6 +190,26 @@ final class KanbanStore: ObservableObject {
         currentServerBoardSlug = "default"
         errorMessage = nil
         mutationErrorMessage = nil
+        showKept()
+    }
+
+    /// The board's kept answers, shown until Hermes answers. No load set
+    /// `loadedBoardSlug` for them, so nothing on them is actionable. Shown
+    /// again, they redraw nothing.
+    private func showKept() {
+        guard let answers else { return }
+        if let kept = KanbanService.kept(KanbanBoardsResponse.self, from: answers.kept(KanbanService.KeptRoute.boards)) {
+            setIfChanged(\.boards, kept.boards)
+            setIfChanged(\.currentServerBoardSlug, kept.current)
+        }
+        setIfChanged(\.board, keptBoard(resolvedSelectedBoardSlug))
+        setIfChanged(\.profiles, KanbanService.kept(KanbanProfilesResponse.self, from: answers.kept(KanbanService.KeptRoute.profiles))?.profiles ?? [])
+        setIfChanged(\.projects, KanbanService.kept(KanbanProjectsResponse.self, from: answers.kept(KanbanService.KeptRoute.projects))?.projects ?? [])
+        setIfChanged(\.orchestration, KanbanService.kept(KanbanOrchestrationSettings.self, from: answers.kept(KanbanService.KeptRoute.orchestration)))
+    }
+
+    private func keptBoard(_ slug: String) -> KanbanBoard? {
+        answers.flatMap { KanbanService.kept(KanbanBoard.self, from: $0.kept(KanbanService.KeptRoute.board(slug))) }
     }
 
     /// `superseding: true` lets an explicit user navigation (board selection)
@@ -190,9 +220,8 @@ final class KanbanStore: ObservableObject {
         loadGeneration += 1
         let generation = loadGeneration
         guard let service else {
-            if board == nil {
-                setIfChanged(\.errorMessage, AppLocalization.string("Connect to a Hermes dashboard to use Kanban."))
-            }
+            // Said over a kept board too, which can't be changed offline.
+            setIfChanged(\.errorMessage, AppLocalization.string("Connect to a Hermes dashboard to use Kanban."))
             return
         }
 
@@ -213,6 +242,7 @@ final class KanbanStore: ObservableObject {
 
             setIfChanged(\.boards, boardResponse.boards)
             setIfChanged(\.currentServerBoardSlug, boardResponse.current)
+            boardsAnswered = true
 
             if !selectedBoardSlug.isEmpty && !boards.contains(where: { $0.slug == selectedBoardSlug }) {
                 selectedBoardSlug = ""
@@ -237,7 +267,7 @@ final class KanbanStore: ObservableObject {
             guard generation == loadGeneration else { return }
 
             // A poll usually brings back the same snapshot; only what changed
-            // is written, since every @Published write redraws the board.
+            // is written, since every write redraws the board.
             setIfChanged(\.board, resolvedBoard)
             // Exactly the slug used in GET /board?board=... above.
             setIfChanged(\.loadedBoardSlug, resolvedSlug)
@@ -258,8 +288,8 @@ final class KanbanStore: ObservableObject {
         }
     }
 
-    /// @Published fires on equal writes too, so a background reload writes
-    /// only the values that changed.
+    /// A write notifies observers even when the value is equal, so a
+    /// background reload writes only the values that changed.
     private func setIfChanged<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<KanbanStore, Value>, _ value: Value) {
         if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
     }
@@ -276,6 +306,12 @@ final class KanbanStore: ObservableObject {
         } else if let persistenceKey {
             defaults.set(slug, forKey: persistenceKey)
         }
+        // The board picked shows what it showed last time while it loads,
+        // rather than the last board's cards (archived tasks aren't kept).
+        if !includeArchived, resolvedSelectedBoardSlug != loadedBoardSlug, let kept = keptBoard(resolvedSelectedBoardSlug) {
+            loadedBoardSlug = nil
+            setIfChanged(\.board, kept)
+        }
         // Explicit navigation supersedes any in-flight poll so the displayed
         // snapshot converges on the selection instead of racing it.
         await reload(includeArchived: includeArchived, superseding: true)
@@ -291,6 +327,32 @@ final class KanbanStore: ObservableObject {
         return try await service.fetchTask(id: id, board: loadedBoardSlug ?? effectiveBoardSlug)
     }
 
+    /// The board holding task `id`, and the task: the loaded board first,
+    /// then the others, since a Pulse card names a task, not its board.
+    /// Nil when no board has it. One board's failure (anything but its
+    /// 404) doesn't stop the search, but when no board has the task the
+    /// first failure is thrown, so a lost connection doesn't read as a
+    /// missing task.
+    func findTask(id: String) async throws -> (board: String, task: KanbanTask)? {
+        guard let service else { throw KanbanServiceError.invalidResponse(AppLocalization.string("Kanban is not connected.")) }
+        let first = loadedBoardSlug ?? resolvedSelectedBoardSlug
+        var failure: Error?
+        for slug in [first] + boards.map(\.slug).filter({ $0 != first }) {
+            do {
+                return (slug, try await service.fetchTask(id: id, board: slug).task)
+            } catch DashboardTicketBridgeError.http(let status, let detail)
+                        where status == 404 && !DashboardTicketBridgeError.isPluginOffDetail(detail) {
+                continue  // not on this board (a profile that turned Kanban off says so below)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if failure == nil { failure = error }
+            }
+        }
+        if let failure { throw failure }
+        return nil
+    }
+
     func fetchTaskLog(id: String, tailBytes: Int = 16_384) async throws -> KanbanWorkerLog {
         guard let service else { throw KanbanServiceError.invalidResponse(AppLocalization.string("Kanban is not connected.")) }
         return try await service.fetchTaskLog(id: id, board: loadedBoardSlug ?? effectiveBoardSlug, tailBytes: tailBytes)
@@ -304,15 +366,25 @@ final class KanbanStore: ObservableObject {
         return try await service.fetchModelOptions()
     }
 
+    /// The roster the override picker listed last time on this dashboard,
+    /// or nil (#1533).
+    func keptModelOptions() -> [KanbanModelProviderOption]? {
+        answers.flatMap { KanbanService.kept(KanbanModelOptionsResponse.self, from: $0.kept(KanbanService.KeptRoute.modelOptions)) }
+            .map(KanbanService.offerable)
+    }
+
     @discardableResult
     func createTask(
         _ request: KanbanCreateTaskRequest,
         initialStatus: String? = nil,
+        expectedContext: KanbanBoardContextStamp? = nil,
         includeArchived: Bool = false
     ) async throws -> KanbanTask? {
         guard !isMutating else {
             throw recordMutationError(KanbanServiceError.mutationInProgress)
         }
+        // A draft composed for one board is never created on another.
+        try validateExpectedContext(expectedContext)
         // Context is frozen before the first suspension point.
         guard let context = makeOperationContext() else {
             throw recordMutationError(KanbanServiceError.invalidResponse(AppLocalization.string("Kanban is not connected.")))
@@ -585,7 +657,7 @@ final class KanbanStore: ObservableObject {
     @discardableResult
     func specifyTask(
         id: String,
-        expectedContext: KanbanBoardContextStamp? = nil,
+        expectedContext: KanbanBoardContextStamp,
         includeArchived: Bool = false
     ) async throws -> KanbanSpecifyResponse {
         guard !isMutating else {
@@ -607,7 +679,7 @@ final class KanbanStore: ObservableObject {
     @discardableResult
     func decomposeTask(
         id: String,
-        expectedContext: KanbanBoardContextStamp? = nil,
+        expectedContext: KanbanBoardContextStamp,
         includeArchived: Bool = false
     ) async throws -> KanbanDecomposeResponse {
         guard !isMutating else {
@@ -629,7 +701,7 @@ final class KanbanStore: ObservableObject {
     /// UI, and a completion after configure() is inert. The board reload
     /// after success doubles as the authoritative post-nudge refresh.
     func nudgeDispatcher(
-        expectedContext: KanbanBoardContextStamp? = nil,
+        expectedContext: KanbanBoardContextStamp,
         includeArchived: Bool = false
     ) async throws {
         guard !isMutating else {
@@ -924,8 +996,9 @@ final class KanbanStore: ObservableObject {
     enum KanbanEventRefreshDisposition: Equatable {
         /// The authoritative reload ran to completion.
         case refreshed
-        /// Store was mutating/loading - the caller should retry the SAME
-        /// batch once; the ordinary poll converges regardless.
+        /// Store was mutating/loading, or the reload failed - the caller
+        /// should retry the SAME batch once; the ordinary poll converges
+        /// regardless.
         case deferred
         /// Context no longer matches the actionable loaded snapshot - the
         /// batch is dropped permanently (zero requests).
@@ -938,6 +1011,7 @@ final class KanbanStore: ObservableObject {
     ///   stale context / non-actionable snapshot -> .stale (zero request)
     ///   mutating or loading                     -> .deferred
     ///   actionable + idle                       -> authoritative reload
+    ///                                              (.deferred if it failed)
     @discardableResult
     func refreshFromEvent(
         expectedContext: KanbanBoardContextStamp,
@@ -963,13 +1037,20 @@ final class KanbanStore: ObservableObject {
             mutationErrorMessage = previousMutationErrorMessage
             return .stale
         }
-        return .refreshed
+        // A reload that failed refreshed nothing: the batch is retried soon
+        // instead of leaving the board stale until the slow poll.
+        return errorMessage == nil ? .refreshed : .deferred
     }
 
     /// Publish a coalesced invalidation AFTER a refreshed reload so detail
     /// surfaces act on fresh REST state, never on raw socket payloads.
     func publishLiveInvalidation(_ invalidation: KanbanEventInvalidation) {
         liveInvalidation = invalidation
+    }
+
+    func setLiveStreamConnected(_ connected: Bool) {
+        // Every publish redraws the board.
+        if liveStreamConnected != connected { liveStreamConnected = connected }
     }
 
     /// Test seam: awaits any in-flight debounced dispatcher nudge owned by the
@@ -1142,4 +1223,12 @@ final class KanbanStore: ObservableObject {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
     }
+}
+
+/// A request to show a Kanban task, on whichever board holds it, on the
+/// dashboard it was made on.
+struct KanbanTaskOpenRequest: Equatable {
+    let id = UUID()
+    let taskID: String
+    let dashboardID: UUID?
 }

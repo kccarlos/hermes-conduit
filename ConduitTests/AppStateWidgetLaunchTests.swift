@@ -7,6 +7,8 @@ final class AppStateWidgetLaunchTests: XCTestCase {
         let suite = "AppStateWidgetLaunchTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
+        // "Open to" is the drawer shell's.
+        defaults.set(false, forKey: V2ShellPreference.key)
         let dashboard = SavedDashboard(
             id: UUID(uuidString: "00000000-0000-0000-0000-0000000000a1")!,
             label: "Primary",
@@ -264,6 +266,31 @@ final class AppStateWidgetLaunchTests: XCTestCase {
 
         XCTAssertEqual(appState.activeSessionId, "existing-session")
         XCTAssertEqual(appState.turnState, .idle, "the chat still open must not stay synchronizing")
+    }
+
+    /// #916: a new chat runs on the profile's default model, so it must not
+    /// show the model the chat open before it was switched to.
+    func testANewChatDoesNotShowThePreviousChatsModel() async throws {
+        let suite = "AppStateWidgetLaunchTests.new-chat-model.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let current = dashboard("Current", id: "00000000-0000-0000-0000-0000000000b6")
+        let appState = makeAppState(defaults: defaults, active: current, dashboards: [current])
+        let connection = HermesConnection(baseUrl: current.normalizedURL, ticket: "test")
+        appState.connection = connection
+        appState.client = HermesClient(connection: connection, profile: "default")
+        appState.isConnected = true
+        appState.activeSessionId = "existing-session"
+        appState.runtime.model = "minimax-m3"
+        appState.runtime.provider = "minimax"
+        appState.widgetSessionCreatorOverride = { _, _ in ("new-runtime", "new-stored", "default") }
+
+        await appState.createNewSession()
+
+        XCTAssertEqual(appState.activeSessionId, "new-runtime")
+        XCTAssertEqual(appState.runtime.model, "", "the old chat's model is not this chat's")
+        XCTAssertEqual(appState.runtime.provider, "")
+        XCTAssertNotEqual(appState.sessions.first?.model, "minimax-m3")
     }
 
     func testWidgetResumeDoesNotAdoptResponseAfterLeaseRevocation() async throws {
@@ -843,6 +870,8 @@ final class AppStateWidgetLaunchTests: XCTestCase {
             appState.composerPlaceholder,
             AppLocalization.string("Message \(appState.profileDisplayName(appState.activeProfile))…")
         )
+        // A field too narrow for the whole hint at a large Text Size.
+        XCTAssertEqual(appState.composerShortPlaceholder, AppLocalization.string("Message…"))
         appState.startNewChat()
         XCTAssertEqual(appState.pendingNewChat, workspace, "another tap shows the same new chat")
 
@@ -855,8 +884,9 @@ final class AppStateWidgetLaunchTests: XCTestCase {
         XCTAssertFalse(appState.showsPendingNewChat)
     }
 
-    /// A New Chat from the app that can't start says so in the app's words;
-    /// a widget's keeps the widget's, and shows its chat as its link arrives.
+    /// A New Chat from the app that can't start says so in the app's words,
+    /// in a notice over the screen too; a widget's keeps the widget's, and
+    /// shows its chat as its link arrives.
     func testNewChatThatCantStartSaysSo() async throws {
         struct CreateRefused: Error {}
         let suite = "AppStateWidgetLaunchTests.new-chat-failed.\(UUID().uuidString)"
@@ -883,6 +913,11 @@ final class AppStateWidgetLaunchTests: XCTestCase {
         XCTAssertFalse(appState.showsPendingNewChat)
         XCTAssertEqual(appState.activeSessionId, openChat)
         XCTAssertEqual(appState.errorMessage, AppLocalization.string("Couldn't start a new chat. Check your connection and try again."))
+        XCTAssertEqual(
+            appState.pinSyncNotice?.message,
+            AppLocalization.string("Couldn't start a new chat. Check your connection and try again."),
+            "a notice says it over the chat too: the composer shows its error only while it's locked"
+        )
 
         appState.isConnected = false
         appState.isConnecting = true
@@ -1041,6 +1076,83 @@ final class AppStateWidgetLaunchTests: XCTestCase {
             await Task.yield()
         }
         XCTFail(failure)
+        return false
+    }
+
+    /// On a Mac the app's own New Chat opens ready to type, connected or
+    /// waiting for the connection; elsewhere the keyboard stays down.
+    func testInAppNewChatFocusesItsComposerOnlyOnAMac() async throws {
+        for focuses in [true, false] {
+            let suite = "AppStateWidgetLaunchTests.new-chat-focus.\(focuses).\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let current = dashboard("Current", id: "00000000-0000-0000-0000-0000000000c4")
+            let appState = makeAppState(defaults: defaults, active: current, dashboards: [current])
+            appState.newChatFocusesComposer = focuses
+            appState.widgetSessionCreatorOverride = { _, _ in ("queued-new", "queued-new", "default") }
+            _ = appState.handleScenePhase(.active)
+            appState.showLogin = false
+            let connection = HermesConnection(baseUrl: current.normalizedURL, ticket: "test")
+            appState.connection = connection
+            appState.client = HermesClient(connection: connection, profile: "default")
+            appState.widgetSettledCatalogOwner = WidgetWorkspaceID(dashboardID: current.id, profile: "default")
+            appState.isConnecting = true
+
+            appState.startNewChat()
+            appState.isConnecting = false
+            appState.isConnected = true
+            guard await waitForLaunchCompletion(appState) else { return }
+
+            XCTAssertEqual(appState.activeSessionId, "queued-new")
+            XCTAssertEqual(appState.composerFocusRequest?.sessionID, focuses ? "queued-new" : nil)
+
+            appState.composerFocusRequest = nil
+            appState.widgetSessionCreatorOverride = { _, _ in ("direct-new", "direct-new", "default") }
+            appState.startNewChat()
+            guard await waitForNewChatStart(appState) else { return }
+
+            XCTAssertEqual(appState.activeSessionId, "direct-new")
+            XCTAssertEqual(appState.composerFocusRequest?.sessionID, focuses ? "direct-new" : nil)
+        }
+    }
+
+    /// A chat that came on screen while New Chat was being created (a
+    /// notification, a list tap) isn't the new chat, and keeps its keyboard
+    /// down even though the open chat changed.
+    func testNewChatDoesNotFocusAChatOpenedWhileItWasCreated() async throws {
+        struct CreateRefused: Error {}
+        let suite = "AppStateWidgetLaunchTests.new-chat-focus-race.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let current = dashboard("Current", id: "00000000-0000-0000-0000-0000000000c5")
+        let appState = makeAppState(defaults: defaults, active: current, dashboards: [current])
+        appState.newChatFocusesComposer = true
+        _ = appState.handleScenePhase(.active)
+        appState.showLogin = false
+        let connection = HermesConnection(baseUrl: current.normalizedURL, ticket: "test")
+        appState.connection = connection
+        appState.client = HermesClient(connection: connection, profile: "default")
+        appState.isConnected = true
+        appState.activeSessionId = "earlier-new"
+        appState.newChatOpenedSessionID = "earlier-new"
+        appState.widgetSessionCreatorOverride = { [weak appState] _, _ in
+            appState?.activeSessionId = "opened-meanwhile"
+            throw CreateRefused()
+        }
+
+        appState.startNewChat()
+        guard await waitForNewChatStart(appState) else { return }
+
+        XCTAssertEqual(appState.activeSessionId, "opened-meanwhile")
+        XCTAssertNil(appState.composerFocusRequest)
+    }
+
+    private func waitForNewChatStart(_ appState: AppState) async -> Bool {
+        for _ in 0..<10_000 {
+            if !appState.isStartingNewChat { return true }
+            await Task.yield()
+        }
+        XCTFail("New Chat did not finish before the deterministic wait budget ended")
         return false
     }
 

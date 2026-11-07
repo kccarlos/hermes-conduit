@@ -22,18 +22,41 @@ def _count(value) -> str:
 def render(selection: dict) -> str:
     unit = list(selection.get("unit") or [])
     ui = list(selection.get("ui") or [])
+    replaced = list(selection.get("replaced_unit") or [])
+    pinned_run = [t for t in (selection.get("curated_unit") or unit) if t not in replaced]
     lines = [
         "### Hosted CI selection",
         "",
-        "Every unit class except the nightly-only timing families runs in the",
-        "unit shard jobs (`scripts/hosted-suite.json`). UI tests run the curated",
-        "smoke classes below; the complete UI suite and the timing families run",
-        "in the nightly workflow.",
+        "Every PR and push run builds once and runs the pinned unit tests below;",
+        "a push also runs the pinned UI tests, a PR doesn't",
+        "(`scripts/smoke-suite.json`, capped at "
+        f"{_count(selection.get('max_unit_tests'))} unit and "
+        f"{_count(selection.get('max_ui_tests'))} UI tests). Every unit class (in balanced shards,",
+        "`scripts/hosted-suite.json`), the timing families and the complete UI",
+        "suite run in the nightly workflow.",
         "",
-        f"- UI smoke classes: **{len(ui)}** of {_count(selection.get('inventory_ui'))}",
-        f"- UI classes left to the nightly run: {_count(selection.get('delegated_ui'))}",
+        f"- pinned unit tests run: **{len(pinned_run)}**"
+        + (f" ({len(replaced)} more run in their whole changed class)" if replaced else "")
+        + "; unit classes"
+        f" this run reaches, whole or in part: {len({t.split('/')[0] for t in unit})}"
+        f" of {_count(selection.get('inventory_unit'))}",
+        f"- pinned UI tests (pushes only): **{len(ui)}**, from {len({t.split('/')[0] for t in ui})} of "
+        f"{_count(selection.get('inventory_ui'))} UI classes",
+        f"- classes left to the nightly run: {_count(selection.get('delegated_unit'))} unit"
+        f" + {_count(selection.get('delegated_ui'))} UI",
         "",
-        "UI: " + ", ".join(ui),
+        "Unit: " + ", ".join(pinned_run),
+        "",
+        "Source contracts: " + ", ".join(selection.get("source_contracts") or []),
+        "",
+    ]
+    if selection.get("changed_unit"):
+        lines += ["Added for this change: " + ", ".join(selection["changed_unit"]), ""]
+    if selection.get("changed_skipped"):
+        lines += ["Related to this change but over the smoke budget (nightly only): "
+                  + ", ".join(selection["changed_skipped"]), ""]
+    lines += [
+        "UI (pushes only): " + ", ".join(ui),
         "",
     ]
     return "\n".join(lines)

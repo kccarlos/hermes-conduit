@@ -1,8 +1,42 @@
 import SwiftUI
 
 enum KanbanPollingPolicy {
-    static let boardIntervalNanoseconds: UInt64 = 8_000_000_000
-    static let detailIntervalNanoseconds: UInt64 = 4_000_000_000
+    static let boardIntervalNanoseconds = nanoseconds(PollCadence.kanbanBoard)
+    static let detailIntervalNanoseconds = nanoseconds(PollCadence.kanbanTaskDetail)
+
+    /// The board's poll: 8 s, or 60 s while the live event stream is
+    /// connected and says when to read; stretched in Low Power and Low Data
+    /// Mode. Without the stream, a board that stays the same read after read
+    /// is read less often (`withoutStream`).
+    static func boardInterval(streaming: Bool, unchangedReads: Int = 0, conditions: DeviceConditions) -> UInt64 {
+        nanoseconds(PollCadence.stretched(
+            streaming ? PollCadence.kanbanWhileStreaming : withoutStream(PollCadence.kanbanBoard, unchangedReads: unchangedReads),
+            by: conditions
+        ))
+    }
+
+    /// The open task's poll: 4 s, or 60 s while the stream is connected (a
+    /// batch touching the task reads it at once), and less often without the
+    /// stream while it stays the same (`withoutStream`).
+    static func detailInterval(streaming: Bool, unchangedReads: Int = 0, conditions: DeviceConditions) -> UInt64 {
+        nanoseconds(PollCadence.stretched(
+            streaming ? PollCadence.kanbanWhileStreaming : withoutStream(PollCadence.kanbanTaskDetail, unchangedReads: unchangedReads),
+            by: conditions
+        ))
+    }
+
+    /// A poll standing in for the live stream (a network that refuses the
+    /// socket): its usual interval, then 15 s after 15 reads that found
+    /// nothing new, 30 s after 45, and its usual interval again once a read
+    /// finds a change (issue 1728).
+    static func withoutStream(_ interval: TimeInterval, unchangedReads: Int) -> TimeInterval {
+        let steps: [TimeInterval] = [interval, 15, 15, 30]
+        return max(interval, steps[min(max(unchangedReads, 0) / 15, steps.count - 1)])
+    }
+
+    private static func nanoseconds(_ seconds: TimeInterval) -> UInt64 {
+        UInt64(seconds * 1_000_000_000)
+    }
 }
 
 /// Pure draft-reconciliation rules for the task detail surface, extracted so
@@ -239,7 +273,7 @@ struct KanbanSelectionHeaderBar: View {
                 }
             } label: {
                 Text("Cancel")
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
                     .contentShape(Rectangle())
@@ -252,7 +286,7 @@ struct KanbanSelectionHeaderBar: View {
 
             HStack(spacing: 6) {
                 Text(countLabel)
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                     .lineLimit(1)
                     .accessibilityLabel(countLabel)
                 if bulkBusy {
@@ -350,21 +384,42 @@ struct KanbanView: View {
 
     init(columnsLayout: Bool = false) {
         self.columnsLayout = columnsLayout
+        _store = State(initialValue: KanbanStore())
+    }
+
+    /// Tests host the real board over a store whose service they supply.
+    init(columnsLayout: Bool, store: KanbanStore) {
+        self.columnsLayout = columnsLayout
+        _store = State(initialValue: store)
     }
 
     @EnvironmentObject private var appState: AppState
-    @StateObject private var store = KanbanStore()
+    @State private var store: KanbanStore
+    /// The dashboard (`serverIdentityKey`) the store was last pointed at.
+    /// The board shows only once it matches, so nothing the store held
+    /// before (or its empty state) is drawn: it's pointed before the first
+    /// frame, and on a switch before the next one (#1533).
+    @State private var configuredServerKey: String?
     @State private var selectedTask: KanbanTask?
+    /// The task request being opened (AppState.kanbanTaskOpenRequest).
+    @State private var openingRequest: UUID?
     @State private var showNewTask = false
     @State private var newTaskStatus = "todo"
+    @State private var newTaskContext: KanbanBoardContextStamp?
     @State private var includeArchived = false
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.v2Shell) private var shell
+    /// Control Center or a Face ID sheet only dips the scene to inactive:
+    /// the stream and the poll stop in the background, not on a dip.
+    @Environment(\.scenePhase) private var scenePhase
     /// iPhone-native interaction: one selected lane rendered as a vertical
     /// card list behind a horizontally scrolling chip selector.
     @State private var selectedLane: String?
+    /// V2 columns: the lane the sideways board is scrolled to (its leading
+    /// column), which the jump bar marks and sets.
+    @State private var scrolledColumn: String?
     /// Permanent deletion from a card is a TWO-STEP action (V2): BOTH card
     /// entry points (ellipsis menu and context menu) stage the task here
     /// TOGETHER WITH the loaded board/server context that staged it, and
@@ -445,6 +500,55 @@ struct KanbanView: View {
         showBulkFailures = false
     }
 
+    /// Opens the task a request names, on whichever board holds it, once
+    /// a board has loaded and shows; says so when no board has it. A load
+    /// that fails while the request waits drops it, so it never opens
+    /// later (an error left from before doesn't), and so do leaving Tasks
+    /// and a switch to another dashboard. A newer request wins: an
+    /// older lookup that finishes later changes nothing.
+    private func openRequestedTask() {
+        guard shell.isTabActive, let request = appState.kanbanTaskOpenRequest, openingRequest != request.id else { return }
+        guard request.dashboardID == appState.activeDashboardID else {
+            appState.kanbanTaskOpenRequest = nil
+            return
+        }
+        // Waits out a load in flight too: an earlier request's board switch
+        // landing later would leave this task's sheet reading the wrong board.
+        guard store.loadedBoardSlug != nil, !store.isLoading else { return }
+        openingRequest = request.id
+        Task {
+            defer {
+                if appState.kanbanTaskOpenRequest?.id == request.id { appState.kanbanTaskOpenRequest = nil }
+            }
+            // Still the request, on its dashboard, with Tasks showing: one left behind opens nothing.
+            let current = {
+                appState.kanbanTaskOpenRequest?.id == request.id && appState.activeDashboardID == request.dashboardID
+                    && shell.isTabActive
+            }
+            do {
+                let found = try await store.findTask(id: request.taskID)
+                guard current() else { return }
+                guard let found else {
+                    store.showMutationError(KanbanServiceError.invalidResponse(
+                        AppLocalization.string("Couldn't find Kanban task \(request.taskID) on your boards.")))
+                    return
+                }
+                if found.board != store.loadedBoardSlug {
+                    // Checked again after the lookup: a newer request mustn't have its board switched under it.
+                    guard current() else { return }
+                    await store.selectBoard(slug: found.board, includeArchived: includeArchived)
+                    // The switch failed: its own error shows, and the old board's sheet would read the wrong board.
+                    guard current(), store.loadedBoardSlug == found.board else { return }
+                }
+                selectedTask = found.task
+            } catch is CancellationError {
+                return
+            } catch {
+                if current() { store.showMutationError(error) }
+            }
+        }
+    }
+
     /// Prune selected IDs against the authoritative loaded board (polling
     /// keeps running during selection mode). Tasks that disappeared from the
     /// board are dropped; lane switches never prune.
@@ -460,9 +564,11 @@ struct KanbanView: View {
 
     /// Configuration/polling key. Deliberately EXCLUDES appState.activeProfile:
     /// Hermes Kanban is a shared cross-profile board anchored at the Hermes
-    /// root, so Conduit's UI profile switch does not change Kanban data.
+    /// root, so Conduit's UI profile switch does not change Kanban data. It
+    /// names the open dashboard, so a switch with no bridge shows the new
+    /// dashboard's kept board.
     private var pollingKey: String {
-        "\(String(describing: bridgeIdentity))|\(appState.dashboardTicketBridge?.baseURL ?? "")|archived=\(includeArchived)"
+        "\(serverIdentityKey)|archived=\(includeArchived)"
     }
 
     /// V3D: the live /events stream identity. ANY component change (server,
@@ -498,11 +604,12 @@ struct KanbanView: View {
                 initialCursor: watermark,
                 baseURL: bridge.baseURL
             ),
-            socketFactory: { [cloudflareAccess = bridge.cloudflareAccess] url in
-                URLSessionKanbanEventSocket.open(url: url, cloudflareAccess: cloudflareAccess)
+            socketFactory: { [authorizer = bridge.requestAuthorizer] url in
+                try await URLSessionKanbanEventSocket.open(url: url, authorizer: authorizer)
             },
             ticketMinter: { try await bridge.mintTicket() },
             sleeper: { nanoseconds in try await Task.sleep(nanoseconds: nanoseconds) },
+            onConnectionChange: { [store] connected in store.setLiveStreamConnected(connected) },
             onBatch: { [includeArchived] invalidation in
                 let disposition = await store.refreshFromEvent(
                     expectedContext: invalidation.context,
@@ -534,7 +641,20 @@ struct KanbanView: View {
     /// server does NOT dismiss them (their data is server-global), and
     /// ordinary board polling never changes this key.
     private var serverIdentityKey: String {
-        "\(String(describing: bridgeIdentity))|\(appState.dashboardTicketBridge?.baseURL ?? "")"
+        "\(String(describing: bridgeIdentity))|\(appState.dashboardTicketBridge?.baseURL ?? "")|\(appState.activeDashboardID?.uuidString ?? "")"
+    }
+
+    /// Points the store at the open dashboard, and shows what the board
+    /// showed last time there (#1533), before the first frame and offline
+    /// too.
+    private func configureStore() {
+        let dashboardURL = appState.activeDashboardID.flatMap { appState.savedDashboardRegistry.dashboard(with: $0)?.normalizedURL }
+        store.configure(
+            requester: appState.dashboardTicketBridge,
+            serverIdentity: appState.dashboardTicketBridge?.baseURL ?? dashboardURL ?? "",
+            answers: appState.screenAnswers(profile: AppState.KeptRoute.everyProfile)
+        )
+        configuredServerKey = serverIdentityKey
     }
 
     private var visibleColumns: [KanbanColumn] {
@@ -551,7 +671,7 @@ struct KanbanView: View {
         VStack(spacing: 12) {
             header
 
-            if store.isLoading && store.board == nil {
+            if configuredServerKey != serverIdentityKey || (store.isLoading && store.board == nil) {
                 Spacer()
                 ProgressView("Loading board…")
                     .tint(.conduitAccent)
@@ -563,18 +683,17 @@ struct KanbanView: View {
                     description: Text(errorMessage)
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let board = store.board {
+            } else if store.board != nil {
                 if visibleColumns.isEmpty {
                     ContentUnavailableView("No Columns", systemImage: "rectangle.3.group")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     laneBoard
-                        .refreshable { await store.refresh(includeArchived: includeArchived) }
                         .overlay(alignment: .topTrailing) {
                             VStack(alignment: .trailing, spacing: 6) {
                                 if let nudgeNotice = nudgeNoticeState.notice {
                                     Label(nudgeNotice, systemImage: "checkmark.circle")
-                                        .font(.caption)
+                                        .scaledFont(.caption)
                                         .foregroundStyle(.green)
                                         .padding(8)
                                         .background(.ultraThinMaterial, in: Capsule())
@@ -582,7 +701,7 @@ struct KanbanView: View {
                                 }
                                 if let bulkNotice = bulkNoticeState.text {
                                     Label(bulkNotice, systemImage: bulkNoticeState.kind == .success ? "checkmark.circle" : "exclamationmark.triangle.fill")
-                                        .font(.caption)
+                                        .scaledFont(.caption)
                                         .foregroundStyle(bulkNoticeState.kind == .success ? Color.green : Color.orange)
                                         .padding(8)
                                         .background(.ultraThinMaterial, in: Capsule())
@@ -597,13 +716,13 @@ struct KanbanView: View {
                                     .buttonStyle(.plain)
                                     .accessibilityLabel("Dismiss Kanban error")
                                     }
-                                    .font(.caption)
+                                    .scaledFont(.caption)
                                     .foregroundStyle(.red)
                                     .padding(8)
                                     .background(.ultraThinMaterial, in: Capsule())
                                 } else if let refreshError = store.errorMessage {
                                     Text("Refresh failed: \(refreshError)")
-                                        .font(.caption)
+                                        .scaledFont(.caption)
                                         .foregroundStyle(.secondary)
                                         .padding(8)
                                         .background(.ultraThinMaterial, in: Capsule())
@@ -623,26 +742,26 @@ struct KanbanView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(item: $selectedTask) { task in
             KanbanTaskDetailView(task: task)
-                .environmentObject(store)
+                .environment(store)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showNewTask) {
-            KanbanTaskComposerView(initialStatus: newTaskStatus)
-                .environmentObject(store)
+            KanbanTaskComposerView(initialStatus: newTaskStatus, expectedContext: newTaskContext)
+                .environment(store)
                 .environmentObject(appState)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showOrchestrationSettings) {
             KanbanOrchestrationSettingsSheet()
-                .environmentObject(store)
+                .environment(store)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showProfileRouting) {
             KanbanProfileRoutingScreen()
-                .environmentObject(store)
+                .environment(store)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
@@ -652,14 +771,14 @@ struct KanbanView: View {
             // no loaded metadata exists.
             if let board = loadedBoardMetadata {
                 KanbanBoardEditorView(mode: .settings(board: board), includeArchived: includeArchived)
-                    .environmentObject(store)
+                    .environment(store)
                     .presentationDetents([.large])
                     .presentationDragIndicator(.visible)
             }
         }
         .sheet(isPresented: $showNewBoard) {
             KanbanBoardEditorView(mode: .create, includeArchived: includeArchived)
-                .environmentObject(store)
+                .environment(store)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
@@ -670,7 +789,7 @@ struct KanbanView: View {
                 tenantFilter: $tenantFilter,
                 groupRunningByProfile: $groupRunningByProfile
             )
-            .environmentObject(store)
+            .environment(store)
             .presentationDetents([.medium])
             .presentationDragIndicator(.visible)
         }
@@ -777,6 +896,8 @@ struct KanbanView: View {
             showBoardSettings = false
             showNewBoard = false
             showFilters = false
+            // So is a New Task draft (its lane and workspace default).
+            showNewTask = false
             assigneeFilter = nil
             tenantFilter = nil
             // V3C: a board switch invalidates every selected ID - selection
@@ -790,45 +911,82 @@ struct KanbanView: View {
             showBoardSettings = false
             showNewBoard = false
             showFilters = false
+            showNewTask = false
             pendingBoardArchive = nil
             nudgeNoticeState.invalidateOnContextChange()
             exitSelectionMode()
+            // The new one's kept board, before the next frame.
+            configureStore()
         }
         // V3C: the authoritative board keeps polling during selection mode;
         // prune ghost selections against it (never transfer by index).
         .onChange(of: store.board) { _, _ in
             pruneSelectionAgainstBoard()
         }
-        // V2 keeps a visited Tasks tab mounted behind the selected one: the
-        // board listens and polls only while it shows, and catches up when it
-        // comes back. Outside V2 the board is always active.
-        .task(id: "\(liveEventsKey)|\(shell.isTabActive)") {
-            guard shell.isTabActive else { return }
-            await runLiveEventStream()
+        // A task to show (a Pulse card's), once the board is up and showing.
+        .onChange(of: appState.kanbanTaskOpenRequest, initial: true) { _, _ in openRequestedTask() }
+        .onChange(of: store.loadedBoardSlug) { _, _ in openRequestedTask() }
+        .onChange(of: shell.isTabActive) { _, isActive in
+            // Leaving Tasks before the task could open drops the request, so it never opens unasked later.
+            if !isActive, let request = appState.kanbanTaskOpenRequest, openingRequest != request.id {
+                appState.kanbanTaskOpenRequest = nil
+            }
+            openRequestedTask()
         }
+        .onChange(of: store.isLoading) { wasLoading, isLoading in
+            // A load that just failed with no board to show: the request can't open.
+            if wasLoading, !isLoading, store.loadedBoardSlug == nil, store.errorMessage != nil,
+               appState.kanbanTaskOpenRequest != nil, openingRequest != appState.kanbanTaskOpenRequest?.id {
+                appState.kanbanTaskOpenRequest = nil
+            }
+            openRequestedTask()
+        }
+        // V2 keeps a visited Tasks tab mounted behind the selected one: the
+        // board listens and polls only while it shows and the app is on
+        // screen, and catches up when it comes back. Outside V2 the board is
+        // always active while the app is.
+        .task(id: "\(liveEventsKey)|\(shell.isTabActive)|\(scenePhase == .background)") {
+            guard shell.isTabActive, scenePhase != .background else { return }
+            await runLiveEventStream()
+            store.setLiveStreamConnected(false)
+        }
+        .onAppear(perform: configureStore)
         .task(id: pollingKey) {
             selectedTask = nil
-            store.configure(
-                requester: appState.dashboardTicketBridge,
-                serverIdentity: appState.dashboardTicketBridge?.baseURL ?? ""
-            )
+            configureStore()
             await store.reload(includeArchived: includeArchived)
         }
-        .task(id: "\(pollingKey)|\(shell.isTabActive)") {
-            guard shell.isTabActive else { return }
-            // Back on the tab: refresh what changed while it was hidden. The
-            // first load is the configure task's own.
-            if store.loadedBoardSlug != nil {
+        // The stream connecting or dropping restarts the poll: a dropped
+        // stream may have missed events, so the board reads at once.
+        .task(id: "\(pollingKey)|\(shell.isTabActive)|\(scenePhase == .background)|\(store.liveStreamConnected)") {
+            guard shell.isTabActive, scenePhase != .background else { return }
+            // Back on the tab, or the stream gone: refresh what changed
+            // meanwhile. The first load is the configure task's own, and a
+            // stream that just connected has nothing to catch up on.
+            if store.loadedBoardSlug != nil, !store.liveStreamConnected {
                 await store.poll(includeArchived: includeArchived)
             }
+            // Without the stream, reads that find nothing new space
+            // themselves out.
+            var unchangedReads = 0
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(nanoseconds: KanbanPollingPolicy.boardIntervalNanoseconds)
+                    try await Task.sleep(nanoseconds: KanbanPollingPolicy.boardInterval(
+                        streaming: store.liveStreamConnected,
+                        unchangedReads: unchangedReads,
+                        conditions: DeviceConditionsMonitor.shared.current
+                    ))
                 } catch {
                     break
                 }
                 guard !Task.isCancelled else { break }
+                // poll skips a read under a write or another load: that tick
+                // isn't a read, so it doesn't count.
+                guard !store.isMutating, !store.isLoading else { continue }
+                let before = store.board
                 await store.poll(includeArchived: includeArchived)
+                // A failed read keeps the base pace, so a recovery shows soon.
+                unchangedReads = store.errorMessage == nil && store.board == before ? unchangedReads + 1 : 0
             }
         }
     }
@@ -931,27 +1089,51 @@ struct KanbanView: View {
             columnBoard
         } else {
             chipLaneBoard
+                .refreshable { await store.refresh(includeArchived: includeArchived) }
         }
     }
 
     /// V2: each lane is a column of cards with its status symbol, name and
-    /// count; the board scrolls sideways.
+    /// count; the board scrolls sideways, a column at a time, and the jump
+    /// bar above lists every lane the server reported (Blocked and Done
+    /// included) with its count, so each is one tap away.
+    ///
+    /// Pull to refresh belongs to each column's own list. On the sideways
+    /// board it made the board scroll vertically too (a refresh control
+    /// turns on vertical bounce), so a swipe that wasn't perfectly level
+    /// dragged the board up and down instead of on to the next lanes.
     private var columnBoard: some View {
         let columns = visibleColumns
-        return ScrollView(.horizontal, showsIndicators: false) {
-            LazyHStack(alignment: .top, spacing: 12) {
-                ForEach(columns) { column in
-                    boardColumn(column)
+        return VStack(spacing: 8) {
+            columnJumpBar(columns)
+            ScrollView(.horizontal, showsIndicators: false) {
+                // Eager: eight-odd lanes, every one laid out and in the
+                // accessibility tree, not only those on screen.
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(columns) { column in
+                        boardColumn(column)
+                            .id(column.name)
+                    }
                 }
+                .scrollTargetLayout()
+                .padding(.horizontal, 2)
+                .padding(.bottom, 14)
             }
-            .padding(.horizontal, 2)
-            .padding(.bottom, 14)
+            .scrollTargetBehavior(.viewAligned)
+            .scrollPosition(id: $scrolledColumn, anchor: .leading)
+            // Sideways only, whatever a column holds.
+            .scrollBounceBehavior(.basedOnSize, axes: .vertical)
         }
-        .disabled(!store.isSelectedSnapshotLoaded)
+        // A lane that left the board, or another board, starts the board at
+        // its leading edge rather than at a lane id that isn't there.
+        .onChange(of: columns.map(\.name)) { _, names in
+            if let scrolled = scrolledColumn, !names.contains(scrolled) { scrolledColumn = nil }
+        }
+        .onChange(of: store.resolvedSelectedBoardSlug) { _, _ in scrolledColumn = nil }
         .overlay(alignment: .top) {
-            if !store.isSelectedSnapshotLoaded {
+            if !store.isSelectedSnapshotLoaded, store.errorMessage == nil {
                 Label("Loading \(store.selectedBoardMetadata?.name ?? store.resolvedSelectedBoardSlug)…", systemImage: "hourglass")
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
                     .background(.ultraThinMaterial, in: Capsule())
@@ -964,22 +1146,80 @@ struct KanbanView: View {
         }
     }
 
+    /// Every lane as a chip with its count; tapping one brings its column
+    /// into view.
+    private func columnJumpBar(_ columns: [KanbanColumn]) -> some View {
+        let current = KanbanColumnBoardPolicy.currentColumn(scrolledTo: scrolledColumn, in: columns)
+        return ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(KanbanColumnBoardPolicy.summaries(for: columns)) { summary in
+                        columnJumpChip(summary, isCurrent: summary.status == current)
+                            .id(summary.status)
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.vertical, 1)
+            }
+            .frame(minHeight: 34)
+            .onChange(of: current) { _, status in
+                guard let status else { return }
+                withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) {
+                    proxy.scrollTo(status, anchor: .center)
+                }
+            }
+        }
+    }
+
+    private func columnJumpChip(_ summary: KanbanBoardColumnSummary, isCurrent: Bool) -> some View {
+        let tint = KanbanStatusPresentation.forStatus(summary.status).tint
+        return Button {
+            withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) {
+                scrolledColumn = summary.status
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: summary.systemImage)
+                    .scaledFont(.caption2)
+                Text(summary.title)
+                    .scaledFont(.caption.weight(isCurrent ? .bold : .semibold))
+                Text(String(summary.count))
+                    .scaledFont(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if summary.isLocked {
+                    Image(systemName: "lock.fill")
+                        .scaledFont(.caption2)
+                        .imageScale(.small)
+                        .foregroundStyle(.conduitTertiary)
+                }
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6).frame(minHeight: 30)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(isCurrent ? .primary : .secondary)
+        .conduitGlassControl(cornerRadius: 15, tint: isCurrent ? tint.opacity(0.16) : .clear)
+        .accessibilityLabel(summary.title + ", " + AppLocalization.string("\(summary.count) tasks"))
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
+    }
+
     private func boardColumn(_ column: KanbanColumn) -> some View {
         let presentation = KanbanStatusPresentation.forStatus(column.name)
         return VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 6) {
                 Image(systemName: presentation.systemImage)
-                    .font(.caption.weight(.semibold))
+                    .scaledFont(.caption.weight(.semibold))
                     .foregroundStyle(presentation.tint)
                 Text(presentation.displayName)
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                 Text(String(column.tasks.count))
-                    .font(.caption.monospacedDigit())
+                    .scaledFont(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 if presentation.isBackendControlled {
                     Image(systemName: "lock.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
+                        .scaledFont(.caption2)
+                        .imageScale(.small)
+                        .foregroundStyle(.conduitTertiary)
                 }
                 Spacer(minLength: 0)
             }
@@ -1005,6 +1245,7 @@ struct KanbanView: View {
                 }
                 .padding(.bottom, 8)
             }
+            .refreshable { await store.refresh(includeArchived: includeArchived) }
         }
         .frame(width: 250)
         .padding(10)
@@ -1049,15 +1290,10 @@ struct KanbanView: View {
                 }
                 // NOTE: bottom action bar is applied as an overlay on the
                 // whole lane board (see laneBoard modifiers).
-                // Navigation invariant: while the newly selected board is
-                // still loading, the visible cards belong to the OLD board.
-                // Keep them as read-only cached content - no taps, menus,
-                // moves, or deletes - until the new snapshot lands.
-                .disabled(!store.isSelectedSnapshotLoaded)
                 .overlay(alignment: .top) {
-                    if !store.isSelectedSnapshotLoaded {
+                    if !store.isSelectedSnapshotLoaded, store.errorMessage == nil {
                         Label("Loading \(store.selectedBoardMetadata?.name ?? store.resolvedSelectedBoardSlug)…", systemImage: "hourglass")
-                            .font(.caption)
+                            .scaledFont(.caption)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
                             .background(.ultraThinMaterial, in: Capsule())
@@ -1078,8 +1314,17 @@ struct KanbanView: View {
 
     // MARK: - V3C card interactions
 
-    @ViewBuilder
+    /// Navigation invariant: while the selected board is still loading,
+    /// the cards on screen are another board's, or the kept ones the board
+    /// opened on (#1533). They stay read-only - no taps, menus, moves, or
+    /// deletes - until the snapshot lands; the board still scrolls.
     private func taskCard(_ task: KanbanTask) -> some View {
+        taskCardContent(task)
+            .disabled(!store.isSelectedSnapshotLoaded)
+    }
+
+    @ViewBuilder
+    private func taskCardContent(_ task: KanbanTask) -> some View {
         let isSelected = selectedTaskIDs.contains(task.id)
         let actionsInert = isSelectionActive || bulkBusy
         if isSelectionActive {
@@ -1163,7 +1408,7 @@ struct KanbanView: View {
     private var bulkActionBar: some View {
         HStack(spacing: 10) {
             Text(selectedCountLabel)
-                .font(.subheadline.weight(.semibold))
+                .scaledFont(.subheadline.weight(.semibold))
                 .lineLimit(1)
                 .accessibilityLabel(selectedCountLabel)
             Spacer()
@@ -1261,21 +1506,26 @@ struct KanbanView: View {
 
     private var bulkMoveSheet: some View {
         NavigationStack {
-            List {
-                ForEach(KanbanBulkDestinationPolicy.moveDestinations(), id: \.id) { presentation in
-                    Button {
-                        commitBulkFromStage { staged in
-                            PendingBulkOperation(ids: staged.ids, context: staged.context, action: .move(presentation.rawValue))
+            SettingsDetailContainer {
+                SettingsCard {
+                    ForEach(KanbanBulkDestinationPolicy.moveDestinations(), id: \.id) { presentation in
+                        Button {
+                            commitBulkFromStage { staged in
+                                PendingBulkOperation(ids: staged.ids, context: staged.context, action: .move(presentation.rawValue))
+                            }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: presentation.systemImage)
+                                    .foregroundStyle(presentation.tint)
+                                Text(presentation.displayName)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                            }
+                            .frame(minHeight: 36)
+                            .contentShape(Rectangle())
                         }
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: presentation.systemImage)
-                                .foregroundStyle(presentation.tint)
-                            Text(presentation.displayName)
-                            Spacer()
-                        }
+                        .buttonStyle(.plain)
                     }
-                    .foregroundStyle(.primary)
                 }
             }
             .navigationTitle(moveSheetTitle)
@@ -1296,30 +1546,36 @@ struct KanbanView: View {
 
     private var bulkAssignSheet: some View {
         NavigationStack {
-            List {
-                if store.profiles.isEmpty {
-                    Text("No profiles on this server yet.")
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(store.profiles) { profile in
-                    Button {
-                        commitBulkFromStage { staged in
-                            PendingBulkOperation(ids: staged.ids, context: staged.context, action: .assign(profile.name))
-                        }
-                    } label: {
-                        HStack(spacing: 10) {
-                            Text(profile.name)
-                            Spacer()
-                        }
+            SettingsDetailContainer {
+                ConduitSettingsSection(title: AppLocalization.string("Profiles"), symbol: "person.2", tint: .conduitAccent) {
+                    if store.profiles.isEmpty {
+                        Text("No profiles on this server yet.")
+                            .foregroundStyle(.secondary)
                     }
-                    .foregroundStyle(.primary)
+                    ForEach(store.profiles) { profile in
+                        Button {
+                            commitBulkFromStage { staged in
+                                PendingBulkOperation(ids: staged.ids, context: staged.context, action: .assign(profile.name))
+                            }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Text(profile.name)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                            }
+                            .frame(minHeight: 36)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
-                Section {
+                SettingsCard {
                     Button("Unassign") {
                         commitBulkFromStage { staged in
                             PendingBulkOperation(ids: staged.ids, context: staged.context, action: .assign(nil))
                         }
                     }
+                    .buttonStyle(.settings)
                 }
             }
             .navigationTitle(assignSheetTitle)
@@ -1345,8 +1601,8 @@ struct KanbanView: View {
 
     private var bulkPrioritySheet: some View {
         NavigationStack {
-            Form {
-                Section {
+            SettingsDetailContainer {
+                SettingsCard {
                     HStack(spacing: 12) {
                         Button {
                             // Clamped at Int bounds: the numeric field can
@@ -1362,7 +1618,7 @@ struct KanbanView: View {
                         TextField("Priority", value: $bulkPriorityValue, format: .number)
                             .keyboardType(.numbersAndPunctuation)
                             .multilineTextAlignment(.center)
-                            .font(.title3.bold())
+                            .scaledFont(.title3.bold())
                             .monospacedDigit()
                             .accessibilityLabel("Priority value")
                         Button {
@@ -1375,11 +1631,11 @@ struct KanbanView: View {
                         .accessibilityLabel("Increase priority")
                     }
                     .padding(.vertical, 4)
-                } footer: {
                     // Audited contract: upstream applies the verbatim
                     // integer (direct SQL) - NO bounds exist; this control
                     // validates only that the value parses as Int.
                     Text("Any integer is valid; Hermes stores it verbatim (no bounds upstream).")
+                        .settingsCaption()
                 }
             }
             .navigationTitle(prioritySheetTitle)
@@ -1414,15 +1670,17 @@ struct KanbanView: View {
 
     private var bulkFailuresSheet: some View {
         NavigationStack {
-            List {
+            SettingsDetailContainer {
                 if let outcome = lastBulkOutcome {
-                    ForEach(KanbanBulkResultPolicy.failures(from: outcome), id: \.id) { failure in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Task \(failure.id)")
-                                .font(.subheadline.weight(.semibold))
-                            Text(failure.reason)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    SettingsCard {
+                        ForEach(KanbanBulkResultPolicy.failures(from: outcome), id: \.id) { failure in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Task \(failure.id)")
+                                    .scaledFont(.subheadline.weight(.semibold))
+                                Text(failure.reason)
+                                    .scaledFont(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -1604,16 +1862,17 @@ struct KanbanView: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: presentation.systemImage)
-                    .font(.caption2)
+                    .scaledFont(.caption2)
                 Text(presentation.displayName)
-                    .font(.caption.weight(isSelected ? .bold : .semibold))
+                    .scaledFont(.caption.weight(isSelected ? .bold : .semibold))
                 Text(String(column.tasks.count))
-                    .font(.caption2.monospacedDigit())
+                    .scaledFont(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
                 if presentation.isBackendControlled {
                     Image(systemName: "lock.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.tertiary)
+                        .scaledFont(.caption2)
+                        .imageScale(.small)
+                        .foregroundStyle(.conduitTertiary)
                 }
             }
             .padding(.horizontal, 11)
@@ -1628,13 +1887,9 @@ struct KanbanView: View {
 
     /// THE canonical visible-lane answer. Every consumer — the chip
     /// highlight, the card list, and the New Task button's initial status —
-    /// must ask this instead of reading raw `selectedLane`, which stays nil
-    /// until the user explicitly taps a chip even though a lane IS resolved
-    /// for display (first unlocked lane). See KanbanLanePolicy.
-    private var effectiveSelectedLane: String? {
-        KanbanLanePolicy.effectiveSelectedLane(selected: selectedLane, columns: visibleColumns)
-    }
-
+    /// must ask KanbanLanePolicy instead of reading raw `selectedLane`, which
+    /// stays nil until the user explicitly taps a chip even though a lane IS
+    /// resolved for display (first unlocked lane).
     private func resolvedLaneName(columns: [KanbanColumn]) -> String? {
         KanbanLanePolicy.effectiveSelectedLane(selected: selectedLane, columns: columns)
     }
@@ -1673,9 +1928,9 @@ struct KanbanView: View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Kanban")
-                    .font(.title3.weight(.bold))
+                    .scaledFont(.title3.weight(.bold))
                 Text(store.selectedBoardMetadata?.name ?? store.selectedBoardMetadata?.slug ?? AppLocalization.string("Board"))
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -1795,12 +2050,20 @@ struct KanbanView: View {
 
             Button {
                 // The global + creates relative to the lane the UI actually
-                // considers visible (effectiveSelectedLane), NOT the raw chip
-                // selection — selectedLane stays nil until a chip is tapped,
-                // and falling back to Todo then would ignore the resolved
-                // visible lane. Locked lanes collapse to the default unlocked
-                // landing status.
-                newTaskStatus = KanbanLanePolicy.newTaskInitialStatus(effectiveLane: effectiveSelectedLane)
+                // considers visible, NOT the raw chip selection — selectedLane
+                // stays nil until a chip is tapped, and falling back to Todo
+                // then would ignore the resolved visible lane. On the V2
+                // columns board that lane is the column it is scrolled to
+                // (KanbanLanePolicy.newTaskLane). Locked lanes collapse to
+                // the default unlocked landing status.
+                let lane = KanbanLanePolicy.newTaskLane(
+                    columnsLayout: columnsLayout,
+                    scrolledColumn: scrolledColumn,
+                    selected: selectedLane,
+                    columns: visibleColumns
+                )
+                newTaskStatus = KanbanLanePolicy.newTaskInitialStatus(effectiveLane: lane)
+                newTaskContext = store.loadedContextStamp
                 showNewTask = true
             } label: {
                 Image(systemName: "plus")
@@ -1825,7 +2088,7 @@ struct KanbanView: View {
                     searchText = ""
                     searchFocused = false
                 }
-                .font(.subheadline.weight(.medium))
+                .scaledFont(.subheadline.weight(.medium))
                 .foregroundStyle(Color.conduitAccent)
                 .buttonStyle(.plain)
                 .frame(minHeight: 44)
@@ -1847,9 +2110,10 @@ struct KanbanView: View {
             if !searchText.isEmpty {
                 Button { searchText = "" } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.conduitTertiary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(AppLocalization.string("Clear search"))
             }
             // V3B: assignee/tenant/Show Archived/grouping live behind ONE
             // compact filter button instead of crowding the header.
@@ -1885,11 +2149,11 @@ struct KanbanView: View {
     private func runningGroupHeader(_ group: KanbanRunningGroupPolicy.Group) -> some View {
         HStack(spacing: 6) {
             Text(group.displayName)
-                .font(.caption.weight(.semibold))
+                .scaledFont(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(String(group.tasks.count))
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.tertiary)
+                .scaledFont(.caption2.monospacedDigit())
+                .foregroundStyle(.conduitTertiary)
             Spacer()
         }
         .padding(.horizontal, 4)
@@ -1991,7 +2255,7 @@ private struct KanbanCardView: View {
                     .frame(width: 7, height: 7)
                     .padding(.top, 5)
                 Text(task.title)
-                    .font(.subheadline.weight(.semibold))
+                    .scaledFont(.subheadline.weight(.semibold))
                     .lineLimit(3)
                 Spacer(minLength: 2)
                 if !isMenusDisabled {
@@ -2041,7 +2305,7 @@ private struct KanbanCardView: View {
                     }
                 } label: {
                     Image(systemName: "ellipsis")
-                        .font(.caption.weight(.bold))
+                        .scaledFont(.caption.weight(.bold))
                         .foregroundStyle(.secondary)
                         .frame(width: 24, height: 24)
                 }
@@ -2052,12 +2316,12 @@ private struct KanbanCardView: View {
 
             if let summary = task.latestSummary, !summary.isEmpty {
                 Text(summary)
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
             } else if let body = task.body, !body.isEmpty {
                 Text(body)
-                    .font(.caption)
+                    .scaledFont(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
             }
@@ -2141,10 +2405,10 @@ private struct KanbanCardView: View {
                     .foregroundStyle(.red)
             }
             Text(KanbanShortID.of(task.id))
-                .font(.caption2.monospaced())
+                .scaledFont(.caption2.monospaced())
         }
-        .font(.caption2)
-        .foregroundStyle(.tertiary)
+        .scaledFont(.caption2)
+        .foregroundStyle(.conduitTertiary)
     }
 
     private func copy(text: String, notice: String) {
