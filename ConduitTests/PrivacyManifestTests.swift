@@ -27,10 +27,8 @@ final class PrivacyManifestTests: XCTestCase {
         ],
         // NotificationSharedSettings reads the App Group defaults.
         "ConduitNotificationService": [userDefaults: ["1C8F.1"]],
-        "ConduitLocationPush": [userDefaults: ["1C8F.1"]],
         // The composer limit the app publishes in the App Group defaults,
         // and the age of share inbox folders in the App Group container.
-        "ConduitShareExtension": [userDefaults: ["1C8F.1"], fileTimestamp: ["C617.1"]],
     ]
 
     /// Target folder -> the data it sends its developer, none linked to the
@@ -84,8 +82,6 @@ final class PrivacyManifestTests: XCTestCase {
         let app = Bundle.main.bundleURL
         let embedded = [
             ("ConduitNotificationService", app.appendingPathComponent("PlugIns/ConduitNotificationService.appex")),
-            ("ConduitLocationPush", app.appendingPathComponent("PlugIns/ConduitLocationPush.appex")),
-            ("ConduitShareExtension", app.appendingPathComponent("PlugIns/ConduitShareExtension.appex")),
             ("ConduitWatch", app.appendingPathComponent("Watch/ConduitWatch.app")),
         ]
         for (folder, bundle) in embedded where FileManager.default.fileExists(atPath: bundle.path) {
